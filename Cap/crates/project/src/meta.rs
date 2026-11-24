@@ -1,0 +1,2134 @@
+use either::Either;
+use relative_path::RelativePathBuf;
+use serde::{Deserialize, Serialize};
+use specta::Type;
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    io::Write,
+    path::{Path, PathBuf},
+};
+use tracing::{debug, info, warn};
+
+use crate::{
+    CaptionsData, CursorEvents, CursorImage, KeyboardEvents, ProjectConfiguration, XY,
+    cursor::{MIN_VISIBLE_CURSOR_SHAPE_MS, SHORT_CURSOR_SHAPE_DEBOUNCE_MS},
+};
+
+/// Recordings made from this version on keep every cursor shape shown for at
+/// least `MIN_VISIBLE_CURSOR_SHAPE_MS`. Recordings saved without the field keep
+/// the one-second debounce they were made and exported with. A segment copied
+/// in from another recording carries that recording's version with it.
+pub const CURSOR_SHAPE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct VideoMeta {
+    #[specta(type = String)]
+    pub path: RelativePathBuf,
+    #[serde(default = "legacy_static_video_fps")]
+    pub fps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+fn legacy_static_video_fps() -> u32 {
+    30
+}
+
+/// Where the recording device's physical notch sits within the captured video.
+///
+/// macOS captures the pixels behind the notch, so without this the recording
+/// shows an unbroken menu bar where the recorder saw a cutout. Fractions of the
+/// captured frame rather than of the display, so area recordings, which are
+/// cropped at capture time, need no extra context to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+pub struct DisplayNotch {
+    /// Distance from the left edge of the video to the notch.
+    pub x: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AudioMeta {
+    #[specta(type = String)]
+    pub path: RelativePathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_summary: Option<AudioGapSummary>,
+    /// Milliseconds the unmuted microphone delivered sustained bit-exact silence,
+    /// e.g. while a VoIP call held the input on macOS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digital_silence_ms: Option<u32>,
+}
+
+/// Overlap-trim accounting captured by the recorder's audio gap tracker, persisted so the
+/// editor can compensate for stale-startup audio drift from typed data instead of scraping
+/// the recording log. See `cap-editor`'s `audio_timing_repair_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AudioGapSummary {
+    /// Total audio trimmed from overlapping frames over the whole recording, in milliseconds.
+    pub total_overlap_trimmed_ms: u32,
+    /// Startup-window trim used for stale-startup repair, excluding mid-recording trims.
+    #[serde(default)]
+    pub startup_overlap_trimmed_ms: u32,
+    /// Number of whole audio frames dropped because they fully overlapped the committed timeline.
+    pub overlap_dropped_frames: u32,
+    /// Subset of `overlap_dropped_frames` that dropped within the first few frames — the
+    /// signature of a stale buffered burst at capture start.
+    pub startup_overlap_drops: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SharingMeta {
+    pub id: String,
+    pub link: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub enum Platform {
+    MacOS,
+    Windows,
+    Linux,
+}
+
+impl Default for Platform {
+    fn default() -> Self {
+        #[cfg(windows)]
+        return Self::Windows;
+
+        #[cfg(target_os = "macos")]
+        return Self::MacOS;
+
+        #[cfg(target_os = "linux")]
+        return Self::Linux;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RecordingMeta {
+    #[serde(default)]
+    pub platform: Option<Platform>,
+    #[serde(skip_serializing, default)]
+    pub project_path: PathBuf,
+    pub pretty_name: String,
+    #[serde(default)]
+    pub sharing: Option<SharingMeta>,
+    #[serde(flatten)]
+    pub inner: RecordingMetaInner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<UploadMeta>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Type, Debug)]
+pub struct S3UploadMeta {
+    pub id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, specta::Type, Debug)]
+pub struct VideoUploadInfo {
+    pub id: String,
+    pub link: String,
+    pub config: S3UploadMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "state")]
+pub enum UploadMeta {
+    MultipartUpload {
+        video_id: String,
+        file_path: PathBuf,
+        pre_created_video: VideoUploadInfo,
+        recording_dir: PathBuf,
+    },
+    SinglePartUpload {
+        video_id: String,
+        recording_dir: PathBuf,
+        file_path: PathBuf,
+        screenshot_path: PathBuf,
+    },
+    SegmentUpload {
+        video_id: String,
+        pre_created_video: VideoUploadInfo,
+        recording_dir: PathBuf,
+    },
+    Failed {
+        error: String,
+    },
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(untagged, rename_all = "camelCase")]
+pub enum RecordingMetaInner {
+    Studio(Box<StudioRecordingMeta>),
+    Instant(InstantRecordingMeta),
+}
+
+impl specta::Flatten for RecordingMetaInner {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(untagged, rename_all = "camelCase")]
+pub enum InstantRecordingMeta {
+    InProgress { recording: bool },
+    Failed { error: String },
+    Complete { fps: u32, sample_rate: Option<u32> },
+}
+
+impl RecordingMeta {
+    pub fn path(&self, relative: &RelativePathBuf) -> PathBuf {
+        relative.to_path(&self.project_path)
+    }
+
+    pub fn load_for_project(project_path: &Path) -> Result<Self, Box<dyn Error>> {
+        let meta_path = project_path.join("recording-meta.json");
+        let mut meta: Self = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+        meta.project_path = project_path.to_path_buf();
+        meta.normalize_paths();
+
+        Ok(meta)
+    }
+
+    pub fn save_for_project(&self) -> Result<(), Either<serde_json::Error, std::io::Error>> {
+        self.save_for_project_logged(std::time::Duration::ZERO)
+    }
+
+    /// Like [`Self::save_for_project`], but on Windows waits up to two seconds
+    /// for another handle to release the metadata file. It can block, so only
+    /// call it off the UI thread.
+    pub fn save_for_project_with_retry(
+        &self,
+    ) -> Result<(), Either<serde_json::Error, std::io::Error>> {
+        self.save_for_project_logged(std::time::Duration::from_secs(2))
+    }
+
+    fn save_for_project_logged(
+        &self,
+        busy_retry: std::time::Duration,
+    ) -> Result<(), Either<serde_json::Error, std::io::Error>> {
+        self.save_for_project_with(busy_retry, |file, bytes| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .inspect_err(|error| {
+            let path = self.project_path.join("recording-meta.json");
+            let (kind, os_error) = match error {
+                Either::Left(_) => (None, None),
+                Either::Right(error) => (Some(error.kind()), error.raw_os_error()),
+            };
+            warn!(
+                path = %path.display(),
+                path_len = path.as_os_str().len(),
+                ?kind,
+                ?os_error,
+                %error,
+                "Recording metadata save failed"
+            );
+        })
+    }
+
+    fn save_for_project_with(
+        &self,
+        #[cfg_attr(not(windows), allow(unused_variables))] busy_retry: std::time::Duration,
+        prepare: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), Either<serde_json::Error, std::io::Error>> {
+        let meta = serde_json::to_string_pretty(self).map_err(Either::Left)?;
+        let meta_path = self.project_path.join("recording-meta.json");
+        let permissions = match std::fs::symlink_metadata(&meta_path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(Either::Right(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Recording metadata must be a regular file",
+                )));
+            }
+            Ok(metadata) if metadata.permissions().readonly() => {
+                return Err(Either::Right(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Recording metadata is read-only",
+                )));
+            }
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(Either::Right(error)),
+        };
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".recording-meta-").suffix(".json.tmp");
+        // tempfile marks its Windows files FILE_ATTRIBUTE_TEMPORARY and clears
+        // that in keep() through a SetFileAttributesW call on the raw path,
+        // which fails once the path passes MAX_PATH. Studio finalization saves
+        // inside `<project>/.recovery-<uuid>/staged`, so long recording names
+        // failed every stop there while std's long-path-aware I/O succeeded.
+        #[cfg(windows)]
+        let temporary = builder.make_in(&self.project_path, |path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+        });
+        #[cfg(not(windows))]
+        let temporary = builder.tempfile_in(&self.project_path);
+        let mut temporary = temporary.map_err(Either::Right)?;
+        if let Some(permissions) = permissions {
+            temporary
+                .as_file()
+                .set_permissions(permissions)
+                .map_err(Either::Right)?;
+        }
+        prepare(temporary.as_file_mut(), meta.as_bytes()).map_err(Either::Right)?;
+        #[cfg(windows)]
+        {
+            // tempfile 3.23 lacks Rust's Windows rename fallback for open readers.
+            let (file, mut path) = temporary.into_parts();
+            replace_metadata_file(&path, &meta_path, busy_retry).map_err(Either::Right)?;
+            path.disable_cleanup(true);
+            drop(file);
+        }
+        #[cfg(not(windows))]
+        drop(
+            temporary
+                .persist(&meta_path)
+                .map_err(|error| Either::Right(error.error))?,
+        );
+        Ok(())
+    }
+
+    pub fn project_config(&self) -> ProjectConfiguration {
+        // Imports have no config until their first edit, so a missing file is
+        // a new project. One that exists but fails to parse keeps reading as
+        // the plain default.
+        let mut config = match ProjectConfiguration::load(&self.project_path) {
+            Ok(config) => config,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ProjectConfiguration::for_new_project()
+            }
+            Err(_) => ProjectConfiguration::default(),
+        };
+
+        let captions_path = self.project_path.join("captions.json");
+        debug!("Checking for captions at: {:?}", captions_path);
+
+        if config.captions.is_none()
+            && let Ok(captions_str) = std::fs::read_to_string(&captions_path)
+        {
+            debug!("Found captions.json, attempting to parse");
+            if let Ok(captions_data) = serde_json::from_str::<CaptionsData>(&captions_str) {
+                info!(
+                    "Successfully loaded captions with {} segments",
+                    captions_data.segments.len()
+                );
+                config.captions = Some(captions_data);
+            } else {
+                warn!("Failed to parse captions.json");
+            }
+        } else if config.captions.is_none() {
+            debug!("No captions.json found");
+        }
+
+        if let Some(ref captions) = config.captions {
+            let timeline_needs_captions = config
+                .timeline
+                .as_ref()
+                .is_some_and(|timeline| timeline.caption_segments.is_empty());
+
+            if timeline_needs_captions && !captions.segments.is_empty() {
+                let caption_track_segments: Vec<crate::CaptionTrackSegment> = captions
+                    .segments
+                    .iter()
+                    .map(|seg| crate::CaptionTrackSegment {
+                        id: seg.id.clone(),
+                        start: seg.start as f64,
+                        end: seg.end as f64,
+                        text: seg.text.clone(),
+                        words: seg.words.clone(),
+                        fade_duration_override: None,
+                        linger_duration_override: None,
+                        position_override: None,
+                        color_override: None,
+                        background_color_override: None,
+                        font_size_override: None,
+                    })
+                    .collect();
+
+                if let Some(ref mut timeline) = config.timeline {
+                    timeline.caption_segments = caption_track_segments;
+                }
+            }
+        }
+
+        config
+    }
+
+    pub fn output_path(&self) -> PathBuf {
+        match &self.inner {
+            RecordingMetaInner::Instant(_) => self.project_path.join("content/output.mp4"),
+            RecordingMetaInner::Studio(_) => self.project_path.join("output").join("result.mp4"),
+        }
+    }
+
+    pub fn studio_meta(&self) -> Option<&StudioRecordingMeta> {
+        match &self.inner {
+            RecordingMetaInner::Studio(meta) => Some(meta),
+            _ => None,
+        }
+    }
+
+    fn normalize_paths(&mut self) {
+        let normalize_video = |meta: &mut VideoMeta| normalize_relative_path(&mut meta.path);
+        let normalize_audio = |meta: &mut AudioMeta| normalize_relative_path(&mut meta.path);
+        let normalize_optional_path = |path: &mut Option<RelativePathBuf>| {
+            if let Some(path) = path {
+                normalize_relative_path(path);
+            }
+        };
+
+        match &mut self.inner {
+            RecordingMetaInner::Studio(meta) => match meta.as_mut() {
+                StudioRecordingMeta::SingleSegment { segment } => {
+                    normalize_video(&mut segment.display);
+                    if let Some(camera) = &mut segment.camera {
+                        normalize_video(camera);
+                    }
+                    if let Some(audio) = &mut segment.audio {
+                        normalize_audio(audio);
+                    }
+                    normalize_optional_path(&mut segment.cursor);
+                }
+                StudioRecordingMeta::MultipleSegments { inner } => {
+                    for segment in &mut inner.segments {
+                        normalize_video(&mut segment.display);
+                        if let Some(camera) = &mut segment.camera {
+                            normalize_video(camera);
+                        }
+                        if let Some(mic) = &mut segment.mic {
+                            normalize_audio(mic);
+                        }
+                        if let Some(system_audio) = &mut segment.system_audio {
+                            normalize_audio(system_audio);
+                        }
+                        normalize_optional_path(&mut segment.cursor);
+                        normalize_optional_path(&mut segment.keyboard);
+                    }
+
+                    if let Cursors::Correct(cursors) = &mut inner.cursors {
+                        for cursor in cursors.values_mut() {
+                            normalize_relative_path(&mut cursor.image_path);
+                        }
+                    }
+                }
+            },
+            RecordingMetaInner::Instant(_) => {}
+        }
+    }
+}
+
+/// Antivirus, the search indexer and cloud sync briefly open a file that was
+/// just written, and Windows refuses to replace a file another handle holds
+/// without FILE_SHARE_DELETE, so callers off the UI thread retry those
+/// refusals for `busy_retry`.
+#[cfg(windows)]
+fn replace_metadata_file(
+    from: &Path,
+    to: &Path,
+    busy_retry: std::time::Duration,
+) -> std::io::Result<()> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    let started = std::time::Instant::now();
+    let mut retries = 0_u32;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ) && started.elapsed() < busy_retry =>
+            {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            result => {
+                if retries > 0 {
+                    warn!(
+                        path = %to.display(),
+                        retries,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        succeeded = result.is_ok(),
+                        "Recording metadata replace was blocked by another handle"
+                    );
+                }
+                return result;
+            }
+        }
+    }
+}
+
+fn normalize_relative_path(path: &mut RelativePathBuf) {
+    // No real file name holds a NUL, and every media opener (FFmpeg, AVFoundation)
+    // converts the path to a C string, which a NUL makes fail or panic. Dropping
+    // it turns a damaged meta into an ordinary missing file.
+    if path.as_str().contains('\0') {
+        *path = RelativePathBuf::from(path.as_str().replace('\0', ""));
+    }
+    let original = path.as_str();
+    let normalized = original.replace('\\', "/");
+
+    if normalized.starts_with("content/")
+        || normalized.starts_with("screenshots/")
+        || normalized.starts_with("output/")
+    {
+        *path = RelativePathBuf::from(normalized);
+        return;
+    }
+
+    for root in ["content/", "screenshots/", "output/"] {
+        if let Some(index) = normalized.find(root) {
+            *path = RelativePathBuf::from(&normalized[index..]);
+            return;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(untagged, rename_all = "camelCase")]
+pub enum StudioRecordingMeta {
+    SingleSegment {
+        #[serde(flatten)]
+        #[specta(flatten)]
+        segment: SingleSegment,
+    },
+    MultipleSegments {
+        #[serde(flatten)]
+        #[specta(flatten)]
+        inner: MultipleSegments,
+    },
+}
+
+impl StudioRecordingMeta {
+    pub fn is_audio_only(&self) -> bool {
+        match self {
+            StudioRecordingMeta::SingleSegment { .. } => false,
+            StudioRecordingMeta::MultipleSegments { inner } => inner.audio_only,
+        }
+    }
+
+    /// Notch captured with this recording. Every segment shares one display, so
+    /// the first segment speaks for all of them. `None` for recordings made
+    /// before Cap started capturing this, and for every non-macOS recording.
+    pub fn display_notch(&self) -> Option<DisplayNotch> {
+        match self {
+            StudioRecordingMeta::SingleSegment { .. } => None,
+            StudioRecordingMeta::MultipleSegments { inner } => {
+                inner.segments.first().and_then(|s| s.display_notch)
+            }
+        }
+    }
+
+    pub fn status(&self) -> StudioRecordingStatus {
+        match self {
+            StudioRecordingMeta::SingleSegment { .. } => StudioRecordingStatus::Complete,
+            StudioRecordingMeta::MultipleSegments { inner } => inner
+                .status
+                .clone()
+                .unwrap_or(StudioRecordingStatus::Complete),
+        }
+    }
+
+    pub fn ensure_ordinary_media_access(&self, project_path: &Path) -> Result<(), String> {
+        if let StudioRecordingStatus::Failed { error } = self.status() {
+            return Err(format!(
+                "This recording failed: {error}. Its original files are preserved and may contain incomplete tracks. Open the recording folder to inspect them."
+            ));
+        }
+
+        let path = project_path.join("recording-diagnostics.json");
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "Cannot verify preserved recording diagnostics: {error}. Original files are unchanged."
+                ));
+            }
+        };
+        let diagnostics: serde_json::Value = serde_json::from_slice(&raw).map_err(|error| {
+            format!("Cannot verify preserved recording diagnostics: {error}. Original files are unchanged.")
+        })?;
+        let failed = diagnostics
+            .get("segments")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|segments| {
+                segments.iter().any(|segment| {
+                    segment
+                        .get("trackFailures")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|failures| !failures.is_empty())
+                })
+            });
+        if failed && self.legacy_omitted_track_failures(&diagnostics).is_none() {
+            return Err(
+                "This recording retains a requested-track failure or incomplete diagnostics. Its original files are preserved. Open the recording folder to inspect them."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn legacy_omitted_track_failures(
+        &self,
+        diagnostics: &serde_json::Value,
+    ) -> Option<Vec<(usize, &'static str)>> {
+        let Self::MultipleSegments { inner } = self else {
+            return None;
+        };
+        if !matches!(
+            inner.status,
+            Some(StudioRecordingStatus::Complete | StudioRecordingStatus::NeedsRemux)
+        ) || diagnostics.get("version")?.as_u64()? != 1
+        {
+            return None;
+        }
+
+        let mut omitted = Vec::new();
+        for segment in diagnostics.get("segments")?.as_array()? {
+            let index = usize::try_from(segment.get("segmentIndex")?.as_u64()?).ok()?;
+            let recorded = inner.segments.get(index)?;
+            for failure in segment.get("trackFailures")?.as_array()? {
+                if !matches!(failure.get("stage")?.as_str()?, "runtime" | "stop") {
+                    return None;
+                }
+                failure.get("error")?.as_str()?;
+                let track = match failure.get("track")?.as_str()? {
+                    "microphone" if recorded.mic.is_none() => "microphone",
+                    "camera" if recorded.camera.is_none() => "camera",
+                    "systemAudio" if recorded.system_audio.is_none() => "systemAudio",
+                    _ => return None,
+                };
+                omitted.push((index, track));
+            }
+        }
+        Some(omitted)
+    }
+
+    pub fn camera_path(&self) -> Option<RelativePathBuf> {
+        match self {
+            Self::SingleSegment { segment } => segment.camera.as_ref().map(|c| c.path.clone()),
+            Self::MultipleSegments { inner, .. } => inner
+                .segments
+                .first()
+                .and_then(|s| s.camera.as_ref().map(|c| c.path.clone())),
+        }
+    }
+
+    pub fn pointer_cursor_ids(&self) -> HashSet<String> {
+        match self {
+            StudioRecordingMeta::MultipleSegments { inner, .. } => inner.pointer_cursor_ids(),
+            _ => HashSet::new(),
+        }
+    }
+
+    pub fn cursor_shape_version(&self) -> u32 {
+        match self {
+            StudioRecordingMeta::MultipleSegments { inner } => inner.cursor_shape_version,
+            StudioRecordingMeta::SingleSegment { .. } => 0,
+        }
+    }
+
+    pub fn segment_cursor_shape_version(&self, segment: &MultipleSegment) -> u32 {
+        match self {
+            StudioRecordingMeta::MultipleSegments { inner } => segment
+                .cursor_shape_version
+                .unwrap_or(inner.cursor_shape_version),
+            StudioRecordingMeta::SingleSegment { .. } => 0,
+        }
+    }
+
+    pub fn stabilize_cursor_shapes(
+        &self,
+        segment: Option<&MultipleSegment>,
+        events: &mut CursorEvents,
+    ) {
+        let version = segment.map_or_else(
+            || self.cursor_shape_version(),
+            |segment| self.segment_cursor_shape_version(segment),
+        );
+        let current = version >= CURSOR_SHAPE_VERSION;
+        let pointer_ids = match self {
+            StudioRecordingMeta::MultipleSegments { inner } => inner.arrow_cursor_ids(current),
+            StudioRecordingMeta::SingleSegment { .. } => HashSet::new(),
+        };
+        let pointer_ids = (!pointer_ids.is_empty()).then_some(&pointer_ids);
+        if current {
+            events.hold_brief_cursor_shapes(pointer_ids, MIN_VISIBLE_CURSOR_SHAPE_MS);
+        } else {
+            events.stabilize_short_lived_cursor_shapes(pointer_ids, SHORT_CURSOR_SHAPE_DEBOUNCE_MS);
+        }
+    }
+
+    pub fn min_fps(&self) -> u32 {
+        match self {
+            Self::SingleSegment { segment } => segment.display.fps,
+            Self::MultipleSegments { inner, .. } => {
+                inner.segments.iter().map(|s| s.display.fps).min().unwrap()
+            }
+        }
+    }
+
+    pub fn max_fps(&self) -> u32 {
+        match self {
+            Self::SingleSegment { segment } => segment.display.fps,
+            Self::MultipleSegments { inner, .. } => {
+                inner.segments.iter().map(|s| s.display.fps).max().unwrap()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleSegment {
+    pub display: VideoMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<VideoMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub cursor: Option<RelativePathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MultipleSegments {
+    pub segments: Vec<MultipleSegment>,
+    #[serde(default, skip_serializing_if = "Cursors::is_empty")]
+    pub cursors: Cursors,
+    #[serde(default)]
+    pub status: Option<StudioRecordingStatus>,
+    #[serde(default, skip_serializing_if = "is_legacy_cursor_shape_version")]
+    pub cursor_shape_version: u32,
+    /// Recorded from the microphone and system audio alone. Each segment's
+    /// display track is a small black placeholder that keeps the timeline,
+    /// recovery and the editor on their usual paths; it is never shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub audio_only: bool,
+}
+
+fn is_legacy_cursor_shape_version(version: &u32) -> bool {
+    *version == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "status")]
+pub enum StudioRecordingStatus {
+    InProgress,
+    NeedsRemux,
+    Failed { error: String },
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(untagged, rename_all = "camelCase")]
+pub enum Cursors {
+    Old(HashMap<String, String>),
+    Correct(HashMap<String, CursorMeta>),
+}
+
+impl Cursors {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Cursors::Old(map) => map.is_empty(),
+            Cursors::Correct(map) => map.is_empty(),
+        }
+    }
+}
+
+impl Default for Cursors {
+    fn default() -> Self {
+        Self::Correct(Default::default())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorMeta {
+    #[specta(type = String)]
+    pub image_path: RelativePathBuf,
+    pub hotspot: XY<f64>,
+    #[serde(default)]
+    pub shape: Option<cap_cursor_info::CursorShape>,
+}
+
+impl MultipleSegments {
+    pub fn path(&self, meta: &RecordingMeta, path: impl AsRef<Path>) -> PathBuf {
+        meta.project_path.join(path)
+    }
+
+    pub fn pointer_cursor_ids(&self) -> HashSet<String> {
+        self.arrow_cursor_ids(false)
+    }
+
+    fn arrow_cursor_ids(&self, include_tahoe: bool) -> HashSet<String> {
+        use cap_cursor_info::{CursorShape, CursorShapeMacOS, CursorShapeWindows};
+        match &self.cursors {
+            Cursors::Correct(map) => map
+                .iter()
+                .filter_map(|(id, cursor)| match cursor.shape.as_ref() {
+                    Some(CursorShape::MacOS(CursorShapeMacOS::Arrow))
+                    | Some(CursorShape::Windows(CursorShapeWindows::Arrow)) => Some(id.clone()),
+                    Some(CursorShape::MacOS(CursorShapeMacOS::TahoeArrow)) if include_tahoe => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Cursors::Old(_) => HashSet::new(),
+        }
+    }
+
+    pub fn get_cursor_image(&self, meta: &RecordingMeta, id: &str) -> Option<CursorImage> {
+        match &self.cursors {
+            Cursors::Old(_) => None,
+            Cursors::Correct(map) => {
+                let cursor = map.get(id)?;
+                Some(CursorImage {
+                    path: meta.path(&cursor.image_path),
+                    hotspot: cursor.hotspot,
+                })
+            }
+        }
+    }
+}
+
+/// An audio track that starts more than this many seconds after the segment's
+/// screen and camera is late: it no longer sets the segment's start, and its
+/// clip offset turns negative so it plays from where it was recorded with
+/// silence before it. A microphone that delivers nothing after a resume, or
+/// only comes back part way through a segment, records its start that late
+/// (at the stop time when it never delivered). Aligning to it skipped the
+/// screen and camera forward and held their last frame.
+///
+/// Tracks of a normal recording start within a few hundred milliseconds of
+/// each other: the largest audio lag across 152 audio tracks of real Studio
+/// recordings was 0.155 s (a legacy first-packet system audio start), so
+/// those keep their exact alignment. It matches the recorder's own outage
+/// threshold: a microphone silent for a second is treated as stalled.
+pub const LATE_AUDIO_START_SECS: f64 = 1.0;
+
+fn is_late_audio_start(audio_start: f64, video_start: f64) -> bool {
+    audio_start - video_start > LATE_AUDIO_START_SECS
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct MultipleSegment {
+    pub display: VideoMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<VideoMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "audio")]
+    pub mic: Option<AudioMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio: Option<AudioMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub cursor: Option<RelativePathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub keyboard: Option<RelativePathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_notch: Option<DisplayNotch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_shape_version: Option<u32>,
+}
+
+impl MultipleSegment {
+    pub fn usable_system_audio(&self) -> Option<&AudioMeta> {
+        self.system_audio
+            .as_ref()
+            .filter(|audio| audio.start_time.is_some() == self.display.start_time.is_some())
+    }
+
+    pub fn path(&self, meta: &RecordingMeta, path: impl AsRef<Path>) -> PathBuf {
+        meta.project_path.join(path)
+    }
+
+    pub fn cursor_events(&self, meta: &RecordingMeta) -> CursorEvents {
+        let Some(cursor_path) = &self.cursor else {
+            return CursorEvents::default();
+        };
+
+        let full_path = meta.path(cursor_path);
+
+        let mut data = match CursorEvents::load_from_file(&full_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Failed to load cursor data: {e}");
+                return CursorEvents::default();
+            }
+        };
+
+        if let RecordingMetaInner::Studio(studio_meta) = &meta.inner {
+            studio_meta.stabilize_cursor_shapes(Some(self), &mut data);
+        } else {
+            data.stabilize_short_lived_cursor_shapes(None, SHORT_CURSOR_SHAPE_DEBOUNCE_MS);
+        }
+
+        data
+    }
+
+    pub fn keyboard_events(&self, meta: &RecordingMeta) -> KeyboardEvents {
+        let keyboard_path = self.keyboard.clone().or_else(|| {
+            let display_dir = self.display.path.parent()?;
+            let binary = display_dir.join(crate::KEYBOARD_EVENTS_FILE_NAME);
+            let binary_full = meta.path(&binary);
+            if binary_full.exists() {
+                return Some(binary);
+            }
+
+            let legacy = display_dir.join(crate::LEGACY_KEYBOARD_EVENTS_FILE_NAME);
+            let legacy_full = meta.path(&legacy);
+            legacy_full.exists().then_some(legacy)
+        });
+
+        let Some(keyboard_path) = keyboard_path else {
+            return KeyboardEvents::default();
+        };
+
+        let full_path = meta.path(&keyboard_path);
+
+        match KeyboardEvents::load_from_file(&full_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Failed to load keyboard data: {e}");
+                KeyboardEvents::default()
+            }
+        }
+    }
+
+    /// The segment time every track is aligned to: segment time zero is this
+    /// many seconds after the recording epoch. It is the latest track start,
+    /// except that a late audio track (see [`LATE_AUDIO_START_SECS`]) is left
+    /// out, so it cannot skip the screen and camera forward to its start.
+    pub fn latest_start_time(&self) -> Option<f64> {
+        let video_start = self.video_start_time()?;
+        let mut value = video_start;
+
+        for audio in self.aligned_audio() {
+            let start = audio.start_time?;
+            if !is_late_audio_start(start, video_start) {
+                value = value.max(start);
+            }
+        }
+
+        Some(value)
+    }
+
+    /// Whether an audio track started so long after the video that it no
+    /// longer sets the segment's start (see [`LATE_AUDIO_START_SECS`]).
+    pub fn has_late_audio(&self) -> bool {
+        let Some(video_start) = self.video_start_time() else {
+            return false;
+        };
+        self.aligned_audio()
+            .filter_map(|audio| audio.start_time)
+            .any(|start| is_late_audio_start(start, video_start))
+    }
+
+    /// The segment start before late audio was left out: the latest start of
+    /// every track. Projects saved then are timed against it.
+    pub(crate) fn legacy_latest_start_time(&self) -> Option<f64> {
+        let mut value = self.video_start_time()?;
+        for audio in self.aligned_audio() {
+            value = value.max(audio.start_time?);
+        }
+        Some(value)
+    }
+
+    fn video_start_time(&self) -> Option<f64> {
+        let display_start = self.display.start_time?;
+        match &self.camera {
+            Some(camera) => Some(display_start.max(camera.start_time?)),
+            None => Some(display_start),
+        }
+    }
+
+    fn aligned_audio(&self) -> impl Iterator<Item = &AudioMeta> {
+        [self.mic.as_ref(), self.usable_system_audio()]
+            .into_iter()
+            .flatten()
+    }
+
+    pub fn calculate_audio_offsets(&self) -> crate::ClipOffsets {
+        self.calculate_audio_offsets_with_calibration(None)
+    }
+
+    pub fn calculate_audio_offsets_with_calibration(
+        &self,
+        calibration_offset: Option<f32>,
+    ) -> crate::ClipOffsets {
+        let latest = match self.latest_start_time() {
+            Some(t) => t,
+            None => return crate::ClipOffsets::default(),
+        };
+
+        let cal_offset = calibration_offset.unwrap_or(0.0);
+
+        let mic_offset = self
+            .mic
+            .as_ref()
+            .and_then(|m| m.start_time)
+            .map(|t| (latest - t) as f32 + cal_offset)
+            .unwrap_or(0.0);
+
+        let system_audio_offset = self
+            .usable_system_audio()
+            .and_then(|s| s.start_time)
+            .map(|t| (latest - t) as f32 + cal_offset)
+            .unwrap_or(0.0);
+
+        // The camera needs no clip offset: its decoder is already aligned to
+        // the latest start time (rendering's `segment_video_timing`). Adding
+        // `latest - camera.start` here as well plays the camera that far ahead.
+        crate::ClipOffsets {
+            camera: 0.0,
+            mic: mic_offset,
+            system_audio: system_audio_offset,
+        }
+    }
+
+    pub fn camera_device_id(&self) -> Option<&str> {
+        self.camera.as_ref().and_then(|c| c.device_id.as_deref())
+    }
+
+    pub fn mic_device_id(&self) -> Option<&str> {
+        self.mic.as_ref().and_then(|m| m.device_id.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod metadata_save_tests {
+    use super::*;
+    use std::io::Read;
+
+    const LEGACY_METADATA: &str = r#"{"platform":"MacOS","pretty_name":"Cap 0.5.9 recording","sharing":null,"segments":[{"display":{"path":"content/segments/segment-0/display.mp4","fps":30,"start_time":0.0}}],"cursors":{},"status":{"status":"NeedsRemux"}}"#;
+
+    fn recording(project: &Path) -> RecordingMeta {
+        let mut meta: RecordingMeta = serde_json::from_str(LEGACY_METADATA).unwrap();
+        meta.project_path = project.to_path_buf();
+        meta
+    }
+
+    fn assert_no_temporary_metadata(project: &Path) {
+        assert!(std::fs::read_dir(project).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".recording-meta-")
+        }));
+    }
+
+    #[test]
+    fn only_a_project_without_a_config_starts_as_a_new_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta = recording(directory.path());
+        assert_eq!(
+            meta.project_config().background.padding_mode,
+            crate::PaddingMode::Even
+        );
+
+        let mut saved = ProjectConfiguration::default();
+        saved.background.padding = 10.0;
+        saved.write(directory.path()).unwrap();
+        let loaded = meta.project_config();
+        assert_eq!(
+            loaded.background.padding_mode,
+            crate::PaddingMode::Proportional
+        );
+        assert_eq!(loaded.background.padding, 10.0);
+
+        std::fs::write(directory.path().join("project-config.json"), b"{not json").unwrap();
+        assert_eq!(
+            meta.project_config().background.padding_mode,
+            crate::PaddingMode::Proportional
+        );
+    }
+
+    #[test]
+    fn caption_loading_preserves_missing_empty_and_populated_timelines() {
+        let captions = CaptionsData {
+            source_timed: true,
+            segments: vec![crate::CaptionSegment {
+                id: "source-caption".into(),
+                start: 1.25,
+                end: 2.75,
+                text: "Café 字".into(),
+                words: vec![crate::CaptionWord {
+                    text: "Café".into(),
+                    start: 1.25,
+                    end: 2.0,
+                }],
+                recording_clip: None,
+            }],
+            ..Default::default()
+        };
+        let saved: crate::CaptionTrackSegment = serde_json::from_value(serde_json::json!({
+            "id": "saved", "start": 5.0, "end": 6.0, "text": "Saved", "words": [],
+            "colorOverride": "#123456", "fadeDurationOverride": 0.75,
+        }))
+        .unwrap();
+        let generated = serde_json::json!([{
+            "id": "source-caption", "start": 1.25, "end": 2.75, "text": "Café 字",
+            "words": [{"text": "Café", "start": 1.25, "end": 2.0}],
+            "fadeDurationOverride": null, "lingerDurationOverride": null,
+            "positionOverride": null, "colorOverride": null,
+            "backgroundColorOverride": null, "fontSizeOverride": null,
+        }]);
+        for sidecar in [false, true] {
+            for timeline in 0..3 {
+                let directory = tempfile::tempdir().unwrap();
+                let meta = recording(directory.path());
+                let mut config = ProjectConfiguration {
+                    captions: (!sidecar).then(|| captions.clone()),
+                    ..Default::default()
+                };
+                if timeline > 0 {
+                    config.timeline = Some(serde_json::from_value(serde_json::json!({
+                        "segments": [], "zoomSegments": [],
+                        "captionSegments": if timeline == 2 { serde_json::to_value([&saved]).unwrap() } else { serde_json::json!([]) },
+                    })).unwrap());
+                }
+                if !sidecar || timeline > 0 {
+                    config.write(directory.path()).unwrap();
+                }
+                if sidecar {
+                    std::fs::write(
+                        directory.path().join("captions.json"),
+                        serde_json::to_vec(&captions).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let loaded = meta.project_config();
+                assert_eq!(
+                    serde_json::to_value(loaded.captions.unwrap()).unwrap(),
+                    serde_json::to_value(&captions).unwrap()
+                );
+                if timeline == 0 {
+                    assert!(loaded.timeline.is_none());
+                } else {
+                    assert_eq!(
+                        serde_json::to_value(loaded.timeline.unwrap().caption_segments).unwrap(),
+                        if timeline == 1 {
+                            generated.clone()
+                        } else {
+                            serde_json::to_value([&saved]).unwrap()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_caption_master_takes_precedence_over_legacy_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta = recording(directory.path());
+        let captions = |text: &str| CaptionsData {
+            source_timed: true,
+            segments: vec![crate::CaptionSegment {
+                id: "caption".into(),
+                start: 1.0,
+                end: 2.0,
+                text: text.into(),
+                words: Vec::new(),
+                recording_clip: None,
+            }],
+            ..Default::default()
+        };
+        let config = ProjectConfiguration {
+            captions: Some(captions("edited")),
+            ..Default::default()
+        };
+        config.write(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("captions.json"),
+            serde_json::to_vec(&captions("stale")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.project_config().captions.unwrap().segments[0].text,
+            "edited"
+        );
+        ProjectConfiguration::default()
+            .write(directory.path())
+            .unwrap();
+        assert_eq!(
+            meta.project_config().captions.unwrap().segments[0].text,
+            "stale"
+        );
+    }
+
+    #[test]
+    fn new_metadata_preserves_legacy_serialization_and_loads() {
+        let project = tempfile::tempdir().unwrap();
+        let meta = recording(project.path());
+        meta.save_for_project().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("recording-meta.json")).unwrap(),
+            serde_json::to_string_pretty(&meta).unwrap()
+        );
+        let loaded = RecordingMeta::load_for_project(project.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(meta).unwrap()
+        );
+        assert_no_temporary_metadata(project.path());
+    }
+
+    #[test]
+    fn replacing_metadata_does_not_modify_the_previous_file() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("recording-meta.json");
+        std::fs::write(&path, LEGACY_METADATA).unwrap();
+        let mut previous = std::fs::File::open(&path).unwrap();
+        let mut meta = recording(project.path());
+        meta.pretty_name = "Finished recording".into();
+
+        meta.save_for_project().unwrap();
+
+        let mut previous_bytes = String::new();
+        previous.read_to_string(&mut previous_bytes).unwrap();
+        assert_eq!(previous_bytes, LEGACY_METADATA);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serde_json::to_string_pretty(&meta).unwrap()
+        );
+        assert_eq!(
+            RecordingMeta::load_for_project(project.path())
+                .unwrap()
+                .pretty_name,
+            "Finished recording"
+        );
+        assert_no_temporary_metadata(project.path());
+    }
+
+    #[test]
+    fn failed_staged_write_or_sync_preserves_previous_metadata() {
+        for partial_write in [true, false] {
+            let project = tempfile::tempdir().unwrap();
+            let path = project.path().join("recording-meta.json");
+            std::fs::write(&path, LEGACY_METADATA).unwrap();
+            let mut meta = recording(project.path());
+            meta.pretty_name = "Must not be published".into();
+            let failure = if partial_write {
+                "injected incomplete write"
+            } else {
+                "injected file sync failure"
+            };
+
+            let result = meta.save_for_project_with(std::time::Duration::ZERO, |file, bytes| {
+                let count = if partial_write {
+                    bytes.len() / 2
+                } else {
+                    bytes.len()
+                };
+                file.write_all(&bytes[..count])?;
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), LEGACY_METADATA);
+                Err(std::io::Error::other(failure))
+            });
+
+            assert!(matches!(result, Err(Either::Right(error)) if error.to_string() == failure));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), LEGACY_METADATA);
+            assert_eq!(
+                RecordingMeta::load_for_project(project.path())
+                    .unwrap()
+                    .pretty_name,
+                "Cap 0.5.9 recording"
+            );
+            assert_no_temporary_metadata(project.path());
+        }
+    }
+
+    #[test]
+    fn non_file_metadata_destination_is_preserved() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("recording-meta.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("retained"), b"original").unwrap();
+
+        assert!(recording(project.path()).save_for_project().is_err());
+
+        assert_eq!(std::fs::read(path.join("retained")).unwrap(), b"original");
+        assert_no_temporary_metadata(project.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn denied_metadata_replacement_preserves_previous_metadata() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("recording-meta.json");
+        std::fs::write(&path, LEGACY_METADATA).unwrap();
+        let mut locked = None;
+        let result = recording(project.path()).save_for_project_with(
+            std::time::Duration::ZERO,
+            |file, bytes| {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                locked = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(&path)?,
+                );
+                Ok(())
+            },
+        );
+
+        assert!(locked.is_some());
+        drop(locked);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), LEGACY_METADATA);
+        assert_no_temporary_metadata(project.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_saves_when_the_temporary_path_passes_max_path() {
+        let root = tempfile::tempdir().unwrap();
+        let padding = 245_usize.saturating_sub(root.path().as_os_str().len() + 1);
+        assert!((1..=255).contains(&padding));
+        let project = root.path().join("r".repeat(padding));
+        std::fs::create_dir(&project).unwrap();
+        assert!(
+            project
+                .join(".recording-meta-000000.json.tmp")
+                .as_os_str()
+                .len()
+                > 260
+        );
+
+        let mut meta = recording(&project);
+        meta.save_for_project().unwrap();
+        meta.pretty_name = "Finished recording".into();
+        meta.save_for_project().unwrap();
+
+        assert_eq!(
+            RecordingMeta::load_for_project(&project)
+                .unwrap()
+                .pretty_name,
+            "Finished recording"
+        );
+        assert_no_temporary_metadata(&project);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_replacement_waits_for_a_handle_without_share_delete() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 1;
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("recording-meta.json");
+        std::fs::write(&path, LEGACY_METADATA).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let mut meta = recording(project.path());
+        meta.pretty_name = "Finished recording".into();
+
+        let result = meta.save_for_project_with_retry();
+        release.join().unwrap();
+
+        result.unwrap();
+        assert_eq!(
+            RecordingMeta::load_for_project(project.path())
+                .unwrap()
+                .pretty_name,
+            "Finished recording"
+        );
+        assert_no_temporary_metadata(project.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_replacement_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("recording-meta.json");
+        std::fs::write(&path, LEGACY_METADATA).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        recording(project.path()).save_for_project().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_metadata_and_its_target_are_preserved() {
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join("original.json");
+        let path = project.path().join("recording-meta.json");
+        std::fs::write(&target, LEGACY_METADATA).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(recording(project.path()).save_for_project().is_err());
+
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), LEGACY_METADATA);
+        assert_no_temporary_metadata(project.path());
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::RecordingMeta;
+
+    fn test_meta_deserialize(s: &str) {
+        let _: RecordingMeta = serde_json::from_str(s).unwrap();
+    }
+
+    #[test]
+    fn single_segment() {
+        test_meta_deserialize(
+            r#"{
+						  "pretty_name": "Cap 2024-11-15 at 16.35.36",
+						  "sharing": null,
+						  "display": {
+						    "path": "content/display.mp4"
+						  },
+						  "camera": null,
+						  "audio": null,
+						  "segments": [
+						    {
+						      "start": 0.0,
+						      "end": 10.683263063430786
+						    }
+						  ],
+						  "cursor": "cursor.json"
+						}"#,
+        );
+
+        test_meta_deserialize(
+            r#"{
+	          "pretty_name": "Cap 2024-11-26 at 22.16.36",
+	          "sharing": null,
+	          "display": {
+	            "path": "content/display.mp4"
+	          },
+	          "camera": {
+	            "path": "content/camera.mp4"
+	          },
+	          "audio": {
+	            "path": "content/audio-input.mp3"
+	          },
+	          "segments": [],
+	          "cursor": "cursor.json"
+	        }"#,
+        );
+    }
+
+    #[test]
+    fn multi_segment() {
+        test_meta_deserialize(
+            r#"{
+              "pretty_name": "Cap 2024-11-26 at 22.29.30",
+              "sharing": null,
+              "segments": [
+                {
+                  "display": {
+                    "path": "content/segments/segment-0/display.mp4"
+                  },
+                  "camera": {
+                    "path": "content/segments/segment-0/camera.mp4"
+                  },
+                  "audio": {
+                    "path": "content/segments/segment-0/audio-input.mp3"
+                  }
+                }
+              ],
+              "cursors": {
+                "0": "content/cursors/cursor_0.png",
+                "3": "content/cursors/cursor_3.png",
+                "2": "content/cursors/cursor_2.png",
+                "1": "content/cursors/cursor_1.png"
+              }
+            }"#,
+        );
+
+        test_meta_deserialize(
+            r#"{
+	          "pretty_name": "Cap 2024-11-26 at 22.32.26",
+	          "sharing": null,
+	          "segments": [
+	            {
+	              "display": {
+	                "path": "content/segments/segment-0/display.mp4"
+	              },
+	              "camera": {
+	                "path": "content/segments/segment-0/camera.mp4"
+	              },
+	              "audio": {
+	                "path": "content/segments/segment-0/audio-input.mp3"
+	              }
+	            },
+	            {
+	              "display": {
+	                "path": "content/segments/segment-1/display.mp4"
+	              },
+	              "camera": {
+	                "path": "content/segments/segment-1/camera.mp4"
+	              },
+	              "audio": {
+	                "path": "content/segments/segment-1/audio-input.mp3"
+	              }
+	            }
+	          ]
+	        }"#,
+        );
+    }
+
+    mod audio_offsets {
+        use crate::{AudioMeta, MultipleSegment, VideoMeta};
+        use relative_path::RelativePathBuf;
+
+        fn video(start_time: Option<f64>) -> VideoMeta {
+            VideoMeta {
+                path: RelativePathBuf::from("display.mp4"),
+                fps: 30,
+                start_time,
+                device_id: None,
+            }
+        }
+
+        fn audio(start_time: Option<f64>) -> AudioMeta {
+            AudioMeta {
+                path: RelativePathBuf::from("audio.ogg"),
+                start_time,
+                device_id: None,
+                gap_summary: None,
+                digital_silence_ms: None,
+            }
+        }
+
+        fn segment(
+            display_start: f64,
+            mic_start: Option<f64>,
+            system_start: Option<f64>,
+        ) -> MultipleSegment {
+            MultipleSegment {
+                display: video(Some(display_start)),
+                camera: None,
+                mic: mic_start.map(|s| audio(Some(s))),
+                system_audio: system_start.map(|s| audio(Some(s))),
+                cursor: None,
+                keyboard: None,
+                display_notch: None,
+                cursor_shape_version: None,
+            }
+        }
+
+        // The recorder anchors system audio at the recording epoch
+        // (start_time ~ 0.0), which keeps it from ever being the latest
+        // start_time: the mic/display anchor — and therefore where playback
+        // starts and how the mic aligns to video — must be identical with
+        // and without a system audio track.
+        #[test]
+        fn epoch_anchored_system_audio_does_not_move_the_anchor() {
+            let without = segment(0.58, Some(0.55), None);
+            let with = segment(0.58, Some(0.55), Some(0.0));
+
+            assert_eq!(without.latest_start_time(), Some(0.58));
+            assert_eq!(with.latest_start_time(), Some(0.58));
+
+            let offsets_without = without.calculate_audio_offsets();
+            let offsets_with = with.calculate_audio_offsets();
+            assert_eq!(offsets_without.mic, offsets_with.mic);
+            assert!((offsets_with.mic - 0.03).abs() < 1e-6);
+            // System audio positions itself by its own start.
+            assert!((offsets_with.system_audio - 0.58).abs() < 1e-6);
+        }
+
+        // Legacy recordings (pre-epoch-anchor) stamped system audio with its
+        // first packet time; those files keep their historical alignment:
+        // a later system start is still the anchor for them.
+        #[test]
+        fn legacy_first_packet_system_audio_keeps_historical_anchor() {
+            let legacy = segment(0.5824678, Some(0.5559852), Some(0.6586015));
+            assert_eq!(legacy.latest_start_time(), Some(0.6586015));
+            let offsets = legacy.calculate_audio_offsets();
+            assert!((offsets.mic - (0.6586015 - 0.5559852) as f32).abs() < 1e-6);
+            assert_eq!(offsets.system_audio, 0.0);
+        }
+
+        // The camera decoder is aligned to the latest start time, so an early
+        // camera must not get a clip offset on top of that alignment.
+        #[test]
+        fn early_camera_gets_no_clip_offset() {
+            let mut early = segment(0.2, Some(1.0), None);
+            early.camera = Some(video(Some(0.0)));
+            assert_eq!(early.latest_start_time(), Some(1.0));
+            let offsets = early.calculate_audio_offsets_with_calibration(Some(0.05));
+            assert_eq!(offsets.camera, 0.0);
+            assert!((offsets.mic - 0.05).abs() < 1e-6);
+        }
+
+        #[test]
+        fn mismatched_system_audio_does_not_affect_timing_or_audio_selection() {
+            let mut segment = segment(10.0, Some(10.5), Some(11.0));
+            segment.camera = Some(video(Some(10.25)));
+            assert_eq!(segment.latest_start_time(), Some(11.0));
+            assert!(segment.usable_system_audio().is_some());
+
+            segment.system_audio.as_mut().unwrap().start_time = None;
+            assert!(segment.usable_system_audio().is_none());
+            assert_eq!(segment.latest_start_time(), Some(10.5));
+            let offsets = segment.calculate_audio_offsets();
+            assert_eq!(offsets.mic, 0.0);
+            assert_eq!(offsets.system_audio, 0.0);
+
+            segment.display.start_time = None;
+            assert!(segment.usable_system_audio().is_some());
+        }
+
+        // A microphone that delivered nothing in a segment records the stop
+        // time as its start. The screen must still start at its own start
+        // and the microphone play from where it was recorded.
+        #[test]
+        fn mic_that_never_started_does_not_move_the_video() {
+            let mut segment = segment(-0.053, Some(19.947), None);
+            segment.camera = Some(video(Some(-0.053)));
+            assert!(segment.has_late_audio());
+            assert_eq!(segment.latest_start_time(), Some(-0.053));
+            let offsets = segment.calculate_audio_offsets();
+            assert_eq!(offsets.camera, 0.0);
+            assert!((offsets.mic - -20.0).abs() < 1e-4);
+        }
+
+        // A microphone that came back part way through a segment plays at
+        // the time it came back, with calibration still applied.
+        #[test]
+        fn mic_recovered_mid_segment_keeps_its_recorded_time() {
+            let segment = segment(0.045, Some(5.045), Some(0.0));
+            assert!(segment.has_late_audio());
+            assert_eq!(segment.latest_start_time(), Some(0.045));
+            let offsets = segment.calculate_audio_offsets_with_calibration(Some(0.05));
+            assert!((offsets.mic - -4.95).abs() < 1e-4);
+            assert!((offsets.system_audio - 0.095).abs() < 1e-4);
+        }
+
+        // Late system audio is excluded the same way, while an on-time mic
+        // still sets the start.
+        #[test]
+        fn late_system_audio_is_excluded_but_on_time_mic_still_aligns() {
+            let segment = segment(1.0, Some(1.04), Some(8.0));
+            assert!(segment.has_late_audio());
+            assert_eq!(segment.latest_start_time(), Some(1.04));
+            let offsets = segment.calculate_audio_offsets();
+            assert_eq!(offsets.mic, 0.0);
+            assert!((offsets.system_audio - -6.96).abs() < 1e-4);
+        }
+
+        // Normal recordings start every track within a fraction of a second,
+        // up to and including the threshold: their alignment is unchanged.
+        #[test]
+        fn audio_within_threshold_keeps_historical_alignment() {
+            for lag in [0.0, 0.03, 0.155, 0.5, crate::LATE_AUDIO_START_SECS] {
+                let segment = segment(2.0, Some(2.0 + lag), None);
+                assert!(!segment.has_late_audio(), "lag {lag}");
+                assert_eq!(segment.latest_start_time(), Some(2.0 + lag));
+                assert_eq!(segment.calculate_audio_offsets().mic, 0.0);
+            }
+            let late = segment(2.0, Some(2.0 + crate::LATE_AUDIO_START_SECS + 0.01), None);
+            assert!(late.has_late_audio());
+            assert_eq!(late.latest_start_time(), Some(2.0));
+        }
+
+        // A late camera is video: it still sets the start, and audio is late
+        // only relative to the later of screen and camera.
+        #[test]
+        fn late_audio_is_measured_from_the_later_video_track() {
+            let mut segment = segment(0.0, Some(3.5), None);
+            segment.camera = Some(video(Some(3.0)));
+            assert!(!segment.has_late_audio());
+            assert_eq!(segment.latest_start_time(), Some(3.5));
+
+            segment.camera = Some(video(None));
+            assert!(!segment.has_late_audio());
+            assert_eq!(segment.latest_start_time(), None);
+
+            segment.camera = None;
+            segment.mic.as_mut().unwrap().start_time = None;
+            assert!(!segment.has_late_audio());
+            assert_eq!(segment.latest_start_time(), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_notch_tests {
+    use crate::{DisplayNotch, RecordingMeta, RecordingMetaInner, StudioRecordingMeta};
+
+    fn multiple_segments(display_notch: &str) -> String {
+        format!(
+            r#"{{
+              "pretty_name": "Cap",
+              "segments": [
+                {{
+                  "display": {{ "path": "content/segments/segment-0/display.mp4", "fps": 30 }}
+                  {display_notch}
+                }}
+              ]
+            }}"#
+        )
+    }
+
+    fn studio(meta: &RecordingMeta) -> &StudioRecordingMeta {
+        match &meta.inner {
+            RecordingMetaInner::Studio(studio) => studio,
+            RecordingMetaInner::Instant(_) => panic!("expected a studio recording"),
+        }
+    }
+
+    /// Every recording made before this field existed must still load.
+    #[test]
+    fn absent_notch_loads_as_none() {
+        let meta: RecordingMeta = serde_json::from_str(&multiple_segments("")).unwrap();
+
+        assert_eq!(studio(&meta).display_notch(), None);
+    }
+
+    #[test]
+    fn notch_round_trips() {
+        let notch = DisplayNotch {
+            x: 0.4384920634920635,
+            width: 0.12235449735449735,
+            height: 0.032586558044806514,
+        };
+
+        let meta: RecordingMeta = serde_json::from_str(&multiple_segments(
+            r#", "display_notch": { "x": 0.4384920634920635, "width": 0.12235449735449735, "height": 0.032586558044806514 }"#,
+        ))
+        .unwrap();
+        assert_eq!(studio(&meta).display_notch(), Some(notch));
+
+        let reparsed: RecordingMeta =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(studio(&reparsed).display_notch(), Some(notch));
+    }
+
+    /// Recordings without a notch shouldn't gain a null key in their metadata.
+    #[test]
+    fn absent_notch_is_not_serialized() {
+        let meta: RecordingMeta = serde_json::from_str(&multiple_segments("")).unwrap();
+
+        assert!(
+            !serde_json::to_string(&meta)
+                .unwrap()
+                .contains("display_notch")
+        );
+    }
+
+    /// Single-segment recordings predate the field entirely.
+    #[test]
+    fn legacy_single_segment_has_no_notch() {
+        let meta: RecordingMeta = serde_json::from_str(
+            r#"{
+              "pretty_name": "Cap",
+              "display": { "path": "content/display.mp4" },
+              "segments": [{ "start": 0.0, "end": 1.0 }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(studio(&meta).display_notch(), None);
+    }
+}
+
+#[cfg(test)]
+mod ordinary_media_access_tests {
+    use super::{
+        Cursors, MultipleSegments, RecordingMeta, StudioRecordingMeta, StudioRecordingStatus,
+    };
+
+    fn studio(status: Option<StudioRecordingStatus>) -> StudioRecordingMeta {
+        StudioRecordingMeta::MultipleSegments {
+            inner: MultipleSegments {
+                segments: Vec::new(),
+                cursors: Cursors::default(),
+                status,
+                cursor_shape_version: 0,
+                audio_only: false,
+            },
+        }
+    }
+
+    fn check_diagnostics(raw: &[u8], expected_ok: bool) {
+        let project = tempfile::tempdir().unwrap();
+        let diagnostics = project.path().join("recording-diagnostics.json");
+        let media = project.path().join("surviving-track.bin");
+        let config = project.path().join("project-config.json");
+        std::fs::write(&diagnostics, raw).unwrap();
+        std::fs::write(&media, b"incomplete original media").unwrap();
+        std::fs::write(&config, b"original config").unwrap();
+        let meta = studio(Some(StudioRecordingStatus::Complete));
+        let before = serde_json::to_vec(&meta).unwrap();
+        assert_eq!(
+            meta.ensure_ordinary_media_access(project.path()).is_ok(),
+            expected_ok
+        );
+        assert_eq!(std::fs::read(diagnostics).unwrap(), raw);
+        assert_eq!(std::fs::read(media).unwrap(), b"incomplete original media");
+        assert_eq!(std::fs::read(config).unwrap(), b"original config");
+        assert_eq!(serde_json::to_vec(&meta).unwrap(), before);
+    }
+
+    fn legacy_optional_failure() -> (StudioRecordingMeta, serde_json::Value) {
+        let recording: RecordingMeta = serde_json::from_str(
+            r#"{"platform":"MacOS","pretty_name":"Cap recording","sharing":null,"segments":[{"display":{"path":"content/segments/segment-0/display.mp4","fps":30,"start_time":0.0}}],"cursors":{},"status":{"status":"Complete"}}"#,
+        )
+        .unwrap();
+        let diagnostics = serde_json::json!({
+            "version": 1,
+            "segments": [{
+                "segmentIndex": 0,
+                "start": 10.0,
+                "end": 20.0,
+                "trackFailures": [{
+                    "track": "microphone",
+                    "stage": "runtime",
+                    "error": "microphone writer failed"
+                }]
+            }]
+        });
+        (recording.studio_meta().unwrap().clone(), diagnostics)
+    }
+
+    #[test]
+    fn released_059_omitted_optional_failures_remain_accessible() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("recording-diagnostics.json");
+        for status in [
+            StudioRecordingStatus::Complete,
+            StudioRecordingStatus::NeedsRemux,
+        ] {
+            for track in ["microphone", "camera", "systemAudio"] {
+                let (mut meta, mut diagnostics) = legacy_optional_failure();
+                let StudioRecordingMeta::MultipleSegments { inner } = &mut meta else {
+                    unreachable!();
+                };
+                inner.status = Some(status.clone());
+                diagnostics["segments"][0]["trackFailures"][0]["track"] = track.into();
+                let raw = serde_json::to_vec(&diagnostics).unwrap();
+                std::fs::write(&path, &raw).unwrap();
+                let original_meta = serde_json::to_vec(&meta).unwrap();
+                assert!(meta.ensure_ordinary_media_access(project.path()).is_ok());
+                assert_eq!(std::fs::read(&path).unwrap(), raw);
+                assert_eq!(serde_json::to_vec(&meta).unwrap(), original_meta);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_diagnostics_do_not_override_failed_or_uncertain_status() {
+        let project = tempfile::tempdir().unwrap();
+        for status in [
+            None,
+            Some(StudioRecordingStatus::InProgress),
+            Some(StudioRecordingStatus::Failed {
+                error: "requested microphone failed".into(),
+            }),
+        ] {
+            let (mut meta, diagnostics) = legacy_optional_failure();
+            let StudioRecordingMeta::MultipleSegments { inner } = &mut meta else {
+                unreachable!();
+            };
+            inner.status = status;
+            std::fs::write(
+                project.path().join("recording-diagnostics.json"),
+                serde_json::to_vec(&diagnostics).unwrap(),
+            )
+            .unwrap();
+            assert!(meta.ensure_ordinary_media_access(project.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn current_or_unresolved_failures_cannot_use_legacy_compatibility() {
+        let project = tempfile::tempdir().unwrap();
+        for (pointer, value) in [
+            ("/version", serde_json::json!(2)),
+            ("/version", serde_json::json!(0)),
+            ("/segments/0/segmentIndex", serde_json::json!(1)),
+            (
+                "/segments/0/trackFailures/0/track",
+                serde_json::json!("display"),
+            ),
+            (
+                "/segments/0/trackFailures/0/track",
+                serde_json::json!("unknown"),
+            ),
+            ("/segments/0/trackFailures/0/stage", serde_json::Value::Null),
+            ("/segments/0/trackFailures/0/error", serde_json::Value::Null),
+        ] {
+            let (meta, mut diagnostics) = legacy_optional_failure();
+            *diagnostics.pointer_mut(pointer).unwrap() = value;
+            std::fs::write(
+                project.path().join("recording-diagnostics.json"),
+                serde_json::to_vec(&diagnostics).unwrap(),
+            )
+            .unwrap();
+            assert!(meta.ensure_ordinary_media_access(project.path()).is_err());
+        }
+
+        let (meta, diagnostics) = legacy_optional_failure();
+        let mut raw_meta = serde_json::to_value(&meta).unwrap();
+        raw_meta["segments"][0]["mic"] = serde_json::json!({
+            "path": "content/segments/segment-0/audio-input.ogg"
+        });
+        let meta: StudioRecordingMeta = serde_json::from_value(raw_meta).unwrap();
+        std::fs::write(
+            project.path().join("recording-diagnostics.json"),
+            serde_json::to_vec(&diagnostics).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.ensure_ordinary_media_access(project.path()).is_err());
+    }
+
+    #[test]
+    fn failed_status_refuses_without_changing_metadata_or_media() {
+        let project = tempfile::tempdir().unwrap();
+        let media = project.path().join("raw.bin");
+        std::fs::write(&media, b"retained").unwrap();
+        let meta = studio(Some(StudioRecordingStatus::Failed {
+            error: "microphone lost".into(),
+        }));
+        let before = serde_json::to_vec(&meta).unwrap();
+        let error = meta
+            .ensure_ordinary_media_access(project.path())
+            .unwrap_err();
+        assert!(error.contains("microphone lost"));
+        assert!(!error.contains("may need to be recovered"));
+        assert_eq!(serde_json::to_vec(&meta).unwrap(), before);
+        assert_eq!(std::fs::read(media).unwrap(), b"retained");
+    }
+
+    #[test]
+    fn absent_diagnostics_preserves_legacy_and_existing_status_policy() {
+        let project = tempfile::tempdir().unwrap();
+        for status in [
+            None,
+            Some(StudioRecordingStatus::Complete),
+            Some(StudioRecordingStatus::InProgress),
+            Some(StudioRecordingStatus::NeedsRemux),
+        ] {
+            assert!(
+                studio(status)
+                    .ensure_ordinary_media_access(project.path())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_single_segment_without_diagnostics_remains_allowed() {
+        let project = tempfile::tempdir().unwrap();
+        let meta: StudioRecordingMeta =
+            serde_json::from_str(r#"{"display":{"path":"content/display.mp4"}}"#).unwrap();
+        assert!(meta.ensure_ordinary_media_access(project.path()).is_ok());
+    }
+
+    #[test]
+    fn clean_track_diagnostics_remain_allowed() {
+        check_diagnostics(br#"{"segments":[{"trackFailures":[]}]}"#, true);
+    }
+
+    #[test]
+    fn retained_failure_refuses_even_if_status_is_complete() {
+        check_diagnostics(
+            br#"{"segments":[{"trackFailures":["system audio lost"]}]}"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn malformed_diagnostics_refuse_without_modification() {
+        check_diagnostics(b"{", false);
+    }
+
+    #[test]
+    fn incomplete_diagnostic_schema_refuses_without_modification() {
+        for raw in [
+            b"{}".as_slice(),
+            br#"{"segments":[{}]}"#,
+            br#"{"segments":null}"#,
+            br#"{"segments":[{"trackFailures":null}]}"#,
+        ] {
+            check_diagnostics(raw, false);
+        }
+    }
+
+    #[test]
+    fn empty_segment_diagnostics_preserve_existing_recovery_policy() {
+        check_diagnostics(br#"{"segments":[]}"#, true);
+    }
+
+    #[test]
+    fn diagnostics_read_error_refuses_without_changing_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let diagnostics = project.path().join("recording-diagnostics.json");
+        std::fs::create_dir(&diagnostics).unwrap();
+        assert!(
+            studio(None)
+                .ensure_ordinary_media_access(project.path())
+                .is_err()
+        );
+        assert!(diagnostics.is_dir());
+    }
+}
+
+#[cfg(test)]
+mod nul_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_nul_in_a_media_path_is_dropped() {
+        let mut path = RelativePathBuf::from("content/segments/segment-0/disp\0lay.mp4");
+        normalize_relative_path(&mut path);
+        assert_eq!(path.as_str(), "content/segments/segment-0/display.mp4");
+    }
+}
+
+#[cfg(test)]
+mod cursor_shape_version_tests {
+    use super::*;
+
+    const HOVER: &str = r#"{"moves":[
+        {"active_modifiers":[],"cursor_id":"0","time_ms":0.0,"x":0.1,"y":0.1},
+        {"active_modifiers":[],"cursor_id":"2","time_ms":1000.0,"x":0.2,"y":0.2},
+        {"active_modifiers":[],"cursor_id":"2","time_ms":1300.0,"x":0.21,"y":0.2},
+        {"active_modifiers":[],"cursor_id":"0","time_ms":1600.0,"x":0.3,"y":0.3},
+        {"active_modifiers":[],"cursor_id":"0","time_ms":3000.0,"x":0.4,"y":0.4}
+    ],"clicks":[]}"#;
+
+    fn project(version: Option<u32>) -> (tempfile::TempDir, RecordingMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("content/segments/segment-0")).unwrap();
+        std::fs::write(
+            dir.path().join("content/segments/segment-0/cursor.json"),
+            HOVER,
+        )
+        .unwrap();
+        let version = version
+            .map(|version| format!(r#","cursorShapeVersion":{version}"#))
+            .unwrap_or_default();
+        let meta = format!(
+            r#"{{"platform":"MacOS","pretty_name":"Hover","sharing":null,
+            "segments":[{{"display":{{"path":"content/segments/segment-0/display.mp4","fps":60}},
+            "cursor":"content/segments/segment-0/cursor.json"}}],
+            "cursors":{{
+              "0":{{"imagePath":"content/cursors/cursor_0.png","hotspot":{{"x":0.2,"y":0.1}},"shape":"MacOS|TahoeArrow"}},
+              "2":{{"imagePath":"content/cursors/cursor_2.png","hotspot":{{"x":0.4,"y":0.3}},"shape":"MacOS|TahoePointingHand"}}
+            }},
+            "status":{{"status":"Complete"}}{version}}}"#
+        );
+        std::fs::write(dir.path().join("recording-meta.json"), meta).unwrap();
+        let meta = RecordingMeta::load_for_project(dir.path()).unwrap();
+        (dir, meta)
+    }
+
+    fn loaded_shapes(meta: &RecordingMeta) -> Vec<String> {
+        let Some(StudioRecordingMeta::MultipleSegments { inner }) = meta.studio_meta() else {
+            panic!("expected a multi-segment recording");
+        };
+        inner.segments[0]
+            .cursor_events(meta)
+            .moves
+            .into_iter()
+            .map(|event| event.cursor_id)
+            .collect()
+    }
+
+    #[test]
+    fn saved_recordings_keep_the_one_second_debounce() {
+        let (_dir, meta) = project(None);
+        assert_eq!(meta.studio_meta().unwrap().cursor_shape_version(), 0);
+        assert_eq!(loaded_shapes(&meta), ["0", "0", "0", "0", "0"]);
+
+        let mut legacy = CursorEvents::load_from_reader(HOVER.as_bytes()).unwrap();
+        legacy.stabilize_short_lived_cursor_shapes(
+            Some(&HashSet::from(["0".to_string()])),
+            SHORT_CURSOR_SHAPE_DEBOUNCE_MS,
+        );
+        let legacy = legacy
+            .moves
+            .into_iter()
+            .map(|event| event.cursor_id)
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_shapes(&meta), legacy);
+    }
+
+    #[test]
+    fn new_recordings_keep_a_hover_shorter_than_a_second() {
+        let (_dir, meta) = project(Some(CURSOR_SHAPE_VERSION));
+        assert_eq!(loaded_shapes(&meta), ["0", "2", "2", "0", "0"]);
+    }
+
+    #[test]
+    fn a_segment_copied_from_another_recording_keeps_its_own_rule() {
+        let (_dir, mut meta) = project(None);
+        let RecordingMetaInner::Studio(studio) = &mut meta.inner else {
+            panic!("expected a studio recording");
+        };
+        let StudioRecordingMeta::MultipleSegments { inner } = studio.as_mut() else {
+            panic!("expected a multi-segment recording");
+        };
+        inner.segments[0].cursor_shape_version = Some(CURSOR_SHAPE_VERSION);
+        assert_eq!(loaded_shapes(&meta), ["0", "2", "2", "0", "0"]);
+
+        let (_dir, mut meta) = project(Some(CURSOR_SHAPE_VERSION));
+        let RecordingMetaInner::Studio(studio) = &mut meta.inner else {
+            panic!("expected a studio recording");
+        };
+        let StudioRecordingMeta::MultipleSegments { inner } = studio.as_mut() else {
+            panic!("expected a multi-segment recording");
+        };
+        inner.segments[0].cursor_shape_version = Some(0);
+        assert_eq!(loaded_shapes(&meta), ["0", "0", "0", "0", "0"]);
+    }
+
+    #[test]
+    fn the_version_is_written_only_for_new_recordings() {
+        let (_dir, legacy) = project(None);
+        let legacy = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy.contains("cursorShapeVersion"));
+
+        let (_dir, current) = project(Some(CURSOR_SHAPE_VERSION));
+        let current = serde_json::to_value(&current).unwrap();
+        assert_eq!(current["cursorShapeVersion"], CURSOR_SHAPE_VERSION);
+    }
+}

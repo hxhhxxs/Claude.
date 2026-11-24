@@ -1,0 +1,1735 @@
+use super::*;
+use crate::{
+    ChannelAudioSourceConfig,
+    output_pipeline::{
+        self, AudioFrame, ChannelAudioSource, ChannelVideoSource, ChannelVideoSourceConfig,
+        SetupCtx,
+    },
+};
+use anyhow::{Context, anyhow};
+use cap_timestamp::Timestamp;
+use cidre::*;
+use futures::{FutureExt as _, channel::mpsc, future::BoxFuture};
+use std::{
+    ptr,
+    sync::{
+        Arc, Mutex,
+        atomic::{self, AtomicBool, AtomicU32, AtomicU64},
+    },
+    time::{Duration, Instant},
+};
+use tokio::{select, sync::broadcast};
+use tokio_util::{
+    future::FutureExt as _,
+    sync::{CancellationToken, DropGuard},
+};
+use tracing::{debug, error, info, warn};
+
+const MAX_CAPTURE_RESTARTS: u32 = 3;
+const RESTART_DELAY: Duration = Duration::from_secs(2);
+const WINDOW_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const WINDOW_GONE_CHECKS: u32 = 2;
+
+/// The window server still lists a minimized, hidden or off-Space window; only
+/// a closed window (or one whose app quit) disappears.
+fn recorded_window_exists(window: &WindowId) -> bool {
+    Window::from_id_direct(window).is_some_and(|window| window.owner_name().is_some())
+}
+
+// The display filter is what hides excluded windows, so an excluded selection must stay on
+// the display-crop path instead of being captured on its own.
+fn capturable_window<'a>(
+    config: &'a Config,
+    excluded_windows: &[WindowId],
+    capture_phase: &'static str,
+) -> Option<&'a WindowId> {
+    let window_id = config.window.as_ref()?;
+
+    if excluded_windows.contains(window_id) {
+        warn!(
+            %window_id,
+            capture_phase,
+            "Capture window is excluded from recordings, using display crop with exclusions"
+        );
+        return None;
+    }
+
+    Some(window_id)
+}
+
+/// Only a stream with a window filter loses its source when the window closes.
+/// An excluded window is recorded as a display crop, which keeps capturing.
+fn window_to_watch(config: &Config, excluded_windows: &[WindowId]) -> Option<WindowId> {
+    capturable_window(config, excluded_windows, "watch").cloned()
+}
+
+fn window_content_filter(
+    window_id: &WindowId,
+    content: &sc::ShareableContent,
+    capture_phase: &'static str,
+) -> Option<arc::R<sc::ContentFilter>> {
+    let Ok(native_id) = window_id.to_string().parse::<u32>() else {
+        warn!(%window_id, capture_phase, "Capture window has an invalid native id");
+        return None;
+    };
+
+    let windows = content.windows();
+    let Some(window) = windows.iter().find(|window| window.id() == native_id) else {
+        warn!(
+            %window_id,
+            capture_phase,
+            "Capture window missing from ScreenCaptureKit shareable content"
+        );
+        return None;
+    };
+
+    Some(sc::ContentFilter::with_desktop_independent_window(window))
+}
+
+/// A single window at the display's full pixel density, filling the frame.
+/// Left to themselves, window captures pick their resolution automatically,
+/// which can read a Retina window at 1x and upscale it, and do not scale the
+/// window to the output, leaving it in a corner of a larger frame.
+fn configure_window_capture(settings: &mut sc::StreamCfg) {
+    settings.set_scales_to_fit(true);
+    // Both arrived in macOS 14; Cap runs from 12.3.
+    if cidre::api::macos_available("14.0") {
+        unsafe {
+            settings.set_capture_resolution(sc::CaptureResolution::Best);
+            settings.set_preserves_aspect_ratio(true);
+        }
+    }
+}
+
+/// What the stream reads. A display capture crops to `crop_bounds` on the
+/// display; a window capture reads the same size from the window's own
+/// top-left corner, so Focus records every pixel a screen region would.
+fn source_rect(captures_window: bool, crop_bounds: super::CropBounds) -> cg::Rect {
+    let (x, y) = if captures_window {
+        (0.0, 0.0)
+    } else {
+        (crop_bounds.position().x(), crop_bounds.position().y())
+    };
+    cg::Rect::new(
+        x,
+        y,
+        crop_bounds.size().width(),
+        crop_bounds.size().height(),
+    )
+}
+
+fn excluded_shareable_windows(
+    excluded_windows: &[WindowId],
+    content: &sc::ShareableContent,
+    capture_phase: &'static str,
+) -> Vec<arc::R<sc::Window>> {
+    if excluded_windows.is_empty() {
+        return Vec::new();
+    }
+
+    let windows = content.windows();
+    let mut collected = Vec::new();
+    for window_id in excluded_windows {
+        let Ok(native_id) = window_id.to_string().parse::<u32>() else {
+            warn!(%window_id, capture_phase, "Excluded window has an invalid native id");
+            continue;
+        };
+
+        // New or protected panels can be absent from the CG on-screen list
+        // while still belonging to the snapshot used to build this filter.
+        if let Some(window) = windows.iter().find(|window| window.id() == native_id) {
+            collected.push(window.retained());
+        } else {
+            warn!(
+                %window_id,
+                capture_phase,
+                "Excluded window missing from ScreenCaptureKit shareable content"
+            );
+        }
+    }
+
+    info!(
+        capture_phase,
+        configured_excluded_windows = excluded_windows.len(),
+        mapped_excluded_windows = collected.len(),
+        "Mapped ScreenCaptureKit excluded windows"
+    );
+    collected
+}
+
+pub(crate) struct FrameScaler {
+    session: arc::R<cidre::vt::PixelTransferSession>,
+    pool: arc::R<cv::PixelBufPool>,
+}
+
+unsafe impl Send for FrameScaler {}
+
+/// Buffers a frame copier keeps between frames. It allocates more while the
+/// writer is behind and lets the extra ones age out afterwards.
+const FRAME_COPY_POOL_MIN_BUFFERS: usize = 4;
+
+impl FrameScaler {
+    fn new(expected_width: usize, expected_height: usize) -> Option<Self> {
+        Self::with_pool(
+            expected_width,
+            expected_height,
+            get_pixel_buffer_pool_size(),
+        )
+    }
+
+    /// Copies frames at their own size into a pool this process owns.
+    pub(crate) fn copier(width: usize, height: usize) -> Option<Self> {
+        Self::with_pool(width, height, FRAME_COPY_POOL_MIN_BUFFERS)
+    }
+
+    fn with_pool(width: usize, height: usize, min_buffers: usize) -> Option<Self> {
+        let mut session = cidre::vt::PixelTransferSession::new().ok()?;
+        session.set_scaling_letter_box().ok()?;
+        session.set_realtime(true).ok()?;
+        let pool = create_pixel_buffer_pool(width, height, min_buffers)?;
+
+        Some(Self { session, pool })
+    }
+
+    pub(crate) fn scale_frame(
+        &self,
+        src_sample_buf: &cm::SampleBuf,
+    ) -> Option<arc::R<cm::SampleBuf>> {
+        let src_image_buf = src_sample_buf.image_buf()?;
+        let dst_buf = self.pool.pixel_buf().ok()?;
+
+        self.session.transfer(src_image_buf, &dst_buf).ok()?;
+
+        let format_desc = cm::VideoFormatDesc::with_image_buf(&dst_buf).ok()?;
+        let timing = src_sample_buf.timing_info(0).ok()?;
+
+        cm::SampleBuf::with_image_buf(&dst_buf, true, None, ptr::null(), &format_desc, &timing).ok()
+    }
+}
+
+fn get_pixel_buffer_pool_size() -> usize {
+    std::env::var("CAP_PIXEL_BUFFER_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+}
+
+fn create_pixel_buffer_pool(
+    width: usize,
+    height: usize,
+    min_count: usize,
+) -> Option<arc::R<cv::PixelBufPool>> {
+    let min_count_num = cf::Number::from_usize(min_count);
+    let width_num = cf::Number::from_usize(width);
+    let height_num = cf::Number::from_usize(height);
+    let io_props = cf::Dictionary::new();
+
+    let pool_attr_keys: [&cf::Type; 1] =
+        [cv::pixel_buffer_pool::keys::minimum_buffer_count().as_ref()];
+    let pool_attr_values: [&cf::Type; 1] = [min_count_num.as_ref()];
+    let pool_attrs = cf::Dictionary::with_keys_values(&pool_attr_keys, &pool_attr_values)?;
+
+    let pixel_buf_attr_keys: [&cf::Type; 5] = [
+        cv::pixel_buffer::keys::pixel_format().as_ref(),
+        cv::pixel_buffer::keys::width().as_ref(),
+        cv::pixel_buffer::keys::height().as_ref(),
+        cv::pixel_buffer::keys::io_surf_props().as_ref(),
+        cv::pixel_buffer::keys::metal_compatibility().as_ref(),
+    ];
+    let pixel_buf_attr_values: [&cf::Type; 5] = [
+        cv::PixelFormat::_420V.to_cf_number().as_ref(),
+        width_num.as_ref(),
+        height_num.as_ref(),
+        io_props.as_ref(),
+        cf::Boolean::value_true().as_ref(),
+    ];
+    let pixel_buf_attrs =
+        cf::Dictionary::with_keys_values(&pixel_buf_attr_keys, &pixel_buf_attr_values)?;
+
+    debug!(min_count, width, height, "Pixel buffer pool initialized");
+    cv::PixelBufPool::new(Some(pool_attrs.as_ref()), Some(pixel_buf_attrs.as_ref())).ok()
+}
+
+fn get_screen_buffer_size() -> usize {
+    std::env::var("CAP_SCREEN_BUFFER_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15)
+}
+
+fn get_max_queue_depth() -> isize {
+    std::env::var("CAP_MAX_QUEUE_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+
+#[derive(Debug)]
+pub struct CMSampleBufferCapture;
+
+impl ScreenCaptureFormat for CMSampleBufferCapture {
+    type VideoFormat = cidre::arc::R<cidre::cm::SampleBuf>;
+
+    fn pixel_format() -> ffmpeg::format::Pixel {
+        ffmpeg::format::Pixel::NV12
+    }
+
+    fn audio_info() -> AudioInfo {
+        AudioInfo::new(
+            ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
+            48_000,
+            2,
+        )
+        .expect("static F32/48kHz/stereo audio config")
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceError {
+    #[error("NoDisplay: Id '{0}'")]
+    NoDisplay(DisplayId),
+    #[error("AsContentFilter")]
+    AsContentFilter,
+    /// A window-only capture whose window is gone. A display crop would
+    /// record whatever now covers the window's rectangle.
+    #[error("WindowGone: Id '{0}'")]
+    WindowGone(WindowId),
+}
+
+pub struct VideoFrame {
+    pub sample_buf: arc::R<cm::SampleBuf>,
+    pub timestamp: Timestamp,
+}
+
+impl output_pipeline::VideoFrame for VideoFrame {
+    fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    fn duplicate(&self) -> Option<Self> {
+        Some(Self {
+            sample_buf: self.sample_buf.clone(),
+            timestamp: self.timestamp,
+        })
+    }
+}
+
+impl ScreenCaptureConfig<CMSampleBufferCapture> {
+    pub async fn to_sources(
+        &self,
+    ) -> anyhow::Result<(VideoSourceConfig, Option<SystemAudioSourceConfig>)> {
+        let (error_tx, error_rx) = broadcast::channel(1);
+        let buffer_size = get_screen_buffer_size();
+        debug!(buffer_size = buffer_size, "Screen capture buffer size");
+        let (video_tx, video_rx) = flume::bounded(buffer_size);
+        let drop_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let (mut audio_tx, audio_rx) = if self.system_audio {
+            let (tx, rx) = mpsc::channel(128);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let system_audio_drop_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let system_audio_frame_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+        let display = Display::from_id(&self.config.display)
+            .ok_or_else(|| SourceError::NoDisplay(self.config.display.clone()))?;
+
+        let window_filter = capturable_window(&self.config, &self.excluded_windows, "initial")
+            .map(|id| {
+                window_content_filter(id, &self.shareable_content, "initial")
+                    .ok_or_else(|| SourceError::WindowGone(id.clone()))
+            })
+            .transpose()?;
+        let captures_window = window_filter.is_some();
+
+        let content_filter = match window_filter {
+            Some(filter) => filter,
+            None => {
+                let excluded_sc_windows = excluded_shareable_windows(
+                    &self.excluded_windows,
+                    &self.shareable_content,
+                    "initial",
+                );
+
+                display
+                    .raw_handle()
+                    .as_content_filter_excluding_windows(
+                        self.shareable_content.clone(),
+                        excluded_sc_windows,
+                    )
+                    .ok_or(SourceError::AsContentFilter)?
+            }
+        };
+
+        debug!("SCK content filter: {:?}", content_filter);
+
+        let size = PhysicalSize::new(self.video_info.width as f64, self.video_info.height as f64);
+
+        debug!("size: {:?}", size);
+
+        let max_queue_depth = get_max_queue_depth();
+        let queue_depth =
+            ((self.config.fps as f32 / 30.0 * 5.0).ceil() as isize).clamp(3, max_queue_depth);
+        debug!(
+            queue_depth = queue_depth,
+            max_queue_depth = max_queue_depth,
+            "Screen capture queue depth"
+        );
+
+        let mut settings = scap_screencapturekit::StreamCfgBuilder::default()
+            .with_width(size.width() as usize)
+            .with_height(size.height() as usize)
+            .with_fps(self.config.fps as f32)
+            .with_shows_cursor(self.config.show_cursor)
+            .with_captures_audio(self.system_audio)
+            .with_queue_depth(queue_depth)
+            .build();
+
+        settings.set_pixel_format(cv::PixelFormat::_420V);
+        settings.set_color_space_name(cg::color_space::names::srgb());
+        if captures_window {
+            configure_window_capture(&mut settings);
+        }
+
+        if let Some(crop_bounds) = self.config.crop_bounds {
+            debug!("crop bounds: {:?}", crop_bounds);
+            settings.set_src_rect(source_rect(captures_window, crop_bounds));
+        }
+        cap_fail::fail_err!(
+            "macos::ScreenCaptureActor::new",
+            ns::Error::with_domain(ns::ErrorDomain::os_status(), 69420, None)
+        );
+
+        let video_frame_counter: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+        let expected_width = self.video_info.width as usize;
+        let expected_height = self.video_info.height as usize;
+        let frame_scaler: Arc<Mutex<Option<FrameScaler>>> = Arc::new(Mutex::new(None));
+        let scaling_logged = Arc::new(AtomicBool::new(false));
+        let scaled_frame_count = Arc::new(AtomicU64::new(0));
+
+        let (stall_health_tx, stall_health_rx) =
+            tokio::sync::mpsc::channel::<output_pipeline::PipelineHealthEvent>(32);
+
+        let rebuild_params = Arc::new(CapturerRebuildParams {
+            display_id: self.config.display.clone(),
+            config: self.config.clone(),
+            system_audio: self.system_audio,
+            excluded_windows: self.excluded_windows.clone(),
+            video_info: self.video_info,
+            video_tx: video_tx.clone(),
+            audio_tx: audio_tx.clone(),
+            error_tx: error_tx.clone(),
+            video_frame_counter: video_frame_counter.clone(),
+            drop_counter: drop_counter.clone(),
+            system_audio_frame_counter: system_audio_frame_counter.clone(),
+            system_audio_drop_counter: system_audio_drop_counter.clone(),
+            frame_scaler: frame_scaler.clone(),
+            scaling_logged: scaling_logged.clone(),
+            scaled_frame_count: scaled_frame_count.clone(),
+            stall_health_tx: stall_health_tx.clone(),
+        });
+
+        let builder = scap_screencapturekit::Capturer::builder(content_filter, settings)
+            .with_output_sample_buf_cb({
+                let video_frame_count = video_frame_counter.clone();
+                let drop_counter = drop_counter.clone();
+                let sys_audio_drop_counter = system_audio_drop_counter.clone();
+                let sys_audio_frame_counter = system_audio_frame_counter.clone();
+                let stall_health_tx = stall_health_tx.clone();
+                move |frame| {
+                    let sample_buffer = frame.sample_buf();
+
+                    let mach_timestamp =
+                        cm::Clock::convert_host_time_to_sys_units(sample_buffer.pts());
+                    let timestamp = Timestamp::MachAbsoluteTime(
+                        cap_timestamp::MachAbsoluteTimestamp::new(mach_timestamp),
+                    );
+
+                    match &frame {
+                        scap_screencapturekit::Frame::Screen(frame) => {
+                            let Some(image_buf) = frame.image_buf() else {
+                                return;
+                            };
+                            if image_buf.height() == 0 || image_buf.width() == 0 {
+                                return;
+                            }
+
+                            let frame_width = image_buf.width();
+                            let frame_height = image_buf.height();
+
+                            let final_sample_buf =
+                                if frame_width != expected_width || frame_height != expected_height
+                                {
+                                    let Ok(mut scaler_guard) = frame_scaler.lock() else {
+                                        drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                        return;
+                                    };
+
+                                    if scaler_guard.is_none() {
+                                        *scaler_guard =
+                                            FrameScaler::new(expected_width, expected_height);
+
+                                        if scaler_guard.is_some() {
+                                            info!(
+                                                expected_width,
+                                                expected_height,
+                                                frame_width,
+                                                frame_height,
+                                                "Display configuration changed, scaling frames to match original dimensions"
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Failed to create frame scaler, dropping mismatched frames"
+                                            );
+                                        }
+                                        scaling_logged.store(true, atomic::Ordering::Relaxed);
+                                    }
+
+                                    let Some(scaler) = scaler_guard.as_ref() else {
+                                        drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                        return;
+                                    };
+
+                                    let Some(scaled) = scaler.scale_frame(sample_buffer) else {
+                                        drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                        return;
+                                    };
+
+                                    let count =
+                                        scaled_frame_count.fetch_add(1, atomic::Ordering::Relaxed)
+                                            + 1;
+                                    if count.is_multiple_of(300) {
+                                        debug!(scaled_frames = count, "Scaling frames");
+                                    }
+
+                                    scaled
+                                } else {
+                                    if scaling_logged.swap(false, atomic::Ordering::Relaxed) {
+                                        let count =
+                                            scaled_frame_count.swap(0, atomic::Ordering::Relaxed);
+                                        info!(
+                                            scaled_frames = count,
+                                            "Display dimensions restored, resuming direct capture"
+                                        );
+                                        if let Ok(mut guard) = frame_scaler.lock() {
+                                            *guard = None;
+                                        }
+                                    }
+
+                                    sample_buffer.retained()
+                                };
+
+                            cap_fail::fail_ret!("screen_capture video frame skip");
+
+                            video_frame_count.fetch_add(1, atomic::Ordering::Relaxed);
+
+                            match output_pipeline::send_with_stall_budget_flume(
+                                &video_tx,
+                                VideoFrame {
+                                    sample_buf: final_sample_buf,
+                                    timestamp,
+                                },
+                                "screen-video",
+                                &stall_health_tx,
+                            ) {
+                                output_pipeline::StallSendOutcome::Sent => {}
+                                output_pipeline::StallSendOutcome::StalledAndDropped { .. }
+                                | output_pipeline::StallSendOutcome::Disconnected => {
+                                    drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        scap_screencapturekit::Frame::Audio(_) => {
+                            use ffmpeg::ChannelLayout;
+
+                            cap_fail::fail_ret!("screen_capture audio frame skip");
+
+                            let Some(audio_tx) = &mut audio_tx else {
+                                return;
+                            };
+
+                            let Ok(buf_list) = sample_buffer.audio_buf_list::<2>() else {
+                                warn!("Failed to extract audio buffer list from sample, dropping audio chunk");
+                                return;
+                            };
+                            let Ok(slice) = buf_list.block().as_slice() else {
+                                warn!("Failed to get audio buffer slice, dropping audio chunk");
+                                return;
+                            };
+
+                            let mut frame = ffmpeg::frame::Audio::new(
+                                ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
+                                sample_buffer.num_samples() as usize,
+                                ChannelLayout::STEREO,
+                            );
+                            frame.set_rate(48_000);
+                            let data_bytes_size =
+                                buf_list.list().buffers[0].data_bytes_size as usize;
+                            for i in 0..frame.planes() {
+                                let start = i.saturating_mul(data_bytes_size);
+                                let end = start.saturating_add(data_bytes_size);
+                                let Some(source) = slice.get(start..end) else {
+                                    warn!("Audio buffer slice too small for plane data, dropping audio chunk");
+                                    return;
+                                };
+                                let destination = frame.data_mut(i);
+                                if destination.len() != source.len() {
+                                    warn!("Audio frame plane size mismatch, dropping audio chunk");
+                                    return;
+                                }
+                                destination.copy_from_slice(source);
+                            }
+
+                            match output_pipeline::send_with_stall_budget_futures(
+                                audio_tx,
+                                AudioFrame::new(frame, timestamp),
+                                "screen-system-audio",
+                                &stall_health_tx,
+                            ) {
+                                output_pipeline::StallSendOutcome::Sent => {
+                                    sys_audio_frame_counter
+                                        .fetch_add(1, atomic::Ordering::Relaxed);
+                                }
+                                output_pipeline::StallSendOutcome::StalledAndDropped { .. }
+                                | output_pipeline::StallSendOutcome::Disconnected => {
+                                    sys_audio_drop_counter
+                                        .fetch_add(1, atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .with_stop_with_err_cb({
+                let video_frame_count = video_frame_counter.clone();
+                let error_tx = error_tx.clone();
+                move |_, err| {
+                    debug!(
+                        "Capturer stopping after creating {} video frames",
+                        video_frame_count.load(atomic::Ordering::Relaxed)
+                    );
+
+                    let _ = error_tx.send(err.retained());
+                }
+            });
+
+        let cancel_token = CancellationToken::new();
+        let capturer = Capturer::new(Arc::new(builder.build()?));
+
+        Ok((
+            VideoSourceConfig {
+                inner: ChannelVideoSourceConfig::new(self.video_info, video_rx),
+                capturer: capturer.clone(),
+                error_rx: error_rx.resubscribe(),
+                video_frame_counter: video_frame_counter.clone(),
+                drop_counter,
+                cancel_token: cancel_token.clone(),
+                drop_guard: cancel_token.drop_guard(),
+                rebuild_params: rebuild_params.clone(),
+                stall_health_rx: Some(stall_health_rx),
+            },
+            audio_rx.map(|rx| {
+                SystemAudioSourceConfig(
+                    ChannelAudioSourceConfig::new(self.audio_info(), rx),
+                    capturer,
+                    error_rx,
+                    system_audio_frame_counter,
+                    system_audio_drop_counter,
+                    rebuild_params,
+                    false,
+                )
+            }),
+        ))
+    }
+}
+
+// Public
+
+pub struct StartCapturing;
+
+// External
+
+pub struct NewFrame(pub scap_screencapturekit::Frame);
+
+// Internal
+
+pub struct CaptureError(pub arc::R<ns::Error>);
+
+struct Capturer {
+    started: Arc<AtomicBool>,
+    capturer: Arc<scap_screencapturekit::Capturer>,
+}
+
+impl Clone for Capturer {
+    fn clone(&self) -> Self {
+        Self {
+            started: self.started.clone(),
+            capturer: self.capturer.clone(),
+            // error_rx: self.error_rx.resubscribe(),
+        }
+    }
+}
+
+impl Capturer {
+    fn new(capturer: Arc<scap_screencapturekit::Capturer>) -> Self {
+        Self {
+            started: Arc::new(AtomicBool::new(false)),
+            capturer,
+        }
+    }
+
+    fn mark_stopped(&self) {
+        self.started.store(false, atomic::Ordering::Relaxed);
+    }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        if self
+            .started
+            .compare_exchange(
+                false,
+                true,
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.capturer
+                .start()
+                .await
+                .map_err(|err| anyhow!(format!("{err}")))?;
+        }
+
+        Ok(())
+    }
+
+    async fn stop(&self) -> anyhow::Result<()> {
+        if self
+            .started
+            .compare_exchange(
+                true,
+                false,
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.capturer.stop().await.context("capturer_stop")?;
+        }
+
+        Ok(())
+    }
+}
+
+pub struct VideoSourceConfig {
+    inner: ChannelVideoSourceConfig<VideoFrame>,
+    capturer: Capturer,
+    error_rx: broadcast::Receiver<arc::R<ns::Error>>,
+    cancel_token: CancellationToken,
+    drop_guard: DropGuard,
+    video_frame_counter: Arc<AtomicU32>,
+    drop_counter: Arc<AtomicU64>,
+    rebuild_params: Arc<CapturerRebuildParams>,
+    stall_health_rx: Option<tokio::sync::mpsc::Receiver<output_pipeline::PipelineHealthEvent>>,
+}
+pub struct VideoSource {
+    inner: ChannelVideoSource<VideoFrame>,
+    capturer: Capturer,
+    cancel_token: CancellationToken,
+    video_frame_counter: Arc<AtomicU32>,
+    drop_counter: Arc<AtomicU64>,
+    _drop_guard: DropGuard,
+    health_tx: output_pipeline::HealthSender,
+    active_capturer: Arc<Mutex<Option<Capturer>>>,
+}
+
+impl output_pipeline::VideoSource for VideoSource {
+    type Config = VideoSourceConfig;
+    type Frame = VideoFrame;
+
+    async fn setup(
+        config: Self::Config,
+        video_tx: mpsc::Sender<Self::Frame>,
+        ctx: &mut SetupCtx,
+    ) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let VideoSourceConfig {
+            inner,
+            capturer,
+            mut error_rx,
+            cancel_token,
+            drop_guard,
+            video_frame_counter,
+            drop_counter,
+            rebuild_params,
+            stall_health_rx,
+        } = config;
+
+        let monitor_cancel = cancel_token.clone();
+        let pipeline_cancel = ctx.stop_token();
+        let stop_signal = ctx.stop_signal();
+        let health_tx = ctx.health_tx().clone();
+
+        if let Some(mut stall_rx) = stall_health_rx {
+            let forward_tx = ctx.health_tx().clone();
+            let forward_cancel = cancel_token.clone();
+            ctx.tasks()
+                .spawn("screen-capture-stall-forwarder", async move {
+                    loop {
+                        tokio::select! {
+                            _ = forward_cancel.cancelled() => break Ok(()),
+                            event = stall_rx.recv() => match event {
+                                Some(ev) => output_pipeline::emit_health(&forward_tx, ev),
+                                None => break Ok(()),
+                            }
+                        }
+                    }
+                });
+        }
+        let active_capturer: Arc<Mutex<Option<Capturer>>> = Arc::new(Mutex::new(None));
+        let active_capturer_for_stop = active_capturer.clone();
+        let original_capturer = capturer.clone();
+        ctx.tasks().spawn("screen-capture-monitor", async move {
+            let mut restart_count = 0u32;
+            let mut window_watch =
+                window_to_watch(&rebuild_params.config, &rebuild_params.excluded_windows)
+                    .map(|window| (window, tokio::time::interval(WINDOW_WATCH_INTERVAL), 0u32));
+
+            loop {
+                select! {
+                    _ = monitor_cancel.cancelled() => break Ok(()),
+                    _ = async {
+                        match window_watch.as_mut() {
+                            Some((_, interval, _)) => interval.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let Some((window, _, missed)) = window_watch.as_mut() else {
+                            continue;
+                        };
+                        if recorded_window_exists(window) {
+                            *missed = 0;
+                            continue;
+                        }
+                        *missed += 1;
+                        if *missed < WINDOW_GONE_CHECKS {
+                            continue;
+                        }
+                        // A window filter keeps its stream running after the window closes or
+                        // its app quits; ScreenCaptureKit just stops sending frames. The stream
+                        // is alive, so it is stopped normally with the pipeline.
+                        warn!(
+                            %window,
+                            "Screen capture source disappeared (recorded window closed); keeping what was recorded"
+                        );
+                        output_pipeline::emit_health(
+                            &health_tx,
+                            output_pipeline::PipelineHealthEvent::CaptureTargetLost {
+                                target: "window".to_string(),
+                            },
+                        );
+                        stop_signal.mark_user_stopped();
+                        pipeline_cancel.cancel();
+                        break Ok(());
+                    }
+                    recv = error_rx.recv() => {
+                        let err = match recv {
+                            Ok(err) => err,
+                            Err(broadcast::error::RecvError::Closed) => break Ok(()),
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                warn!("Screen capture error channel lagged; continuing");
+                                continue;
+                            }
+                        };
+
+                        let user_stopped = is_user_stop_error(err.as_ref());
+                        if user_stopped || is_capture_source_gone_error(err.as_ref()) {
+                            if let Ok(guard) = active_capturer.lock() {
+                                match guard.as_ref() {
+                                    Some(c) => c.mark_stopped(),
+                                    None => original_capturer.mark_stopped(),
+                                }
+                            } else {
+                                original_capturer.mark_stopped();
+                            }
+
+                            if user_stopped {
+                                info!(
+                                    "Screen capture stream stopped from macOS sharing controls"
+                                );
+                            } else {
+                                // The stream is already dead, so failing here would leave Stop
+                                // and Quit waiting on a capture that can never confirm cleanup.
+                                warn!(
+                                    captures_window = rebuild_params.config.window.is_some(),
+                                    "Screen capture source disappeared (window closed or display unavailable); keeping what was recorded"
+                                );
+                                output_pipeline::emit_health(
+                                    &health_tx,
+                                    output_pipeline::PipelineHealthEvent::CaptureTargetLost {
+                                        target: if rebuild_params.config.window.is_some() {
+                                            "window"
+                                        } else {
+                                            "display"
+                                        }
+                                        .to_string(),
+                                    },
+                                );
+                            }
+                            stop_signal.mark_user_stopped();
+                            pipeline_cancel.cancel();
+                            break Ok(());
+                        }
+
+                        if is_system_stop_error(err.as_ref()) {
+                            if monitor_cancel.is_cancelled() {
+                                break Ok(());
+                            }
+
+                            if let Ok(guard) = active_capturer.lock() {
+                                match guard.as_ref() {
+                                    Some(c) => c.mark_stopped(),
+                                    None => original_capturer.mark_stopped(),
+                                }
+                            } else {
+                                original_capturer.mark_stopped();
+                            }
+
+                            if restart_count >= MAX_CAPTURE_RESTARTS {
+                                error!(
+                                    restart_count,
+                                    max_restarts = MAX_CAPTURE_RESTARTS,
+                                    "Screen capture failed after max restart attempts"
+                                );
+                                return Err(anyhow!(system_stop_message()));
+                            }
+
+                            restart_count += 1;
+                            warn!(
+                                restart_count,
+                                max_restarts = MAX_CAPTURE_RESTARTS,
+                                "Screen capture stream stopped by system, attempting restart"
+                            );
+
+                            output_pipeline::emit_health(
+                                &health_tx,
+                                output_pipeline::PipelineHealthEvent::SourceRestarting,
+                            );
+
+                            tokio::time::sleep(RESTART_DELAY).await;
+
+                            if monitor_cancel.is_cancelled() {
+                                break Ok(());
+                            }
+
+                            if Display::from_id(&rebuild_params.display_id).is_none() {
+                                error!(
+                                    display_id = ?rebuild_params.display_id,
+                                    "Capture target display is gone; aborting restart"
+                                );
+                                output_pipeline::emit_health(
+                                    &health_tx,
+                                    output_pipeline::PipelineHealthEvent::CaptureTargetLost {
+                                        target: "display".to_string(),
+                                    },
+                                );
+                                return Err(anyhow!(
+                                    "Capture target display disappeared: {:?}",
+                                    rebuild_params.display_id
+                                ));
+                            }
+
+                            match rebuild_capturer(&rebuild_params).await {
+                                Ok(new_capturer) => {
+                                    if let Ok(mut guard) = active_capturer.lock() {
+                                        *guard = Some(new_capturer);
+                                    }
+                                    info!(
+                                        restart_count,
+                                        "macOS screen capture restarted successfully"
+                                    );
+                                    output_pipeline::emit_health(
+                                        &health_tx,
+                                        output_pipeline::PipelineHealthEvent::SourceRestarted,
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        restart_count,
+                                        error = %e,
+                                        "Failed to restart macOS screen capture"
+                                    );
+                                    return Err(anyhow!(
+                                        "Screen capture restart failed after {} attempts: {e}",
+                                        restart_count
+                                    ));
+                                }
+                            }
+                        }
+
+                        // didStopWithError means the stream has already stopped, so Stop must
+                        // not wait on it, or it can never confirm cleanup.
+                        if let Ok(guard) = active_capturer.lock() {
+                            match guard.as_ref() {
+                                Some(c) => c.mark_stopped(),
+                                None => original_capturer.mark_stopped(),
+                            }
+                        } else {
+                            original_capturer.mark_stopped();
+                        }
+                        error!(error = %err, "Screen capture stream stopped with an error");
+                        return Err(anyhow!(format!("{err}")));
+                    }
+                }
+            }
+        });
+
+        let stats_health_tx = ctx.health_tx().clone();
+        ChannelVideoSource::setup(inner, video_tx, ctx)
+            .await
+            .map(|source| Self {
+                inner: source,
+                capturer,
+                cancel_token,
+                _drop_guard: drop_guard,
+                video_frame_counter,
+                drop_counter,
+                health_tx: stats_health_tx,
+                active_capturer: active_capturer_for_stop,
+            })
+    }
+
+    fn start(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
+        async move {
+            self.capturer.start().await?;
+
+            tokio::spawn({
+                let video_frame_count = self.video_frame_counter.clone();
+                let drop_counter = self.drop_counter.clone();
+                let health_tx = self.health_tx.clone();
+                async move {
+                    let mut prev_frames = 0u32;
+                    let mut prev_drops = 0u64;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let current_frames = video_frame_count.load(atomic::Ordering::Relaxed);
+                        let current_drops = drop_counter.load(atomic::Ordering::Relaxed);
+
+                        let frame_delta = current_frames.saturating_sub(prev_frames);
+                        let drop_delta = current_drops.saturating_sub(prev_drops);
+
+                        if frame_delta > 0 {
+                            let drop_rate = 100.0 * drop_delta as f64
+                                / (frame_delta as f64 + drop_delta as f64);
+                            if drop_rate > 5.0 {
+                                warn!(
+                                    frames = frame_delta,
+                                    drops = drop_delta,
+                                    drop_rate_pct = format!("{:.1}%", drop_rate),
+                                    total_frames = current_frames,
+                                    total_drops = current_drops,
+                                    "Screen capture frame drop rate exceeds 5% threshold"
+                                );
+                                output_pipeline::emit_health(
+                                    &health_tx,
+                                    output_pipeline::PipelineHealthEvent::FrameDropRateHigh {
+                                        source: "screen-video".to_string(),
+                                        rate_pct: drop_rate,
+                                    },
+                                );
+                            } else {
+                                debug!(
+                                    frames = frame_delta,
+                                    drops = drop_delta,
+                                    drop_rate_pct = format!("{:.1}%", drop_rate),
+                                    total_frames = current_frames,
+                                    "Screen capture stats"
+                                );
+                            }
+                        }
+
+                        prev_frames = current_frames;
+                        prev_drops = current_drops;
+                    }
+                }
+                .with_cancellation_token_owned(self.cancel_token.clone())
+                .in_current_span()
+            });
+
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn stop(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
+        async move {
+            debug!(
+                "Capturer stopping after creating {} video frames",
+                self.video_frame_counter.load(atomic::Ordering::Relaxed)
+            );
+
+            self.cancel_token.cancel();
+
+            let capturer_to_stop = self
+                .active_capturer
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.take());
+
+            let target = capturer_to_stop.as_ref().unwrap_or(&self.capturer);
+
+            let stop_result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), target.stop()).await;
+
+            match stop_result {
+                Ok(result) => result,
+                Err(_) => {
+                    error!("Screen capturer stop timed out after 5s");
+                    Err(anyhow::anyhow!(
+                        "Screen capturer stop timed out after 5s — native resources may not be fully released"
+                    ))
+                }
+            }
+        }
+        .boxed()
+    }
+
+    fn video_info(&self) -> VideoInfo {
+        self.inner.video_info()
+    }
+}
+
+fn is_system_stop_error(err: &ns::Error) -> bool {
+    err.code() == sc::error::code::SYSTEM_STOPPED_STREAM as ns::Integer
+        && err.domain().to_string() == sc::error::domain().to_string()
+}
+
+fn is_user_stop_error(err: &ns::Error) -> bool {
+    err.code() == sc::error::code::USER_STOPPED as ns::Integer
+        && err.domain().to_string() == sc::error::domain().to_string()
+}
+
+/// `SCStreamErrorNoCaptureSource`: the recorded window closed, or the display went away or
+/// slept. Nothing can be captured, but everything recorded so far is intact.
+fn is_capture_source_gone_error(err: &ns::Error) -> bool {
+    is_capture_source_gone(err.domain().to_string(), err.code())
+}
+
+fn is_capture_source_gone(domain: String, code: ns::Integer) -> bool {
+    code == sc::error::code::NO_CAPTURE_SOURCE as ns::Integer
+        && domain == sc::error::domain().to_string()
+}
+
+fn system_stop_message() -> &'static str {
+    "Screen capture stopped because macOS made the display unavailable. This commonly happens when the lid is closed or the display sleeps."
+}
+
+struct CapturerRebuildParams {
+    display_id: DisplayId,
+    config: Config,
+    system_audio: bool,
+    excluded_windows: Vec<WindowId>,
+    video_info: VideoInfo,
+    video_tx: flume::Sender<VideoFrame>,
+    audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    error_tx: broadcast::Sender<arc::R<ns::Error>>,
+    video_frame_counter: Arc<AtomicU32>,
+    drop_counter: Arc<AtomicU64>,
+    system_audio_frame_counter: Arc<AtomicU64>,
+    system_audio_drop_counter: Arc<AtomicU64>,
+    frame_scaler: Arc<Mutex<Option<FrameScaler>>>,
+    scaling_logged: Arc<AtomicBool>,
+    scaled_frame_count: Arc<AtomicU64>,
+    stall_health_tx: output_pipeline::HealthSender,
+}
+
+unsafe impl Send for CapturerRebuildParams {}
+unsafe impl Sync for CapturerRebuildParams {}
+
+async fn rebuild_capturer(params: &CapturerRebuildParams) -> anyhow::Result<Capturer> {
+    let shareable_content = sc::ShareableContent::current()
+        .await
+        .map_err(|e| anyhow!("Failed to get shareable content during restart: {e}"))?;
+
+    let display = Display::from_id(&params.display_id)
+        .ok_or_else(|| anyhow!("Display not found during restart: {:?}", params.display_id))?;
+
+    let window_filter = capturable_window(&params.config, &params.excluded_windows, "restart")
+        .map(|id| {
+            window_content_filter(id, &shareable_content, "restart").ok_or_else(|| {
+                anyhow!("Capture window {id} is gone; not falling back to the display")
+            })
+        })
+        .transpose()?;
+    let captures_window = window_filter.is_some();
+
+    let content_filter = match window_filter {
+        Some(filter) => filter,
+        None => {
+            let excluded_sc_windows =
+                excluded_shareable_windows(&params.excluded_windows, &shareable_content, "restart");
+
+            display
+                .raw_handle()
+                .as_content_filter_excluding_windows(shareable_content, excluded_sc_windows)
+                .ok_or_else(|| anyhow!("Failed to create content filter during restart"))?
+        }
+    };
+
+    let size = PhysicalSize::new(
+        params.video_info.width as f64,
+        params.video_info.height as f64,
+    );
+
+    let max_queue_depth = get_max_queue_depth();
+    let queue_depth =
+        ((params.config.fps as f32 / 30.0 * 5.0).ceil() as isize).clamp(3, max_queue_depth);
+
+    let mut settings = scap_screencapturekit::StreamCfgBuilder::default()
+        .with_width(size.width() as usize)
+        .with_height(size.height() as usize)
+        .with_fps(params.config.fps as f32)
+        .with_shows_cursor(params.config.show_cursor)
+        .with_captures_audio(params.system_audio)
+        .with_queue_depth(queue_depth)
+        .build();
+
+    settings.set_pixel_format(cv::PixelFormat::_420V);
+    settings.set_color_space_name(cg::color_space::names::srgb());
+    if captures_window {
+        configure_window_capture(&mut settings);
+    }
+
+    if let Some(crop_bounds) = params.config.crop_bounds {
+        settings.set_src_rect(source_rect(captures_window, crop_bounds));
+    }
+
+    let expected_width = params.video_info.width as usize;
+    let expected_height = params.video_info.height as usize;
+
+    let video_tx = params.video_tx.clone();
+    let mut audio_tx = params.audio_tx.clone();
+    let error_tx = params.error_tx.clone();
+
+    let builder = scap_screencapturekit::Capturer::builder(content_filter, settings)
+        .with_output_sample_buf_cb({
+            let video_frame_count = params.video_frame_counter.clone();
+            let drop_counter = params.drop_counter.clone();
+            let frame_scaler = params.frame_scaler.clone();
+            let scaling_logged = params.scaling_logged.clone();
+            let scaled_frame_count = params.scaled_frame_count.clone();
+            let sys_audio_drop_counter = params.system_audio_drop_counter.clone();
+            let sys_audio_frame_counter = params.system_audio_frame_counter.clone();
+            let stall_health_tx = params.stall_health_tx.clone();
+            move |frame| {
+                let sample_buffer = frame.sample_buf();
+
+                let mach_timestamp =
+                    cm::Clock::convert_host_time_to_sys_units(sample_buffer.pts());
+                let timestamp = Timestamp::MachAbsoluteTime(
+                    cap_timestamp::MachAbsoluteTimestamp::new(mach_timestamp),
+                );
+
+                match &frame {
+                    scap_screencapturekit::Frame::Screen(frame) => {
+                        let Some(image_buf) = frame.image_buf() else {
+                            return;
+                        };
+                        if image_buf.height() == 0 || image_buf.width() == 0 {
+                            return;
+                        }
+
+                        let frame_width = image_buf.width();
+                        let frame_height = image_buf.height();
+
+                        let final_sample_buf =
+                            if frame_width != expected_width || frame_height != expected_height {
+                                let Ok(mut scaler_guard) = frame_scaler.lock() else {
+                                    drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                    return;
+                                };
+
+                                if scaler_guard.is_none() {
+                                    *scaler_guard =
+                                        FrameScaler::new(expected_width, expected_height);
+
+                                    if scaler_guard.is_some() {
+                                        info!(
+                                            expected_width,
+                                            expected_height,
+                                            frame_width,
+                                            frame_height,
+                                            "Display configuration changed, scaling frames to match original dimensions"
+                                        );
+                                    } else {
+                                        warn!(
+                                            "Failed to create frame scaler, dropping mismatched frames"
+                                        );
+                                    }
+                                    scaling_logged.store(true, atomic::Ordering::Relaxed);
+                                }
+
+                                let Some(scaler) = scaler_guard.as_ref() else {
+                                    drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                    return;
+                                };
+
+                                let Some(scaled) = scaler.scale_frame(sample_buffer) else {
+                                    drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                                    return;
+                                };
+
+                                let count =
+                                    scaled_frame_count.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+                                if count.is_multiple_of(300) {
+                                    debug!(scaled_frames = count, "Scaling frames");
+                                }
+
+                                scaled
+                            } else {
+                                if scaling_logged.swap(false, atomic::Ordering::Relaxed) {
+                                    let count =
+                                        scaled_frame_count.swap(0, atomic::Ordering::Relaxed);
+                                    info!(
+                                        scaled_frames = count,
+                                        "Display dimensions restored, resuming direct capture"
+                                    );
+                                    if let Ok(mut guard) = frame_scaler.lock() {
+                                        *guard = None;
+                                    }
+                                }
+
+                                    sample_buffer.retained()
+                            };
+
+                        cap_fail::fail_ret!("screen_capture video frame skip");
+
+                        video_frame_count.fetch_add(1, atomic::Ordering::Relaxed);
+
+                        match output_pipeline::send_with_stall_budget_flume(
+                            &video_tx,
+                            VideoFrame {
+                                sample_buf: final_sample_buf,
+                                timestamp,
+                            },
+                            "screen-video",
+                            &stall_health_tx,
+                        ) {
+                            output_pipeline::StallSendOutcome::Sent => {}
+                            output_pipeline::StallSendOutcome::StalledAndDropped { .. }
+                            | output_pipeline::StallSendOutcome::Disconnected => {
+                                drop_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    scap_screencapturekit::Frame::Audio(_) => {
+                        use ffmpeg::ChannelLayout;
+
+                        cap_fail::fail_ret!("screen_capture audio frame skip");
+
+                        let Some(audio_tx) = &mut audio_tx else {
+                            return;
+                        };
+
+                        let Ok(buf_list) = sample_buffer.audio_buf_list::<2>() else {
+                            warn!("Failed to extract audio buffer list from sample, dropping audio chunk");
+                            return;
+                        };
+                        let Ok(slice) = buf_list.block().as_slice() else {
+                            warn!("Failed to get audio buffer slice, dropping audio chunk");
+                            return;
+                        };
+
+                        let mut frame = ffmpeg::frame::Audio::new(
+                            ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
+                            sample_buffer.num_samples() as usize,
+                            ChannelLayout::STEREO,
+                        );
+                        frame.set_rate(48_000);
+                        let data_bytes_size = buf_list.list().buffers[0].data_bytes_size;
+                        for i in 0..frame.planes() {
+                            frame.data_mut(i).copy_from_slice(
+                                &slice[i * data_bytes_size as usize
+                                    ..(i + 1) * data_bytes_size as usize],
+                            );
+                        }
+
+                        match output_pipeline::send_with_stall_budget_futures(
+                            audio_tx,
+                            AudioFrame::new(frame, timestamp),
+                            "screen-system-audio",
+                            &stall_health_tx,
+                        ) {
+                            output_pipeline::StallSendOutcome::Sent => {
+                                sys_audio_frame_counter
+                                    .fetch_add(1, atomic::Ordering::Relaxed);
+                            }
+                            output_pipeline::StallSendOutcome::StalledAndDropped { .. }
+                            | output_pipeline::StallSendOutcome::Disconnected => {
+                                sys_audio_drop_counter
+                                    .fetch_add(1, atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .with_stop_with_err_cb({
+            let video_frame_count = params.video_frame_counter.clone();
+            move |_, err| {
+                debug!(
+                    "Capturer stopping after creating {} video frames",
+                    video_frame_count.load(atomic::Ordering::Relaxed)
+                );
+                let _ = error_tx.send(err.retained());
+            }
+        });
+
+    let capturer = Capturer::new(Arc::new(builder.build()?));
+    capturer.start().await?;
+    Ok(capturer)
+}
+
+pub struct SystemAudioSourceConfig(
+    ChannelAudioSourceConfig,
+    Capturer,
+    broadcast::Receiver<arc::R<ns::Error>>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    Arc<CapturerRebuildParams>,
+    bool,
+);
+
+impl SystemAudioSourceConfig {
+    /// The stream exists only for its audio, so no video source is there to
+    /// rebuild it after a system stop: the track ends instead of waiting for a
+    /// restart that never comes.
+    pub fn standalone(mut self) -> Self {
+        self.6 = true;
+        self
+    }
+}
+
+pub struct SystemAudioSource {
+    inner: ChannelAudioSource,
+    capturer: Capturer,
+    cancel_token: CancellationToken,
+}
+
+impl output_pipeline::AudioSource for SystemAudioSource {
+    type Config = SystemAudioSourceConfig;
+
+    fn setup(
+        config: Self::Config,
+        tx: mpsc::Sender<AudioFrame>,
+        ctx: &mut SetupCtx,
+    ) -> impl Future<Output = anyhow::Result<Self>> + 'static
+    where
+        Self: Sized,
+    {
+        let SystemAudioSourceConfig(
+            channel_config,
+            capturer,
+            mut error_rx,
+            frame_counter,
+            drop_counter,
+            _rebuild_params,
+            standalone,
+        ) = config;
+
+        let cancel_token = CancellationToken::new();
+        let pipeline_cancel = ctx.stop_token();
+        let stop_signal = ctx.stop_signal();
+        let capturer_for_monitor = capturer.clone();
+
+        ctx.tasks().spawn("system-audio", {
+            let cancel = cancel_token.child_token();
+            async move {
+                let mut system_stop_count = 0u32;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        result = error_rx.recv() => {
+                            match result {
+                                Ok(err) => {
+                                    let user_stopped = is_user_stop_error(err.as_ref());
+                                    if user_stopped || is_capture_source_gone_error(err.as_ref()) {
+                                        capturer_for_monitor.mark_stopped();
+                                        if user_stopped {
+                                            info!(
+                                                "Screen capture audio stream stopped from macOS sharing controls"
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Screen capture audio stream ended because its capture source disappeared"
+                                            );
+                                        }
+                                        stop_signal.mark_user_stopped();
+                                        pipeline_cancel.cancel();
+                                        break;
+                                    }
+                                    if is_system_stop_error(err.as_ref()) && standalone {
+                                        capturer_for_monitor.mark_stopped();
+                                        warn!("System audio stream stopped by the system; ending the audio-only recording");
+                                        stop_signal.mark_user_stopped();
+                                        pipeline_cancel.cancel();
+                                        break;
+                                    }
+                                    if is_system_stop_error(err.as_ref()) {
+                                        system_stop_count += 1;
+                                        if system_stop_count > MAX_CAPTURE_RESTARTS {
+                                            capturer_for_monitor.mark_stopped();
+                                            warn!("Screen capture audio stream stopped by the system (exhausted restarts)");
+                                            return Err(anyhow!(system_stop_message()));
+                                        }
+                                        warn!(
+                                            system_stop_count,
+                                            "Screen capture audio stream stopped by system, waiting for restart"
+                                        );
+                                        tokio::time::sleep(RESTART_DELAY + Duration::from_secs(1)).await;
+                                        continue;
+                                    }
+                                    capturer_for_monitor.mark_stopped();
+                                    return Err(anyhow!("{err}"));
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+        });
+
+        let stats_cancel = cancel_token.clone();
+        tokio::spawn(
+            async move {
+                let mut last_log = Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let captured = frame_counter.load(atomic::Ordering::Relaxed);
+                    let dropped = drop_counter.load(atomic::Ordering::Relaxed);
+
+                    if dropped > 0 {
+                        let total = captured + dropped;
+                        let drop_pct = if total > 0 {
+                            100.0 * dropped as f64 / total as f64
+                        } else {
+                            0.0
+                        };
+
+                        if last_log.elapsed() >= Duration::from_secs(5) {
+                            warn!(
+                                captured = captured,
+                                dropped = dropped,
+                                drop_pct = format!("{:.1}%", drop_pct),
+                                "System audio dropping frames due to full channel"
+                            );
+                            last_log = Instant::now();
+                        }
+                    } else if captured > 0 {
+                        debug!(captured = captured, "System audio frames captured");
+                    }
+                }
+            }
+            .with_cancellation_token_owned(stats_cancel)
+            .in_current_span(),
+        );
+
+        ChannelAudioSource::setup(channel_config, tx, ctx).map({
+            let cancel_token = cancel_token.clone();
+            move |v| {
+                v.map(|source| Self {
+                    inner: source,
+                    capturer,
+                    cancel_token,
+                })
+            }
+        })
+    }
+
+    async fn start(&mut self) -> anyhow::Result<()> {
+        self.capturer.start().await?;
+
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> anyhow::Result<()> {
+        self.cancel_token.cancel();
+        self.capturer.stop().await?;
+
+        Ok(())
+    }
+
+    fn audio_info(&self) -> AudioInfo {
+        self.inner.audio_info()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window_id(id: &str) -> WindowId {
+        id.parse().unwrap()
+    }
+
+    fn window_config(window: Option<WindowId>) -> Config {
+        Config {
+            display: "1".parse().unwrap(),
+            crop_bounds: None,
+            fps: 60,
+            show_cursor: true,
+            window,
+        }
+    }
+
+    fn window_crop(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        scale: f64,
+    ) -> super::super::CropBounds {
+        super::super::even_pixel_crop(
+            LogicalBounds::new(LogicalPosition::new(x, y), LogicalSize::new(width, height)),
+            scale,
+        )
+    }
+
+    fn rect(rect: cg::Rect) -> (f64, f64, f64, f64) {
+        (
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+        )
+    }
+
+    #[test]
+    fn focus_reads_the_whole_window_from_its_top_left() {
+        let crop = window_crop(100., 50., 920., 436., 1.0);
+        assert_eq!(rect(source_rect(true, crop)), (0., 0., 920., 436.));
+        assert_eq!(rect(source_rect(false, crop)), (100., 50., 920., 436.));
+    }
+
+    #[test]
+    fn focus_reads_as_many_pixels_as_a_screen_region_at_every_scale() {
+        for (scale, width, height) in [
+            (1.0, 701., 461.),
+            (2.0, 845., 753.5),
+            (1.5, 1280., 800.),
+            (2.0, 1512., 949.),
+        ] {
+            let crop = window_crop(37., 25., width, height, scale);
+            let (_, _, focus_width, focus_height) = rect(source_rect(true, crop));
+            let (_, _, region_width, region_height) = rect(source_rect(false, crop));
+            assert_eq!((focus_width, focus_height), (region_width, region_height));
+            assert!(width - focus_width < 2. / scale, "{scale}x {width} pt wide");
+            assert!(
+                height - focus_height < 2. / scale,
+                "{scale}x {height} pt tall"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_reads_a_partly_offscreen_window_from_its_top_left() {
+        let crop = window_crop(-1440., -120., 1440., 900., 2.0);
+        assert_eq!(rect(source_rect(true, crop)), (0., 0., 1440., 900.));
+    }
+
+    #[test]
+    fn initial_capture_uses_window_filter_for_non_excluded_window() {
+        let config = window_config(Some(window_id("247")));
+        let excluded = vec![window_id("12"), window_id("99")];
+
+        assert_eq!(
+            capturable_window(&config, &excluded, "initial"),
+            Some(&window_id("247"))
+        );
+    }
+
+    #[test]
+    fn initial_capture_keeps_excluded_window_on_display_path() {
+        let config = window_config(Some(window_id("247")));
+        let excluded = vec![window_id("12"), window_id("247")];
+
+        assert_eq!(capturable_window(&config, &excluded, "initial"), None);
+    }
+
+    #[test]
+    fn restart_capture_keeps_excluded_window_on_display_path() {
+        let config = window_config(Some(window_id("247")));
+        let excluded = vec![window_id("247")];
+        let (restart_config, restart_excluded) = (config.clone(), excluded.clone());
+
+        assert_eq!(
+            capturable_window(&restart_config, &restart_excluded, "restart"),
+            None
+        );
+    }
+
+    #[test]
+    fn restart_capture_uses_window_filter_for_non_excluded_window() {
+        let config = window_config(Some(window_id("247")));
+        let excluded = vec![window_id("12")];
+        let (restart_config, restart_excluded) = (config.clone(), excluded.clone());
+
+        assert_eq!(
+            capturable_window(&restart_config, &restart_excluded, "restart"),
+            Some(&window_id("247"))
+        );
+    }
+
+    #[test]
+    fn only_a_window_filter_is_watched_for_its_window_closing() {
+        let config = window_config(Some(window_id("247")));
+
+        assert_eq!(
+            window_to_watch(&config, &[window_id("12")]),
+            Some(window_id("247"))
+        );
+        assert_eq!(window_to_watch(&config, &[window_id("247")]), None);
+        assert_eq!(window_to_watch(&window_config(None), &[]), None);
+    }
+
+    /// A window filter never reports that its window closed, so the monitor
+    /// polls for it; an id the window server does not know counts as closed.
+    #[test]
+    fn a_window_the_window_server_does_not_list_counts_as_closed() {
+        assert!(!recorded_window_exists(&window_id("4294967294")));
+    }
+
+    #[test]
+    fn only_no_capture_source_counts_as_the_source_disappearing() {
+        let sc_domain = || sc::error::domain().to_string();
+
+        assert!(is_capture_source_gone(sc_domain(), -3815));
+        assert!(!is_capture_source_gone(sc_domain(), -3817));
+        assert!(!is_capture_source_gone(sc_domain(), -3821));
+        assert!(!is_capture_source_gone(sc_domain(), -3811));
+        assert!(!is_capture_source_gone(
+            "NSCocoaErrorDomain".to_string(),
+            -3815
+        ));
+    }
+
+    #[test]
+    fn non_window_targets_never_use_window_filter() {
+        let config = window_config(None);
+
+        assert_eq!(capturable_window(&config, &[], "initial"), None);
+        assert_eq!(capturable_window(&config, &[], "restart"), None);
+    }
+}

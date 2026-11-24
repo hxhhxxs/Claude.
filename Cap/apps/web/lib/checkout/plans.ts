@@ -1,0 +1,90 @@
+import { STRIPE_PLAN_IDS } from "@cap/utils";
+import { CODE as CAP_FRIDAY_CODE } from "@/components/pages/blackfriday/content";
+import { MAX_CHECKOUT_QUANTITY } from "@/lib/checkout-quantity";
+
+export type CheckoutPlan = "monthly" | "yearly";
+export type CheckoutEnvironment = keyof typeof STRIPE_PLAN_IDS;
+
+export const CHECKOUT_PLANS: readonly CheckoutPlan[] = ["monthly", "yearly"];
+
+export const isCheckoutPlan = (value: unknown): value is CheckoutPlan =>
+	value === "monthly" || value === "yearly";
+
+export const planPriceId = (
+	plan: CheckoutPlan,
+	environment: CheckoutEnvironment,
+): string => STRIPE_PLAN_IDS[environment][plan];
+
+export const planForPriceId = (
+	priceId: string | null | undefined,
+	environment: CheckoutEnvironment,
+): CheckoutPlan | null =>
+	CHECKOUT_PLANS.find((plan) => planPriceId(plan, environment) === priceId) ??
+	null;
+
+export const parseCheckoutSeats = (value: unknown): number => {
+	const seats = typeof value === "string" ? Number(value) : value;
+	return typeof seats === "number" &&
+		Number.isInteger(seats) &&
+		seats >= 1 &&
+		seats <= MAX_CHECKOUT_QUANTITY
+		? seats
+		: 1;
+};
+
+const PROMOTION_CODE = /^[A-Za-z0-9][A-Za-z0-9_-]{1,39}$/;
+
+export const parsePromotionCode = (value: unknown): string | null =>
+	typeof value === "string" && PROMOTION_CODE.test(value.trim())
+		? value.trim().toUpperCase()
+		: null;
+
+// Stripe applies a promotion code to every price of a product, so the
+// yearly-only rule for the Cap Friday code is enforced here.
+export const isYearlyOnlyPromotion = (value: unknown): boolean =>
+	parsePromotionCode(value) === CAP_FRIDAY_CODE;
+
+export const promotionForPlan = (
+	plan: CheckoutPlan | null,
+	value: unknown,
+): string | null =>
+	plan === "yearly" || !isYearlyOnlyPromotion(value)
+		? parsePromotionCode(value)
+		: null;
+
+export const checkoutPath = ({
+	plan,
+	seats,
+	onboarding,
+	promo,
+}: {
+	plan: CheckoutPlan;
+	seats: number;
+	onboarding?: boolean;
+	promo?: string | null;
+}): string => {
+	const params = new URLSearchParams({ plan, seats: String(seats) });
+	if (onboarding) params.set("onboarding", "1");
+	const code = parsePromotionCode(promo);
+	if (code) params.set("promo", code);
+	return `/checkout?${params.toString()}`;
+};
+
+// Stripe only presents a currency when every plan price carries it, otherwise
+// switching between monthly and yearly mid-checkout would be rejected.
+export const pickCheckoutCurrency = (
+	preferred: string,
+	supportedByPlan: ReadonlyArray<ReadonlySet<string>>,
+): string =>
+	supportedByPlan.every((currencies) => currencies.has(preferred))
+		? preferred
+		: "usd";
+
+export const sessionIdFromClientSecret = (
+	clientSecret: string,
+): string | null => {
+	const [sessionId] = clientSecret.split("_secret_");
+	return sessionId && sessionId !== clientSecret && sessionId.startsWith("cs_")
+		? sessionId
+		: null;
+};

@@ -1,0 +1,218 @@
+"use server";
+
+import { db } from "@cap/database";
+import { getCurrentUser } from "@cap/database/auth/session";
+import { hashPassword } from "@cap/database/crypto";
+import { nanoId } from "@cap/database/helpers";
+import { organizations, spaceMembers, spaces } from "@cap/database/schema";
+import { userIsPro } from "@cap/utils";
+import {
+	type ImageUpload,
+	Organisation,
+	Space,
+	SpaceMemberId,
+	type SpaceMemberRole,
+	User,
+} from "@cap/web-domain";
+import { and, eq } from "drizzle-orm";
+import { revalidatePath } from "next/cache";
+import { isOrganizationOwnerPro } from "@/lib/org-pro";
+import {
+	reserveSpaceSlot,
+	SPACE_LIMIT_MESSAGE,
+	SPACE_RATE_MESSAGE,
+	spaceCreationLimited,
+} from "@/lib/workspace-creation-limits";
+import { filterUsersInOrganization } from "./organization-member-ids";
+import {
+	getSpaceSettingsFromFormData,
+	hasProSpaceSettingsEnabled,
+} from "./space-settings";
+import { uploadSpaceIcon } from "./upload-space-icon";
+
+interface CreateSpaceResponse {
+	success: boolean;
+	spaceId?: string;
+	name?: string;
+	iconUrl?: string | null;
+	error?: string;
+}
+
+export async function createSpace(
+	formData: FormData,
+): Promise<CreateSpaceResponse> {
+	try {
+		const user = await getCurrentUser();
+
+		if (!user || !user.activeOrganizationId) {
+			return {
+				success: false,
+				error: "User not logged in or no active organization",
+			};
+		}
+
+		const name = formData.get("name") as string;
+		const passwordEnabled = formData.get("passwordEnabled") === "true";
+		const password = formData.get("password") as string | null;
+		const publicEnabled = formData.get("public") === "true";
+		const settings = getSpaceSettingsFromFormData(formData);
+		const canUseProFeatures = userIsPro(user);
+
+		if (!name) {
+			return {
+				success: false,
+				error: "Space name is required",
+			};
+		}
+
+		if (passwordEnabled && !password?.trim()) {
+			return {
+				success: false,
+				error: "Space password is required",
+			};
+		}
+
+		if (!canUseProFeatures && passwordEnabled) {
+			return {
+				success: false,
+				error: "Upgrade required to protect a space with a password",
+			};
+		}
+
+		if (!canUseProFeatures && hasProSpaceSettingsEnabled(settings)) {
+			return {
+				success: false,
+				error: "Upgrade required to change these viewer rules",
+			};
+		}
+
+		if (
+			publicEnabled &&
+			!(await isOrganizationOwnerPro(
+				Organisation.OrganisationId.make(user.activeOrganizationId),
+			))
+		) {
+			return {
+				success: false,
+				error: "Upgrade to Cap Pro to create a public collection link",
+			};
+		}
+
+		if (await spaceCreationLimited(user.id)) {
+			return { success: false, error: SPACE_RATE_MESSAGE };
+		}
+
+		const existingSpace = await db()
+			.select({ id: spaces.id })
+			.from(spaces)
+			.where(
+				and(
+					eq(spaces.organizationId, user.activeOrganizationId),
+					eq(spaces.name, name),
+				),
+			)
+			.limit(1);
+
+		if (existingSpace.length > 0) {
+			return {
+				success: false,
+				error: "A space with this name already exists.",
+			};
+		}
+
+		const requestedMemberIds = formData
+			.getAll("members[]")
+			.filter(
+				(entry): entry is string =>
+					typeof entry === "string" && entry.length > 0 && entry !== user.id,
+			)
+			.map((entry) => User.UserId.make(entry));
+		const [organization] =
+			requestedMemberIds.length > 0
+				? await db()
+						.select({ ownerId: organizations.ownerId })
+						.from(organizations)
+						.where(eq(organizations.id, user.activeOrganizationId))
+						.limit(1)
+				: [];
+		const memberUserIds = organization
+			? await filterUsersInOrganization(
+					user.activeOrganizationId,
+					organization.ownerId,
+					requestedMemberIds,
+				)
+			: [];
+
+		const spaceId = Space.SpaceId.make(nanoId());
+		let iconUrl: ImageUpload.ImageUrlOrKey | null = null;
+		const hashedPassword =
+			passwordEnabled && password?.trim()
+				? await hashPassword(password.trim())
+				: null;
+
+		const created = await db().transaction(async (tx) => {
+			if (
+				!(await reserveSpaceSlot(
+					tx,
+					Organisation.OrganisationId.make(user.activeOrganizationId),
+				))
+			)
+				return false;
+
+			await tx.insert(spaces).values({
+				id: spaceId,
+				name,
+				organizationId: user.activeOrganizationId,
+				createdById: user.id,
+				iconUrl: null,
+				settings,
+				password: hashedPassword,
+				public: publicEnabled,
+			});
+
+			const spaceMembersToInsert = [user.id, ...memberUserIds].map((userId) => {
+				const role: SpaceMemberRole = userId === user.id ? "admin" : "member";
+				return {
+					id: SpaceMemberId.make(nanoId()),
+					spaceId,
+					userId,
+					role,
+				};
+			});
+
+			await tx.insert(spaceMembers).values(spaceMembersToInsert);
+			return true;
+		});
+		if (!created) {
+			return { success: false, error: SPACE_LIMIT_MESSAGE };
+		}
+
+		const iconFile = formData.get("icon") as File | null;
+
+		if (iconFile) {
+			try {
+				const iconFormData = new FormData();
+				iconFormData.append("icon", iconFile);
+				const result = await uploadSpaceIcon(iconFormData, spaceId);
+				iconUrl = result.iconUrl;
+			} catch (error) {
+				console.error("Error uploading space icon:", error);
+			}
+		}
+
+		revalidatePath("/dashboard");
+
+		return {
+			success: true,
+			spaceId,
+			iconUrl,
+			name,
+		};
+	} catch (error) {
+		console.error("Error creating space:", error);
+		return {
+			success: false,
+			error: "Failed to create space",
+		};
+	}
+}

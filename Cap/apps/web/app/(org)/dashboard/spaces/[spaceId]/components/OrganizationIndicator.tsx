@@ -1,0 +1,157 @@
+"use client";
+
+import {
+	Button,
+	Dialog,
+	DialogContent,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+	DialogTrigger,
+} from "@cap/ui";
+import type { ImageUpload } from "@cap/web-domain";
+import { faBuilding } from "@fortawesome/free-solid-svg-icons/faBuilding";
+import { faPlus } from "@fortawesome/free-solid-svg-icons/faPlus";
+import clsx from "clsx";
+import { useState } from "react";
+import { FontAwesomeIcon } from "@/components/FontAwesomeIcon";
+import { SignedImageUrl } from "@/components/SignedImageUrl";
+import {
+	compareOrganizationRoles,
+	normalizeOrganizationRole,
+	organizationRoleLabel,
+} from "@/lib/permissions/roles";
+
+export type OrganizationMemberData = {
+	id: string;
+	userId: string;
+	role: string;
+	image?: ImageUpload.ImageUrl | null;
+	name: string | null;
+	email: string;
+};
+
+type OrganizationIndicatorProps = {
+	memberCount: number;
+	members: OrganizationMemberData[];
+	organizationName: string;
+	canManageMembers: boolean;
+	onAddVideos?: () => void;
+};
+
+export const OrganizationIndicator = ({
+	memberCount,
+	members,
+	organizationName,
+	canManageMembers,
+	onAddVideos,
+}: OrganizationIndicatorProps) => {
+	const [open, setOpen] = useState(false);
+
+	return (
+		<div className="flex gap-2 items-center">
+			<Dialog open={open} onOpenChange={setOpen}>
+				<DialogTrigger asChild>
+					<Button variant="secondary" size="sm" className="z-10 gap-2 px-4 h-9">
+						<FontAwesomeIcon
+							className="size-3.5 text-gray-10"
+							icon={faBuilding}
+						/>
+						{memberCount} {memberCount === 1 ? "member" : "members"}
+					</Button>
+				</DialogTrigger>
+				<DialogContent className="p-0 w-full max-w-md rounded-xl border bg-gray-2 border-gray-4">
+					<DialogHeader
+						icon={<FontAwesomeIcon icon={faBuilding} />}
+						description="View members of this organization"
+					>
+						<DialogTitle className="text-lg text-gray-12">
+							{organizationName} Members: {memberCount}
+						</DialogTitle>
+					</DialogHeader>
+
+					<div className="p-5">
+						<div className="flex flex-col">
+							<div className="space-y-3 max-h-[320px] custom-scroll overflow-y-auto">
+								{members
+									.sort((a, b) => compareOrganizationRoles(a.role, b.role))
+									.map((member) => (
+										<div
+											key={member.id}
+											className="flex gap-3 items-center px-3 py-2 rounded-lg border transition-colors bg-gray-3 border-gray-4"
+										>
+											<SignedImageUrl
+												image={member.image}
+												name={member.name || member.email}
+												className="size-8"
+												letterClass="text-sm"
+											/>
+											<div className="flex-1 min-w-0">
+												<p className="text-sm font-medium truncate text-gray-12">
+													{member.name || member.email}
+												</p>
+												{member.name && (
+													<p className="text-xs truncate text-gray-10">
+														{member.email}
+													</p>
+												)}
+											</div>
+											<p
+												className={clsx(
+													"px-2.5 py-1.5 text-xs font-medium capitalize text-white rounded-full",
+													normalizeOrganizationRole(member.role) === "owner"
+														? "bg-blue-500"
+														: normalizeOrganizationRole(member.role) === "admin"
+															? "bg-gray-12"
+															: "bg-gray-10",
+												)}
+											>
+												{organizationRoleLabel(
+													normalizeOrganizationRole(member.role) ?? "member",
+												)}
+											</p>
+										</div>
+									))}
+							</div>
+						</div>
+					</div>
+
+					<DialogFooter>
+						<div
+							className={clsx(
+								"flex w-full",
+								canManageMembers ? "justify-between" : "justify-end",
+							)}
+						>
+							{canManageMembers && (
+								<Button
+									variant="dark"
+									size="sm"
+									href="/dashboard/settings/organization"
+								>
+									<FontAwesomeIcon className="size-3" icon={faPlus} />
+									Invite members
+								</Button>
+							)}
+							<Button variant="gray" size="sm" onClick={() => setOpen(false)}>
+								Close
+							</Button>
+						</div>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			{onAddVideos && (
+				<Button
+					variant="blue"
+					size="sm"
+					className="gap-2 px-4 h-9"
+					onClick={onAddVideos}
+				>
+					<FontAwesomeIcon className="size-3" icon={faPlus} />
+					Add videos
+				</Button>
+			)}
+		</div>
+	);
+};

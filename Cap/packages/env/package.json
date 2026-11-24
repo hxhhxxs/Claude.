@@ -1,0 +1,21 @@
+{
+	"name": "@cap/env",
+	"private": true,
+	"sideEffects": false,
+	"type": "module",
+	"main": "./index.ts",
+	"types": "./index.ts",
+	"scripts": {
+		"build": "tsdown"
+	},
+	"publishConfig": {
+		"main": "./dist/index.js"
+	},
+	"dependencies": {
+		"@t3-oss/env-nextjs": "^0.13.0",
+		"zod": "^4.6.7"
+	},
+	"devDependencies": {
+		"@types/node": "^22.15.14"
+	}
+}

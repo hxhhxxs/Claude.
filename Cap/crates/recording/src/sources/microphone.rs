@@ -1,0 +1,2566 @@
+use crate::{
+    feeds::microphone::{self, MicrophoneFeedLock},
+    output_pipeline::{AudioFrame, AudioSource, PipelineHealthEvent, emit_health},
+    sources::audio_mixer::AudioMixer,
+};
+use cap_media_info::{AudioInfo, ffmpeg_sample_format_for};
+use cpal::SampleFormat;
+use futures::{SinkExt, channel::mpsc};
+use kameo::error::SendError;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+const MICROPHONE_TARGET_CHANNELS: u16 = 1;
+
+const SILENCE_TIMEOUT_WIRED: Duration = Duration::from_millis(100);
+const SILENCE_TIMEOUT_WIRELESS: Duration = Duration::from_millis(200);
+const SILENCE_CHUNK_DURATION: Duration = Duration::from_millis(20);
+const MIC_RECONNECT_AFTER: Duration = Duration::from_secs(2);
+const MIC_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+// A stalled callback usually means CoreAudio/cpal is delivering buffers late, not that
+// audio was lost: the real samples arrive with their original capture timestamps once the
+// thread resumes. Fabricating forward-timestamped silence for those transient stalls
+// double-counts the interval (synthetic silence *and* the late real samples both land on
+// the muxer timeline), which is what progressively pushed audio past video in long
+// recordings. Below this threshold we emit nothing and let the muxer's gap/overlap
+// reconciliation be the single owner of timeline length; only a sustained outage gets
+// keepalive silence so a genuinely dead device doesn't freeze the audio track.
+const STALL_SILENCE_KEEPALIVE_AFTER: Duration = Duration::from_secs(1);
+
+fn should_fabricate_stall_silence(stall_duration: Duration, keepalive_after: Duration) -> bool {
+    stall_duration >= keepalive_after
+}
+
+struct ReconnectAttemptGuard(Arc<AtomicBool>);
+
+impl Drop for ReconnectAttemptGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+async fn complete_reconnect_attempt<T>(
+    in_flight: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    let _attempt = ReconnectAttemptGuard(in_flight);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = work => Some(result),
+    }
+}
+
+fn reconnect_is_due(stall: Duration, backoff: Duration, in_flight: bool) -> bool {
+    !in_flight && stall >= backoff
+}
+
+fn reset_reconnect_after_frame(
+    in_flight: &AtomicBool,
+    attempts: &mut u32,
+    next_reconnect_after: &mut Duration,
+) {
+    in_flight.store(false, Ordering::Relaxed);
+    *attempts = 0;
+    *next_reconnect_after = MIC_RECONNECT_AFTER;
+}
+
+// macOS can hand an active VoIP call the input while CoreAudio keeps delivering
+// on-time buffers of exact 0.0 (#2303). Those are real captured frames, so the
+// stall/keepalive path never fires. A live microphone's noise floor is never
+// bit-exact zero, even in a quiet room (~4% non-zero samples at -91 dBFS in the
+// issue's measurements), so a sustained run of exact zeros is the signal.
+const DIGITAL_SILENCE_WINDOW: Duration = Duration::from_secs(1);
+const DIGITAL_SILENCE_MIN_WINDOWS: u32 = 5;
+const DIGITAL_SILENCE_MAX_NONZERO_PER_MILLE: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigitalSilenceUpdate {
+    Unchanged,
+    RunStarted,
+    RunExtended,
+    RunEnded,
+}
+
+struct DigitalSilenceDetector {
+    sample_rate: u64,
+    window_len: u64,
+    window_total: u64,
+    window_nonzero: u64,
+    silent_windows: u32,
+    run_samples: u64,
+    flagged_samples: u64,
+}
+
+impl DigitalSilenceDetector {
+    fn new(sample_rate: u32) -> Self {
+        let sample_rate = u64::from(sample_rate).max(1);
+        Self {
+            sample_rate,
+            window_len: (sample_rate * DIGITAL_SILENCE_WINDOW.as_millis() as u64 / 1000).max(1),
+            window_total: 0,
+            window_nonzero: 0,
+            silent_windows: 0,
+            run_samples: 0,
+            flagged_samples: 0,
+        }
+    }
+
+    fn reset(&mut self) -> DigitalSilenceUpdate {
+        let was_flagged = self.silent_windows >= DIGITAL_SILENCE_MIN_WINDOWS;
+        self.window_total = 0;
+        self.window_nonzero = 0;
+        self.silent_windows = 0;
+        self.run_samples = 0;
+        if was_flagged {
+            DigitalSilenceUpdate::RunEnded
+        } else {
+            DigitalSilenceUpdate::Unchanged
+        }
+    }
+
+    fn observe(&mut self, total: u64, nonzero: u64) -> DigitalSilenceUpdate {
+        self.window_total = self.window_total.saturating_add(total);
+        self.window_nonzero = self.window_nonzero.saturating_add(nonzero);
+        if self.window_total < self.window_len {
+            return DigitalSilenceUpdate::Unchanged;
+        }
+
+        let window_total = self.window_total;
+        let silent = self.window_nonzero.saturating_mul(1000)
+            <= window_total.saturating_mul(DIGITAL_SILENCE_MAX_NONZERO_PER_MILLE);
+        self.window_total = 0;
+        self.window_nonzero = 0;
+
+        if !silent {
+            return self.reset();
+        }
+
+        self.silent_windows = self.silent_windows.saturating_add(1);
+        self.run_samples = self.run_samples.saturating_add(window_total);
+        match self.silent_windows.cmp(&DIGITAL_SILENCE_MIN_WINDOWS) {
+            std::cmp::Ordering::Less => DigitalSilenceUpdate::Unchanged,
+            std::cmp::Ordering::Equal => {
+                self.flagged_samples = self.flagged_samples.saturating_add(self.run_samples);
+                DigitalSilenceUpdate::RunStarted
+            }
+            std::cmp::Ordering::Greater => {
+                self.flagged_samples = self.flagged_samples.saturating_add(window_total);
+                DigitalSilenceUpdate::RunExtended
+            }
+        }
+    }
+
+    fn run_ms(&self) -> u64 {
+        self.run_samples.saturating_mul(1000) / self.sample_rate
+    }
+
+    fn flagged_ms(&self) -> u64 {
+        self.flagged_samples.saturating_mul(1000) / self.sample_rate
+    }
+}
+
+fn count_nonzero_samples(frame: &ffmpeg::frame::Audio) -> Option<(u64, u64)> {
+    if frame.format() != ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed) {
+        return None;
+    }
+    let samples = frame.samples() * usize::from(frame.channels());
+    // An empty device callback yields a frame with no planes, where
+    // `data(0)` panics instead of returning an empty slice.
+    if samples == 0 || frame.planes() == 0 {
+        return None;
+    }
+    let bytes = frame.data(0).get(..samples * size_of::<f32>())?;
+    let nonzero = bytes
+        .chunks_exact(size_of::<f32>())
+        .filter(|sample| f32::from_ne_bytes([sample[0], sample[1], sample[2], sample[3]]) != 0.0)
+        .count();
+    Some((samples as u64, nonzero as u64))
+}
+
+pub struct Microphone {
+    #[cfg(windows)]
+    capture_scope: crate::output_pipeline::PipelineBuildScope,
+    #[cfg(target_os = "linux")]
+    required_health: Option<RequiredMicrophoneHealth>,
+    info: AudioInfo,
+    // Holds the current feed lock for the source's lifetime; Windows also
+    // reads it to retire the current subscription.
+    _binding: SharedMicrophoneBinding,
+    cancel: CancellationToken,
+}
+
+/// The feed a running microphone source reads from. A [`MicrophoneSwitch`]
+/// replaces it mid-recording, so teardown always releases the current one.
+struct MicrophoneBinding {
+    lock: Arc<MicrophoneFeedLock>,
+    #[cfg(windows)]
+    subscription: Arc<microphone::RecordingSubscription>,
+}
+
+type SharedMicrophoneBinding = Arc<std::sync::Mutex<MicrophoneBinding>>;
+
+impl Microphone {
+    #[cfg(windows)]
+    fn current_subscription(
+        &self,
+    ) -> (
+        Arc<MicrophoneFeedLock>,
+        Arc<microphone::RecordingSubscription>,
+    ) {
+        let binding = self._binding.lock().unwrap();
+        (binding.lock.clone(), binding.subscription.clone())
+    }
+}
+
+// The detached bridge tasks hold clones of the feed lock and only exit via
+// this token. If the pipeline is torn down without stop() (wedged muxer,
+// error paths), a live-but-orphaned lock would keep the feed in State::Locked
+// forever, making RemoveInput a silent no-op and pinning the cpal stream for
+// the rest of the process.
+impl Drop for Microphone {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(error) = self.current_subscription().1.retire() {
+            self.capture_scope.fail_required(error);
+        }
+        self.cancel.cancel();
+    }
+}
+
+pub struct MicrophoneSwitchRequest {
+    lock: Arc<MicrophoneFeedLock>,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
+/// Moves a running microphone source onto another, already open feed. The
+/// recording keeps its audio track and timeline; only where the samples come
+/// from changes. Opening the new device is the caller's job, so a device that
+/// fails to open never touches the recording.
+#[derive(Clone)]
+pub struct MicrophoneSwitch(flume::Sender<MicrophoneSwitchRequest>);
+
+impl MicrophoneSwitch {
+    pub fn channel() -> (Self, flume::Receiver<MicrophoneSwitchRequest>) {
+        let (tx, rx) = flume::bounded(1);
+        (Self(tx), rx)
+    }
+
+    pub async fn switch(&self, lock: Arc<MicrophoneFeedLock>) -> anyhow::Result<()> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.0
+            .send_async(MicrophoneSwitchRequest { lock, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("The recording's microphone is no longer running"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("The recording's microphone stopped while switching"))?
+    }
+}
+
+async fn next_switch_request(
+    requests: &mut Option<flume::Receiver<MicrophoneSwitchRequest>>,
+) -> Option<MicrophoneSwitchRequest> {
+    let Some(receiver) = requests.as_ref() else {
+        return std::future::pending().await;
+    };
+    let request = receiver.recv_async().await.ok();
+    if request.is_none() {
+        *requests = None;
+    }
+    request
+}
+
+#[derive(Debug, Error)]
+pub enum MicrophoneSourceError {
+    #[error("microphone actor not running")]
+    ActorNotRunning,
+    #[error("failed to add microphone sender: {0}")]
+    AddSenderFailed(SendError<()>),
+}
+
+struct MicResampler {
+    context: ffmpeg::software::resampling::Context,
+    source_rate: u32,
+    source_channels: u16,
+    source_format: SampleFormat,
+}
+
+impl MicResampler {
+    fn create(
+        source_rate: u32,
+        source_channels: u16,
+        source_format: SampleFormat,
+        target_info: &AudioInfo,
+    ) -> Option<Self> {
+        let ffmpeg_fmt = ffmpeg_sample_format_for(source_format)?;
+        let source_info = AudioInfo::new_raw(ffmpeg_fmt, source_rate, source_channels);
+
+        // `resample` feeds frames built by `wrap_frame_with_max_channels`, which tag
+        // them with `ChannelLayout::default`. swr revalidates each frame's layout
+        // against the context and silently drops it on a mismatch, so the context must
+        // be configured with the identical layout. Using the named `channel_layout()`
+        // here instead diverges for 3/4/5/6-channel sources and silenced those mics.
+        let source_layout =
+            source_info.wrapped_frame_layout(AudioInfo::MAX_AUDIO_CHANNELS as usize);
+
+        let context = ffmpeg::software::resampler(
+            (
+                source_info.sample_format,
+                source_layout,
+                source_info.sample_rate,
+            ),
+            (
+                target_info.sample_format,
+                target_info.channel_layout(),
+                target_info.sample_rate,
+            ),
+        )
+        .ok()?;
+
+        Some(Self {
+            context,
+            source_rate,
+            source_channels,
+            source_format,
+        })
+    }
+
+    fn matches(&self, rate: u32, channels: u16, format: SampleFormat) -> bool {
+        self.source_rate == rate && self.source_channels == channels && self.source_format == format
+    }
+
+    fn resample(
+        &mut self,
+        data: &[u8],
+        source_rate: u32,
+        source_channels: u16,
+        source_format: SampleFormat,
+        timestamp: cap_timestamp::Timestamp,
+    ) -> Option<AudioFrame> {
+        let ffmpeg_fmt = ffmpeg_sample_format_for(source_format)?;
+        let source_info = AudioInfo::new_raw(ffmpeg_fmt, source_rate, source_channels);
+
+        let input_frame =
+            source_info.wrap_frame_with_max_channels(data, AudioInfo::MAX_AUDIO_CHANNELS as usize);
+        let input_samples = input_frame.samples();
+
+        let target = *self.context.output();
+        let src_rate = source_rate.max(1) as u64;
+        let dst_rate = target.rate.max(1) as u64;
+        let pending_output_samples = self
+            .context
+            .delay()
+            .map(|d| d.output.max(0) as u64)
+            .unwrap_or(0);
+        let resampled_from_input = (input_samples as u64)
+            .saturating_mul(dst_rate)
+            .div_ceil(src_rate);
+        let capacity = pending_output_samples
+            .saturating_add(resampled_from_input)
+            .saturating_add(16)
+            .min(i32::MAX as u64) as usize;
+
+        let mut output = ffmpeg::frame::Audio::new(target.format, capacity, target.channel_layout);
+
+        if self.context.run(&input_frame, &mut output).is_err() {
+            return None;
+        }
+
+        if output.samples() == 0 {
+            return None;
+        }
+
+        // Timestamp the output with the input frame's capture time, NOT capture minus
+        // the swr delay. The muxer builds the audio timeline from capture timestamps +
+        // sample counts and reconciles overlaps; subtracting the resampler's (pre-run)
+        // delay pulls each frame back so consecutive frames overlap, and the muxer then
+        // drops a full frame each tick — e.g. a 32k→48k mic lost ~0.8s up front and
+        // ran badly out of sync. Sample-count continuity already keeps duration correct.
+        Some(AudioFrame::new(output, timestamp))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct RequiredMicrophoneHealth {
+    source: microphone::RecordingSourceHealth,
+    scope: crate::output_pipeline::PipelineBuildScope,
+}
+
+#[cfg(target_os = "linux")]
+impl RequiredMicrophoneHealth {
+    fn check_terminal(&self) -> bool {
+        if let Some(error) = self.source.terminal_error() {
+            self.scope.fail_required(error);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn accepts_frame(&self, id: u32) -> bool {
+        let current = self.source.frame_is_current(id);
+        if !current {
+            self.check_terminal();
+        }
+        current
+    }
+
+    fn fail(&self, error: String) {
+        self.source.fail(error);
+        self.check_terminal();
+    }
+
+    fn stop(&self) {
+        if let Some(error) = self.source.stop_error() {
+            self.scope.fail_required(error);
+        }
+    }
+}
+
+impl Microphone {
+    pub(crate) fn setup_with_channels(
+        feed_lock: Arc<MicrophoneFeedLock>,
+        mut audio_tx: mpsc::Sender<AudioFrame>,
+        ctx: &mut crate::SetupCtx,
+        target_channels: usize,
+        switch_requests: Option<flume::Receiver<MicrophoneSwitchRequest>>,
+    ) -> impl Future<Output = anyhow::Result<Self>> + 'static {
+        let health_tx = ctx.health_tx().clone();
+        let digital_silence_ms = ctx.digital_silence_ms();
+        #[cfg(windows)]
+        let capture_scope = crate::output_pipeline::PipelineBuildScope::new();
+        #[cfg(windows)]
+        let source_cancel = ctx.stop_token().child_token();
+        #[cfg(windows)]
+        // Retiring a subscription cancels its token. Each one gets a child of the
+        // source's token so a microphone switch can retire the old subscription
+        // without stopping the source.
+        let subscription = feed_lock.recording_subscription(source_cancel.child_token());
+        let binding: SharedMicrophoneBinding = Arc::new(std::sync::Mutex::new(MicrophoneBinding {
+            lock: feed_lock.clone(),
+            #[cfg(windows)]
+            subscription: subscription.clone(),
+        }));
+        #[cfg(windows)]
+        {
+            capture_scope.register_token(source_cancel.clone());
+            let scope = capture_scope.clone();
+            let cancel = source_cancel.clone();
+            let binding = binding.clone();
+            ctx.tasks().spawn("microphone-owned-producers", async move {
+                cancel.cancelled().await;
+                let (feed, subscription) = {
+                    let binding = binding.lock().unwrap();
+                    (binding.lock.clone(), binding.subscription.clone())
+                };
+                finish_recording_subscription(&scope, &feed, subscription).await
+            });
+        }
+        #[cfg(target_os = "linux")]
+        let required_health = crate::output_pipeline::PipelineBuildScope::current()
+            .filter(crate::output_pipeline::PipelineBuildScope::requires_source_health)
+            .map(|scope| RequiredMicrophoneHealth {
+                source: feed_lock.source_health(),
+                scope,
+            });
+        #[cfg(windows)]
+        let setup_scope = capture_scope.clone();
+        #[cfg(windows)]
+        let setup_cancel = source_cancel.clone().drop_guard();
+        let setup = async move {
+            let source_info = feed_lock.audio_info();
+            let audio_info = source_info
+                .with_sample_rate(AudioMixer::INFO.sample_rate)
+                .with_sample_format(AudioMixer::INFO.sample_format)
+                .with_channels(target_channels);
+            let is_wireless = source_info.is_wireless_transport;
+            let device_name = feed_lock.device_name().to_string();
+            let reconnect_settings = microphone::MicrophoneDeviceSettings {
+                sample_rate: Some(source_info.sample_rate),
+                channels: u16::try_from(source_info.channels).ok(),
+            };
+            #[cfg(not(windows))]
+            let cancel = CancellationToken::new();
+            #[cfg(windows)]
+            let cancel = source_cancel;
+            let (tx, rx) = flume::bounded(128);
+
+            let send_timeout = if is_wireless {
+                Duration::from_millis(20)
+            } else {
+                Duration::from_millis(5)
+            };
+
+            #[cfg(windows)]
+            feed_lock
+                .attach_recording_subscription(
+                    subscription.clone(),
+                    tx,
+                    health_tx.clone(),
+                    "microphone-feed:recording".into(),
+                )
+                .await?;
+            #[cfg(not(windows))]
+            feed_lock
+                .ask(microphone::AddRecordingSender {
+                    sender: tx,
+                    health_tx: health_tx.clone(),
+                    label: "microphone-feed:recording".to_string(),
+                })
+                .await
+                .map_err(|err| match err {
+                    SendError::ActorNotRunning(_) => MicrophoneSourceError::ActorNotRunning,
+                    other => MicrophoneSourceError::AddSenderFailed(other.map_msg(|_| ())),
+                })?;
+
+            let mic_frame_counter = Arc::new(AtomicU64::new(0));
+            let mic_drop_counter = Arc::new(AtomicU64::new(0));
+            let mic_silence_counter = Arc::new(AtomicU64::new(0));
+
+            let silence_timeout = if is_wireless {
+                SILENCE_TIMEOUT_WIRELESS
+            } else {
+                SILENCE_TIMEOUT_WIRED
+            };
+
+            let silence_chunk_samples =
+                (audio_info.rate() as f64 * SILENCE_CHUNK_DURATION.as_secs_f64()).ceil() as usize;
+
+            info!(
+                device = %device_name,
+                source_rate = source_info.sample_rate,
+                source_channels = source_info.channels,
+                source_format = ?source_info.sample_format,
+                target_rate = audio_info.sample_rate,
+                target_channels = audio_info.channels,
+                target_format = ?audio_info.sample_format,
+                "Microphone source configured"
+            );
+
+            let recording_muted = feed_lock.recording_muted_handle();
+
+            crate::output_pipeline::spawn_capture_task({
+                let frame_counter = mic_frame_counter.clone();
+                let drop_counter = mic_drop_counter.clone();
+                let silence_counter = mic_silence_counter.clone();
+                let mut feed_lock = feed_lock.clone();
+                #[cfg(not(windows))]
+                let mut device_name = device_name.clone();
+                let health_tx = health_tx.clone();
+                let cancel = cancel.clone();
+                let recording_muted = recording_muted.clone();
+                let digital_silence_ms = digital_silence_ms.clone();
+                #[cfg(windows)]
+                let capture_scope = capture_scope.clone();
+                #[cfg(windows)]
+                let mut subscription = subscription.clone();
+                #[cfg(target_os = "linux")]
+                let required_health = required_health.clone();
+                let binding = binding.clone();
+                let mut switch_requests = switch_requests;
+                let mut rx = rx;
+                let mut reconnect_settings = reconnect_settings;
+                async move {
+                    let mut digital_silence = DigitalSilenceDetector::new(
+                        audio_info.sample_rate * audio_info.channels as u32,
+                    );
+                    let mut resampler: Option<MicResampler> = None;
+                    let mut silence_mode = false;
+                    let mut silence_start: Option<Instant> = None;
+                    let reconnect_in_flight = Arc::new(AtomicBool::new(false));
+                    let mut reconnect_attempts: u32 = 0;
+                    let mut next_reconnect_after = MIC_RECONNECT_AFTER;
+                    let mut last_timestamp: Option<cap_timestamp::Timestamp> = None;
+                    let mut last_frame_duration = SILENCE_CHUNK_DURATION;
+                    // Where the previous microphone's audio ended, until the
+                    // switched-to one delivers its first frame.
+                    let mut switched_from: Option<cap_timestamp::Timestamp> = None;
+                    let mut logged_current_source: Option<(u32, u16, SampleFormat)> = None;
+
+                    loop {
+                        #[cfg(windows)]
+                        if let Some(error) = subscription.error() {
+                            capture_scope.fail_required(error);
+                            break;
+                        }
+                        #[cfg(target_os = "linux")]
+                        if required_health
+                            .as_ref()
+                            .is_some_and(RequiredMicrophoneHealth::check_terminal)
+                        {
+                            break;
+                        }
+                        let recv_result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            request = next_switch_request(&mut switch_requests) => {
+                                let Some(MicrophoneSwitchRequest { lock: next, reply }) = request else {
+                                    continue;
+                                };
+                                let (next_tx, next_rx) = flume::bounded(128);
+                                #[cfg(target_os = "linux")]
+                                if required_health.is_some() {
+                                    let _ = reply.send(Err(anyhow::anyhow!(
+                                        "This recording's microphone cannot be switched"
+                                    )));
+                                    continue;
+                                }
+                                #[cfg(windows)]
+                                let next_subscription = next.recording_subscription(cancel.child_token());
+                                #[cfg(windows)]
+                                let attached = next
+                                    .attach_recording_subscription(
+                                        next_subscription.clone(),
+                                        next_tx,
+                                        health_tx.clone(),
+                                        "microphone-feed:recording".into(),
+                                    )
+                                    .await;
+                                #[cfg(not(windows))]
+                                let attached = next
+                                    .ask(microphone::AddRecordingSender {
+                                        sender: next_tx,
+                                        health_tx: health_tx.clone(),
+                                        label: "microphone-feed:recording".to_string(),
+                                    })
+                                    .await
+                                    .map_err(|error| anyhow::anyhow!("{error}"));
+                                if let Err(error) = attached {
+                                    warn!(%error, "Microphone switch could not attach to the new feed");
+                                    let _ = reply.send(Err(error));
+                                    continue;
+                                }
+                                let previous = std::mem::replace(
+                                    &mut *binding.lock().unwrap(),
+                                    MicrophoneBinding {
+                                        lock: next.clone(),
+                                        #[cfg(windows)]
+                                        subscription: next_subscription.clone(),
+                                    },
+                                );
+                                let previous_name = previous.lock.device_name().to_string();
+                                #[cfg(windows)]
+                                {
+                                    let MicrophoneBinding {
+                                        lock: previous_lock,
+                                        subscription: previous_subscription,
+                                    } = previous;
+                                    let _ = previous_subscription.retire();
+                                    if let Err(error) = previous_lock
+                                        .detach_recording_subscription(previous_subscription)
+                                        .await
+                                    {
+                                        warn!(%error, "Detaching the previous microphone after a switch");
+                                    }
+                                    subscription = next_subscription;
+                                }
+                                #[cfg(not(windows))]
+                                drop(previous);
+                                rx = next_rx;
+                                feed_lock = next;
+                                let next_info = feed_lock.audio_info();
+                                reconnect_settings = microphone::MicrophoneDeviceSettings {
+                                    sample_rate: Some(next_info.sample_rate),
+                                    channels: u16::try_from(next_info.channels).ok(),
+                                };
+                                #[cfg(not(windows))]
+                                {
+                                    device_name = feed_lock.device_name().to_string();
+                                }
+                                reconnect_attempts = 0;
+                                next_reconnect_after = MIC_RECONNECT_AFTER;
+                                if silence_mode {
+                                    silence_start = Some(Instant::now());
+                                }
+                                switched_from = last_timestamp.map(|ts| ts + last_frame_duration);
+                                info!(
+                                    from = %previous_name,
+                                    to = %feed_lock.device_name(),
+                                    source_rate = next_info.sample_rate,
+                                    source_channels = next_info.channels,
+                                    "Microphone source switched"
+                                );
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            r = tokio::time::timeout(silence_timeout, rx.recv_async()) => r,
+                        };
+                        match recv_result {
+                            Ok(Ok(frame)) => {
+                                #[cfg(windows)]
+                                if !subscription.accepts_frame(frame.stream_id) {
+                                    continue;
+                                }
+                                #[cfg(target_os = "linux")]
+                                if required_health
+                                    .as_ref()
+                                    .is_some_and(|health| !health.accepts_frame(frame.stream_id))
+                                {
+                                    continue;
+                                }
+                                if silence_mode {
+                                    let stall_ms =
+                                        silence_start.map(|s| s.elapsed().as_millis()).unwrap_or(0);
+                                    info!(
+                                        stall_ms,
+                                        reconnect_attempts, "Microphone data resumed after silence"
+                                    );
+                                    silence_mode = false;
+                                    silence_start = None;
+                                    reset_reconnect_after_frame(
+                                        &reconnect_in_flight,
+                                        &mut reconnect_attempts,
+                                        &mut next_reconnect_after,
+                                    );
+                                    emit_health(&health_tx, PipelineHealthEvent::SourceRestarted);
+                                }
+
+                                let target_matches_source = frame.sample_rate
+                                    == audio_info.sample_rate
+                                    && frame.channels as usize == audio_info.channels
+                                    && ffmpeg_sample_format_for(frame.format)
+                                        == Some(audio_info.sample_format);
+
+                                let resampler_matches = resampler.as_ref().is_some_and(|r| {
+                                    r.matches(frame.sample_rate, frame.channels, frame.format)
+                                });
+
+                                if !target_matches_source && !resampler_matches {
+                                    let previous_source = logged_current_source;
+                                    let new_source =
+                                        (frame.sample_rate, frame.channels, frame.format);
+                                    if previous_source.is_none() {
+                                        info!(
+                                            source_rate = new_source.0,
+                                            source_channels = new_source.1,
+                                            source_format = ?new_source.2,
+                                            target_rate = audio_info.sample_rate,
+                                            target_channels = audio_info.channels,
+                                            target_format = ?audio_info.sample_format,
+                                            "Microphone: creating resampler for source→target"
+                                        );
+                                    } else {
+                                        info!(
+                                            old = ?previous_source,
+                                            new = ?new_source,
+                                            "Microphone format changed mid-stream, rebuilding resampler"
+                                        );
+                                    }
+                                    resampler = MicResampler::create(
+                                        frame.sample_rate,
+                                        frame.channels,
+                                        frame.format,
+                                        &audio_info,
+                                    );
+                                    logged_current_source = Some(new_source);
+                                } else if target_matches_source && resampler.is_some() {
+                                    info!(
+                                        "Microphone source now matches target, dropping resampler"
+                                    );
+                                    resampler = None;
+                                    logged_current_source =
+                                        Some((frame.sample_rate, frame.channels, frame.format));
+                                }
+
+                                // The muxer lays audio out by sample count and only fills
+                                // gaps longer than its threshold, so the hand-over between
+                                // two microphones (frames still queued for the old one,
+                                // the new one's first buffer) would otherwise pull every
+                                // later sample earlier. Fill it exactly.
+                                if let Some(from) = switched_from.take() {
+                                    let reference = cap_timestamp::Timestamps::now();
+                                    let gap_secs =
+                                        frame.timestamp.signed_duration_since_secs(reference)
+                                            - from.signed_duration_since_secs(reference);
+                                    if let Some(samples) =
+                                        switch_gap_samples(gap_secs, audio_info.rate())
+                                    {
+                                        info!(
+                                            gap_ms = gap_secs * 1000.0,
+                                            "Filling the microphone switch hand-over with silence"
+                                        );
+                                        let silence = AudioFrame::new(
+                                            create_silence_frame(&audio_info, samples),
+                                            from,
+                                        );
+                                        if let Ok(Ok(())) = tokio::time::timeout(
+                                            send_timeout,
+                                            audio_tx.send(silence),
+                                        )
+                                        .await
+                                        {
+                                            silence_counter.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+
+                                let audio_frame = if let Some(ref mut ctx) = resampler {
+                                    ctx.resample(
+                                        &frame.data,
+                                        frame.sample_rate,
+                                        frame.channels,
+                                        frame.format,
+                                        frame.timestamp,
+                                    )
+                                } else {
+                                    Some(AudioFrame::new(
+                                        audio_info.wrap_frame(&frame.data),
+                                        frame.timestamp,
+                                    ))
+                                };
+
+                                let Some(mut audio_frame) = audio_frame else {
+                                    drop_counter.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                };
+
+                                // Mute by zeroing the payload, never by withholding the
+                                // frame: cadence, sample counts, and timestamps must stay
+                                // identical to the unmuted stream so the muxer timeline
+                                // and the stall/keepalive machinery see no difference.
+                                let muted = recording_muted.load(Ordering::Relaxed);
+                                if muted {
+                                    silence_frame_payload(&mut audio_frame.inner);
+                                }
+
+                                let silence_update = if muted {
+                                    digital_silence.reset()
+                                } else {
+                                    count_nonzero_samples(&audio_frame.inner)
+                                        .map(|(total, nonzero)| {
+                                            digital_silence.observe(total, nonzero)
+                                        })
+                                        .unwrap_or(DigitalSilenceUpdate::Unchanged)
+                                };
+                                match silence_update {
+                                    DigitalSilenceUpdate::RunStarted => {
+                                        warn!(
+                                            run_ms = digital_silence.run_ms(),
+                                            "Microphone is delivering exact digital silence while unmuted; another app may be holding the input"
+                                        );
+                                        digital_silence_ms
+                                            .store(digital_silence.flagged_ms(), Ordering::Relaxed);
+                                        emit_health(
+                                            &health_tx,
+                                            PipelineHealthEvent::MicrophoneDigitalSilence,
+                                        );
+                                    }
+                                    DigitalSilenceUpdate::RunExtended => {
+                                        digital_silence_ms
+                                            .store(digital_silence.flagged_ms(), Ordering::Relaxed);
+                                    }
+                                    DigitalSilenceUpdate::RunEnded => {
+                                        info!(
+                                            total_digital_silence_ms = digital_silence.flagged_ms(),
+                                            muted, "Microphone digital silence ended"
+                                        );
+                                        if !muted {
+                                            emit_health(
+                                                &health_tx,
+                                                PipelineHealthEvent::SourceRestarted,
+                                            );
+                                        }
+                                    }
+                                    DigitalSilenceUpdate::Unchanged => {}
+                                }
+
+                                let sample_count = audio_frame.samples();
+                                last_frame_duration = Duration::from_secs_f64(
+                                    sample_count as f64 / audio_info.rate() as f64,
+                                );
+                                last_timestamp = Some(frame.timestamp);
+
+                                match tokio::time::timeout(send_timeout, audio_tx.send(audio_frame))
+                                    .await
+                                {
+                                    Ok(Ok(())) => {
+                                        #[cfg(target_os = "linux")]
+                                        if sample_count > 0
+                                            && let Some(health) = &required_health
+                                        {
+                                            health.source.accepted_frame(frame.stream_id);
+                                        }
+                                        frame_counter.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    _ => {
+                                        drop_counter.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            Ok(Err(_)) => {
+                                debug!("Microphone feed channel closed");
+                                #[cfg(windows)]
+                                if !cancel.is_cancelled() {
+                                    capture_scope.fail_required(
+                                        "Requested microphone feed closed before Stop".into(),
+                                    );
+                                }
+                                #[cfg(target_os = "linux")]
+                                if !cancel.is_cancelled()
+                                    && let Some(health) = &required_health
+                                {
+                                    health.fail("Requested audio feed closed before Stop".into());
+                                }
+                                break;
+                            }
+                            Err(_) => {
+                                let stall_started = *silence_start.get_or_insert_with(Instant::now);
+                                let stall_duration = stall_started.elapsed();
+
+                                if !silence_mode {
+                                    warn!(
+                                        is_wireless,
+                                        timeout_ms = silence_timeout.as_millis(),
+                                        keepalive_after_ms =
+                                            STALL_SILENCE_KEEPALIVE_AFTER.as_millis(),
+                                        "Microphone data timeout, awaiting delivery before keepalive silence"
+                                    );
+                                    silence_mode = true;
+                                }
+
+                                if reconnect_is_due(
+                                    stall_duration,
+                                    next_reconnect_after,
+                                    reconnect_in_flight.load(Ordering::Relaxed),
+                                ) {
+                                    reconnect_attempts += 1;
+                                    warn!(
+                                        attempt = reconnect_attempts,
+                                        backoff_secs = next_reconnect_after.as_secs(),
+                                        stall_secs = stall_duration.as_secs(),
+                                        "Microphone stalled, attempting reconnect"
+                                    );
+                                    emit_health(&health_tx, PipelineHealthEvent::SourceRestarting);
+                                    reconnect_in_flight.store(true, Ordering::Relaxed);
+
+                                    let feed = feed_lock.clone();
+                                    #[cfg(not(windows))]
+                                    let name = device_name.clone();
+                                    let in_flight = reconnect_in_flight.clone();
+                                    let attempt_cancel = cancel.clone();
+                                    #[cfg(windows)]
+                                    let capture_scope = capture_scope.clone();
+                                    #[cfg(windows)]
+                                    let subscription = subscription.clone();
+                                    #[cfg(target_os = "linux")]
+                                    let required_health = required_health.clone();
+                                    crate::output_pipeline::spawn_capture_task(async move {
+                                        let _ = complete_reconnect_attempt(
+                                            in_flight,
+                                            attempt_cancel,
+                                            async move {
+                                                #[cfg(windows)]
+                                                let reconnect = feed.reconnect_recording_subscription(subscription.clone(), reconnect_settings).await;
+                                                #[cfg(not(windows))]
+                                                let reconnect = feed.ask(microphone::SetInput {
+                                                    label: name, settings: Some(reconnect_settings),
+                                                }).await;
+                                                let ready = match reconnect {
+                                                    Ok(r) => r,
+                                                    Err(e) => {
+                                                        warn!("Microphone reconnect failed: {e}");
+                                                        #[cfg(windows)]
+                                                        if !subscription.device_lost() {
+                                                            capture_scope.fail_required(format!(
+                                                                "Requested microphone reconnect failed: {e}"
+                                                            ));
+                                                        }
+                                                        #[cfg(target_os = "linux")]
+                                                        if let Some(health) = &required_health {
+                                                            health.fail(format!("Requested audio reconnect failed: {e}"));
+                                                        }
+                                                        return;
+                                                    }
+                                                };
+                                                match ready.await {
+                                                    Ok(_) => {
+                                                        info!("Microphone reconnect stream ready")
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Microphone reconnect stream failed: {e}");
+                                                        #[cfg(windows)]
+                                                        if !subscription.device_lost() {
+                                                            capture_scope.fail_required(format!(
+                                                                "Requested microphone reconnect stream failed: {e}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        .await;
+                                    });
+
+                                    next_reconnect_after =
+                                        (next_reconnect_after * 2).min(MIC_RECONNECT_BACKOFF_MAX);
+                                    silence_start = Some(Instant::now());
+                                }
+
+                                if !should_fabricate_stall_silence(
+                                    stall_duration,
+                                    STALL_SILENCE_KEEPALIVE_AFTER,
+                                ) {
+                                    continue;
+                                }
+
+                                let timestamp = match last_timestamp {
+                                    Some(ts) => {
+                                        let next = ts + last_frame_duration;
+                                        last_timestamp = Some(next);
+                                        last_frame_duration = Duration::from_secs_f64(
+                                            silence_chunk_samples as f64 / audio_info.rate() as f64,
+                                        );
+                                        next
+                                    }
+                                    None => {
+                                        continue;
+                                    }
+                                };
+
+                                let silence_frame =
+                                    create_silence_frame(&audio_info, silence_chunk_samples);
+                                let audio_frame = AudioFrame::new(silence_frame, timestamp);
+
+                                silence_counter.fetch_add(1, Ordering::Relaxed);
+
+                                if let Ok(Ok(())) =
+                                    tokio::time::timeout(send_timeout, audio_tx.send(audio_frame))
+                                        .await
+                                {}
+                            }
+                        }
+                    }
+                }
+            });
+
+            crate::output_pipeline::spawn_capture_task({
+                let cancel = cancel.clone();
+                let health_tx = health_tx.clone();
+                async move {
+                    let frame_counter = mic_frame_counter;
+                    let drop_counter = mic_drop_counter;
+                    let silence_counter = mic_silence_counter;
+                    let mut last_log = Instant::now();
+                    let mut prev_captured: u64 = 0;
+                    let mut prev_dropped: u64 = 0;
+                    let mut stale_count: u32 = 0;
+                    let mut high_drop_intervals: u32 = 0;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                        }
+                        let captured = frame_counter.load(Ordering::Relaxed);
+                        let dropped = drop_counter.load(Ordering::Relaxed);
+                        let silence = silence_counter.load(Ordering::Relaxed);
+
+                        if (dropped > 0 || silence > 0)
+                            && last_log.elapsed() >= Duration::from_secs(5)
+                        {
+                            let total = captured + dropped;
+                            let drop_pct = if total > 0 {
+                                100.0 * dropped as f64 / total as f64
+                            } else {
+                                0.0
+                            };
+
+                            let captured_delta = captured.saturating_sub(prev_captured);
+                            let dropped_delta = dropped.saturating_sub(prev_dropped);
+                            let data_changed = captured != prev_captured || dropped != prev_dropped;
+                            prev_captured = captured;
+                            prev_dropped = dropped;
+
+                            // Surface a *sustained* high drop rate as a health event, like
+                            // every other source/muxer. The case that matters most is a
+                            // resampler that rejects every frame → 100% drops → silent
+                            // track, which otherwise only appears in this log line.
+                            // Require two consecutive bad intervals so a single
+                            // stall→resume boundary (few captures vs accumulated
+                            // keepalive drops) doesn't trip a false alarm.
+                            let interval_total = captured_delta + dropped_delta;
+                            let interval_drop_pct = if interval_total > 0 {
+                                100.0 * dropped_delta as f64 / interval_total as f64
+                            } else {
+                                0.0
+                            };
+                            if interval_total > 0 && interval_drop_pct >= 50.0 {
+                                high_drop_intervals = high_drop_intervals.saturating_add(1);
+                            } else {
+                                high_drop_intervals = 0;
+                            }
+                            if high_drop_intervals >= 2 {
+                                emit_health(
+                                    &health_tx,
+                                    PipelineHealthEvent::FrameDropRateHigh {
+                                        source: "microphone".to_string(),
+                                        rate_pct: interval_drop_pct,
+                                    },
+                                );
+                            }
+
+                            if !data_changed {
+                                stale_count = stale_count.saturating_add(1);
+                            } else {
+                                stale_count = 0;
+                            }
+
+                            if stale_count <= 2 {
+                                warn!(
+                                    captured,
+                                    dropped,
+                                    silence_frames = silence,
+                                    drop_pct = format!("{:.1}%", drop_pct),
+                                    is_wireless,
+                                    "Microphone audio stats"
+                                );
+                            } else if stale_count.is_multiple_of(12) {
+                                warn!(
+                                    captured,
+                                    dropped,
+                                    silence_frames = silence,
+                                    drop_pct = format!("{:.1}%", drop_pct),
+                                    is_wireless,
+                                    stale_intervals = stale_count,
+                                    "Microphone audio stats (stalled)"
+                                );
+                            }
+                            last_log = Instant::now();
+                        } else if captured > 0 {
+                            debug!(captured, "Microphone audio frames forwarded");
+                        }
+                    }
+                }
+            });
+
+            #[cfg(windows)]
+            drop(setup_cancel.disarm());
+            Ok(Self {
+                #[cfg(windows)]
+                capture_scope,
+                info: audio_info,
+                _binding: binding,
+                #[cfg(target_os = "linux")]
+                required_health,
+                cancel,
+            })
+        };
+        #[cfg(windows)]
+        {
+            async move { setup_scope.run(setup).await }
+        }
+        #[cfg(not(windows))]
+        {
+            setup
+        }
+    }
+}
+
+impl AudioSource for Microphone {
+    type Config = Arc<MicrophoneFeedLock>;
+
+    fn setup(
+        feed_lock: Self::Config,
+        audio_tx: mpsc::Sender<AudioFrame>,
+        ctx: &mut crate::SetupCtx,
+    ) -> impl Future<Output = anyhow::Result<Self>> + 'static {
+        Self::setup_with_channels(
+            feed_lock,
+            audio_tx,
+            ctx,
+            usize::from(MICROPHONE_TARGET_CHANNELS),
+            None,
+        )
+    }
+
+    fn audio_info(&self) -> AudioInfo {
+        self.info
+    }
+
+    fn stop(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        #[cfg(target_os = "linux")]
+        if let Some(health) = &self.required_health {
+            health.stop();
+        }
+        #[cfg(windows)]
+        let (feed, subscription) = self.current_subscription();
+        #[cfg(windows)]
+        if let Some(error) = subscription.retire() {
+            self.capture_scope.fail_required(error);
+        }
+        self.cancel.cancel();
+        #[cfg(windows)]
+        let scope = self.capture_scope.clone();
+        async move {
+            #[cfg(windows)]
+            {
+                finish_recording_subscription(&scope, &feed, subscription).await
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A [`Microphone`] that a [`MicrophoneSwitch`] can move onto another feed
+/// while it records.
+pub struct SwitchableMicrophone(Microphone);
+
+pub struct SwitchableMicrophoneConfig {
+    pub lock: Arc<MicrophoneFeedLock>,
+    pub switch_requests: flume::Receiver<MicrophoneSwitchRequest>,
+}
+
+impl AudioSource for SwitchableMicrophone {
+    type Config = SwitchableMicrophoneConfig;
+
+    fn setup(
+        config: Self::Config,
+        audio_tx: mpsc::Sender<AudioFrame>,
+        ctx: &mut crate::SetupCtx,
+    ) -> impl Future<Output = anyhow::Result<Self>> + 'static {
+        let setup = Microphone::setup_with_channels(
+            config.lock,
+            audio_tx,
+            ctx,
+            usize::from(MICROPHONE_TARGET_CHANNELS),
+            Some(config.switch_requests),
+        );
+        async move { setup.await.map(Self) }
+    }
+
+    fn audio_info(&self) -> AudioInfo {
+        self.0.audio_info()
+    }
+
+    fn stop(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        self.0.stop()
+    }
+}
+
+#[cfg(windows)]
+async fn finish_recording_subscription(
+    scope: &crate::output_pipeline::PipelineBuildScope,
+    feed: &microphone::MicrophoneFeedLock,
+    subscription: Arc<microphone::RecordingSubscription>,
+) -> anyhow::Result<()> {
+    if let Some(error) = subscription.retire() {
+        scope.fail_required(error);
+    }
+    let detached = feed.detach_recording_subscription(subscription).await;
+    let joined = microphone_producers_join(scope).await;
+    detached?;
+    joined
+}
+
+#[cfg(any(windows, test))]
+async fn microphone_producers_join(
+    scope: &crate::output_pipeline::PipelineBuildScope,
+) -> anyhow::Result<()> {
+    let report = scope.cancel_and_join_report().await;
+    if let Some(error) = report.error {
+        anyhow::bail!(error);
+    }
+    anyhow::ensure!(
+        report.quiescent,
+        "Microphone producers did not confirm quiescence"
+    );
+    Ok(())
+}
+
+/// Silence that bridges a microphone switch: the time between the end of the
+/// previous microphone's audio and the new one's first frame. An overlap or a
+/// timestamp far off (a clock the two devices do not share) adds nothing.
+fn switch_gap_samples(gap_secs: f64, rate: i32) -> Option<usize> {
+    const MAX_SWITCH_GAP_SECS: f64 = 2.0;
+    if !gap_secs.is_finite() || gap_secs <= 0.0 || gap_secs > MAX_SWITCH_GAP_SECS {
+        return None;
+    }
+    let samples = (gap_secs * f64::from(rate)).round() as usize;
+    (samples > 0).then_some(samples)
+}
+
+fn create_silence_frame(info: &AudioInfo, sample_count: usize) -> ffmpeg::frame::Audio {
+    let mut frame =
+        ffmpeg::frame::Audio::new(info.sample_format, sample_count, info.channel_layout());
+
+    for i in 0..frame.planes() {
+        frame.data_mut(i).fill(0);
+    }
+
+    frame.set_rate(info.rate() as u32);
+    frame
+}
+
+/// Zero a frame's sample data in place, leaving format, sample count, rate,
+/// layout, and timestamp untouched. All-zero bytes are exact silence for every
+/// sample format cpal/ffmpeg feed through here except U8 — and U8 device input
+/// is resampled to the F32 mixer format before reaching this point, so zeroed
+/// bytes are always true silence for the frames we emit.
+fn silence_frame_payload(frame: &mut ffmpeg::frame::Audio) {
+    for i in 0..frame.planes() {
+        frame.data_mut(i).fill(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cap_media_info::{Sample, Type};
+
+    #[tokio::test]
+    async fn ready_success_without_frames_retries_only_after_existing_backoff() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let result =
+            complete_reconnect_attempt(in_flight.clone(), CancellationToken::new(), async {
+                Ok::<_, ()>(())
+            })
+            .await;
+        assert_eq!(result, Some(Ok(())));
+        assert!(!in_flight.load(Ordering::Relaxed));
+        let next_backoff = MIC_RECONNECT_AFTER * 2;
+        assert!(!reconnect_is_due(
+            Duration::from_millis(3999),
+            next_backoff,
+            in_flight.load(Ordering::Relaxed)
+        ));
+        assert!(reconnect_is_due(
+            Duration::from_secs(4),
+            next_backoff,
+            in_flight.load(Ordering::Relaxed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ready_failure_releases_in_flight_without_skipping_backoff() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let result =
+            complete_reconnect_attempt(in_flight.clone(), CancellationToken::new(), async {
+                Err::<(), _>("failed")
+            })
+            .await;
+        assert_eq!(result, Some(Err("failed")));
+        assert!(!in_flight.load(Ordering::Relaxed));
+        assert!(!reconnect_is_due(
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            false
+        ));
+    }
+
+    #[test]
+    fn real_frame_resets_reconnect_attempts_and_original_delay() {
+        let in_flight = AtomicBool::new(true);
+        let mut attempts = 3;
+        let mut delay = Duration::from_secs(16);
+        reset_reconnect_after_frame(&in_flight, &mut attempts, &mut delay);
+        assert!(!in_flight.load(Ordering::Relaxed));
+        assert_eq!(attempts, 0);
+        assert_eq!(delay, MIC_RECONNECT_AFTER);
+        assert!(!reconnect_is_due(Duration::from_millis(1999), delay, false));
+        assert!(reconnect_is_due(Duration::from_secs(2), delay, false));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_pending_reconnect_and_releases_in_flight() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let cancel = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let attempt = tokio::spawn(complete_reconnect_attempt(
+            in_flight.clone(),
+            cancel.clone(),
+            async {
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        started_rx.await.unwrap();
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempt)
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        assert!(!in_flight.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn already_stopped_source_does_not_dispatch_reconnect() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result: Option<()> = complete_reconnect_attempt(in_flight.clone(), cancel, async {
+            panic!("stopped source dispatched a reconnect")
+        })
+        .await;
+        assert_eq!(result, None);
+        assert!(!in_flight.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn dropped_reconnect_future_releases_in_flight() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let mut attempt = Box::pin(complete_reconnect_attempt(
+            in_flight.clone(),
+            CancellationToken::new(),
+            std::future::pending::<()>(),
+        ));
+        assert!(futures::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert!(!in_flight.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn transient_stall_does_not_fabricate_silence() {
+        // The repro's worst mic stall was 293ms; none of its sub-second late-delivery
+        // stalls should produce synthetic silence (the muxer reconciles them instead).
+        for stall_ms in [0, 5, 54, 86, 100, 114, 200, 293, 500, 999] {
+            assert!(
+                !should_fabricate_stall_silence(
+                    Duration::from_millis(stall_ms),
+                    STALL_SILENCE_KEEPALIVE_AFTER,
+                ),
+                "{stall_ms}ms transient stall must not fabricate silence"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_stall_fabricates_keepalive_silence() {
+        for stall_ms in [1000, 1500, 2000, 5000] {
+            assert!(
+                should_fabricate_stall_silence(
+                    Duration::from_millis(stall_ms),
+                    STALL_SILENCE_KEEPALIVE_AFTER,
+                ),
+                "{stall_ms}ms sustained outage must emit keepalive silence"
+            );
+        }
+    }
+
+    #[test]
+    fn keepalive_threshold_exceeds_reconnect_free_window() {
+        // Keepalive must engage before the first reconnect attempt so a frozen device
+        // never leaves the audio track without forward progress.
+        assert!(STALL_SILENCE_KEEPALIVE_AFTER < MIC_RECONNECT_AFTER);
+    }
+
+    #[test]
+    fn target_info_uses_output_rate_and_mono() {
+        let device_info = AudioInfo {
+            sample_format: Sample::F32(Type::Packed),
+            sample_rate: 32000,
+            channels: 2,
+            time_base: cap_media_info::FFRational(1, 1_000_000),
+            buffer_size: 1024,
+            is_wireless_transport: false,
+        };
+
+        let target = device_info
+            .with_max_channels(MICROPHONE_TARGET_CHANNELS)
+            .with_sample_rate(AudioMixer::INFO.sample_rate)
+            .with_sample_format(AudioMixer::INFO.sample_format)
+            .with_channels(MICROPHONE_TARGET_CHANNELS as usize);
+
+        assert_eq!(target.sample_rate, 48000);
+        assert_eq!(target.channels, 1);
+        assert_eq!(target.sample_format, AudioMixer::INFO.sample_format);
+    }
+
+    #[test]
+    fn resampler_detects_mismatch_between_source_and_target() {
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+
+        assert!(MicResampler::create(32000, 1, SampleFormat::F32, &target).is_some());
+        assert!(MicResampler::create(44100, 2, SampleFormat::I16, &target).is_some());
+        assert!(MicResampler::create(96000, 2, SampleFormat::F32, &target).is_some());
+        assert!(MicResampler::create(48000, 16, SampleFormat::F32, &target).is_some());
+    }
+
+    #[test]
+    fn resampler_matches_detects_same_source() {
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        let resampler =
+            MicResampler::create(32000, 1, SampleFormat::F32, &target).expect("resampler");
+        assert!(resampler.matches(32000, 1, SampleFormat::F32));
+        assert!(!resampler.matches(48000, 1, SampleFormat::F32));
+        assert!(!resampler.matches(32000, 2, SampleFormat::F32));
+        assert!(!resampler.matches(32000, 1, SampleFormat::I16));
+    }
+
+    #[test]
+    fn upsampling_preserves_total_duration() {
+        use cap_timestamp::Timestamp;
+        use std::time::Instant;
+
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        let mut resampler =
+            MicResampler::create(32000, 2, SampleFormat::F32, &target).expect("resampler");
+
+        const FRAME_SAMPLES: usize = 1024;
+        const FRAME_COUNT: usize = 64;
+        const CHANNELS: usize = 2;
+
+        let ts = Timestamp::Instant(Instant::now());
+
+        let payload_len_bytes = FRAME_SAMPLES * CHANNELS * std::mem::size_of::<f32>();
+        let payload = vec![0u8; payload_len_bytes];
+
+        let mut produced: u64 = 0;
+        for _ in 0..FRAME_COUNT {
+            if let Some(frame) = resampler.resample(&payload, 32000, 2, SampleFormat::F32, ts) {
+                produced += frame.samples() as u64;
+            }
+        }
+
+        let consumed_input_samples = (FRAME_SAMPLES * FRAME_COUNT) as u64;
+        let expected_output_samples = consumed_input_samples * 48_000 / 32_000;
+
+        let lower_bound = expected_output_samples * 99 / 100;
+        assert!(
+            produced >= lower_bound,
+            "upsampling lost samples: produced={produced}, expected≈{expected_output_samples}, \
+             lower_bound={lower_bound}"
+        );
+    }
+
+    #[test]
+    fn downsampling_preserves_total_duration() {
+        use cap_timestamp::Timestamp;
+        use std::time::Instant;
+
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        let mut resampler =
+            MicResampler::create(96000, 2, SampleFormat::F32, &target).expect("resampler");
+
+        const FRAME_SAMPLES: usize = 1024;
+        const FRAME_COUNT: usize = 64;
+        const CHANNELS: usize = 2;
+
+        let ts = Timestamp::Instant(Instant::now());
+        let payload_len_bytes = FRAME_SAMPLES * CHANNELS * std::mem::size_of::<f32>();
+        let payload = vec![0u8; payload_len_bytes];
+
+        let mut produced: u64 = 0;
+        for _ in 0..FRAME_COUNT {
+            if let Some(frame) = resampler.resample(&payload, 96000, 2, SampleFormat::F32, ts) {
+                produced += frame.samples() as u64;
+            }
+        }
+
+        let consumed_input_samples = (FRAME_SAMPLES * FRAME_COUNT) as u64;
+        let expected_output_samples = consumed_input_samples * 48_000 / 96_000;
+
+        let lower_bound = expected_output_samples * 99 / 100;
+        assert!(
+            produced >= lower_bound,
+            "downsampling lost samples: produced={produced}, expected≈{expected_output_samples}, \
+             lower_bound={lower_bound}"
+        );
+    }
+
+    #[test]
+    fn resampler_accepts_more_than_eight_input_channels() {
+        use cap_timestamp::Timestamp;
+        use std::time::Instant;
+
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        let mut resampler =
+            MicResampler::create(48000, 16, SampleFormat::F32, &target).expect("resampler");
+
+        const FRAME_SAMPLES: usize = 960;
+        const CHANNELS: usize = 16;
+
+        let payload_len_bytes = FRAME_SAMPLES * CHANNELS * std::mem::size_of::<f32>();
+        let payload = vec![0u8; payload_len_bytes];
+        let frame = resampler
+            .resample(
+                &payload,
+                48000,
+                CHANNELS as u16,
+                SampleFormat::F32,
+                Timestamp::Instant(Instant::now()),
+            )
+            .expect("frame");
+
+        assert_eq!(frame.rate(), 48000);
+        assert_eq!(frame.channels(), 1);
+        assert_eq!(frame.samples(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn resampler_downmixes_surround_channel_counts_without_dropping() {
+        use cap_timestamp::Timestamp;
+        use std::time::Instant;
+
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        const FRAME_SAMPLES: usize = 480;
+
+        // 3/4/5/6 are exactly the channel counts where `ChannelLayout::default` and the
+        // named `channel_layout()` masks diverge. Before the layout fix, swr rejected
+        // every frame for these counts and the mic track was silent.
+        for channels in [3u16, 4, 5, 6] {
+            let mut resampler = MicResampler::create(48000, channels, SampleFormat::F32, &target)
+                .unwrap_or_else(|| panic!("resampler for {channels}ch"));
+
+            // Distinct non-zero signal per channel so a correct downmix carries energy
+            // (a silent/dropped result is distinguishable from a real mixdown).
+            let mut payload = Vec::with_capacity(FRAME_SAMPLES * channels as usize * 4);
+            for _ in 0..FRAME_SAMPLES {
+                for ch in 0..channels {
+                    let value = 0.25f32 + 0.05 * ch as f32;
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+
+            let frame = resampler
+                .resample(
+                    &payload,
+                    48000,
+                    channels,
+                    SampleFormat::F32,
+                    Timestamp::Instant(Instant::now()),
+                )
+                .unwrap_or_else(|| panic!("{channels}ch frame must not be dropped"));
+
+            assert_eq!(frame.channels(), 1, "{channels}ch downmix should be mono");
+            assert_eq!(frame.samples(), FRAME_SAMPLES, "{channels}ch sample count");
+
+            let any_energy = frame
+                .data(0)
+                .chunks_exact(4)
+                .take(frame.samples())
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .any(|s| s.abs() > 0.01);
+            assert!(any_energy, "{channels}ch downmix produced silence");
+        }
+    }
+
+    #[test]
+    fn muted_frames_keep_geometry_but_zero_payload() {
+        use cap_timestamp::Timestamp;
+        use std::time::Instant;
+
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        let mut resampler =
+            MicResampler::create(44100, 2, SampleFormat::F32, &target).expect("resampler");
+
+        const FRAME_SAMPLES: usize = 1024;
+        const CHANNELS: usize = 2;
+        let mut payload = Vec::with_capacity(FRAME_SAMPLES * CHANNELS * 4);
+        for i in 0..(FRAME_SAMPLES * CHANNELS) {
+            let value = 0.5f32 * ((i % 7) as f32 - 3.0);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let ts_instant = Instant::now();
+        let ts = Timestamp::Instant(ts_instant);
+        let mut frame = None;
+        for _ in 0..4 {
+            if let Some(f) = resampler.resample(&payload, 44100, 2, SampleFormat::F32, ts) {
+                frame = Some(f);
+            }
+        }
+        let mut frame = frame.expect("resampler produced a frame");
+
+        let samples_before = frame.samples();
+        let rate_before = frame.rate();
+        assert!(samples_before > 0);
+
+        let had_energy = frame
+            .inner
+            .data(0)
+            .chunks_exact(4)
+            .take(samples_before)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .any(|s| s.abs() > 0.001);
+        assert!(had_energy, "test signal should be non-silent before muting");
+
+        silence_frame_payload(&mut frame.inner);
+
+        // Muting must be a pure payload transformation: geometry, rate, and
+        // timestamp identical, every sample exactly zero.
+        assert_eq!(frame.samples(), samples_before);
+        assert_eq!(frame.rate(), rate_before);
+        match frame.timestamp {
+            Timestamp::Instant(i) => assert_eq!(i, ts_instant),
+            other => panic!("unexpected timestamp variant {other:?}"),
+        }
+        let all_zero = frame
+            .inner
+            .data(0)
+            .chunks_exact(4)
+            .take(frame.samples())
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .all(|s| s == 0.0);
+        assert!(all_zero, "muted frame must be exact digital silence");
+    }
+
+    #[test]
+    fn resampled_frame_timestamps_are_monotonic_and_unshifted() {
+        // Regression: timestamping resampled frames with `capture − swr_delay` pulled
+        // them backward, so consecutive frames overlapped and the muxer dropped ~0.8s of
+        // a 32k→48k mic up front → badly out of sync. Output frames must carry the input
+        // capture timestamp unchanged so the muxer timeline stays monotonic.
+        use cap_timestamp::Timestamp;
+        use std::time::{Duration, Instant};
+
+        let target = AudioInfo::new_raw(Sample::F32(Type::Packed), 48000, 1);
+        let mut resampler =
+            MicResampler::create(32000, 2, SampleFormat::F32, &target).expect("resampler");
+
+        const FRAME_SAMPLES: usize = 1120; // ~35ms at 32k
+        const CHANNELS: usize = 2;
+        let payload = vec![0u8; FRAME_SAMPLES * CHANNELS * std::mem::size_of::<f32>()];
+
+        let base = Instant::now();
+        let frame_dur = Duration::from_micros(FRAME_SAMPLES as u64 * 1_000_000 / 32_000);
+
+        let mut prev: Option<Instant> = None;
+        for n in 0..16u32 {
+            let input_instant = base + frame_dur * n;
+            let Some(frame) = resampler.resample(
+                &payload,
+                32000,
+                CHANNELS as u16,
+                SampleFormat::F32,
+                Timestamp::Instant(input_instant),
+            ) else {
+                continue;
+            };
+
+            let out_instant = match frame.timestamp {
+                Timestamp::Instant(i) => i,
+                other => panic!("expected Instant timestamp, got {other:?}"),
+            };
+
+            // No offset: output carries the exact input capture time.
+            assert_eq!(
+                out_instant, input_instant,
+                "frame {n} timestamp was shifted"
+            );
+            if let Some(p) = prev {
+                assert!(out_instant >= p, "frame {n} timestamp went backwards");
+            }
+            prev = Some(out_instant);
+        }
+
+        assert!(prev.is_some(), "resampler produced no frames");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod required_source_outcome_tests {
+    use super::*;
+    use crate::output_pipeline::PipelineBuildScope;
+
+    #[tokio::test]
+    async fn continuing_failed_callbacks_cancel_before_receive_timeout_and_join_owned_work() {
+        let scope = PipelineBuildScope::new_studio_lifetime();
+        let cancel = CancellationToken::new();
+        scope.register_token(cancel.clone());
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(7),
+            scope: scope.clone(),
+        };
+        let (sender, receiver) = flume::bounded(128);
+        for _ in 0..128 {
+            sender.try_send(7).unwrap();
+        }
+        health.source.test_backend_failure();
+        assert!(!health.check_terminal());
+        let completion = scope.task_completion();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _completion = completion;
+            released.await.unwrap();
+        });
+        assert!(!health.accepts_frame(receiver.try_recv().unwrap()));
+        assert_eq!(receiver.len(), 127);
+        assert!(cancel.is_cancelled());
+        health.stop();
+        let joined = tokio::spawn(async move { scope.cancel_and_join_report().await });
+        tokio::task::yield_now().await;
+        assert!(!joined.is_finished());
+        release.send(()).unwrap();
+        writer.await.unwrap();
+        let report = joined.await.unwrap();
+        assert!(report.quiescent);
+        assert!(
+            report
+                .error
+                .unwrap()
+                .contains("failed while continuing to deliver samples")
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_and_stale_callbacks_preserve_successful_required_source_stop() {
+        let scope = PipelineBuildScope::new_studio_lifetime();
+        let cancel = CancellationToken::new();
+        scope.register_token(cancel.clone());
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(7),
+            scope: scope.clone(),
+        };
+        for _ in 0..128 {
+            assert!(health.accepts_frame(7));
+            assert!(!health.accepts_frame(6));
+        }
+        assert!(!health.check_terminal());
+        assert!(!cancel.is_cancelled());
+        health.stop();
+        let report = scope.cancel_and_join_report().await;
+        assert!(report.quiescent);
+        assert!(report.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn continued_backend_error_in_committed_resume_cancels_parent_attempt() {
+        let parent = PipelineBuildScope::new_studio_lifetime();
+        let child = parent.child_transaction();
+        let cancel = CancellationToken::new();
+        child.register_token(cancel.clone());
+        assert!(child.commit());
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(8),
+            scope: child,
+        };
+        health.source.test_backend_failure();
+        assert!(!health.accepts_frame(8));
+        assert!(cancel.is_cancelled());
+        health.stop();
+        let report = parent.cancel_and_join_report().await;
+        assert!(report.quiescent);
+        assert!(
+            report
+                .error
+                .unwrap()
+                .contains("failed while continuing to deliver samples")
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_audio_failure_cancels_siblings_but_waits_for_owned_writer() {
+        let scope = PipelineBuildScope::new_studio_lifetime();
+        let cancel = CancellationToken::new();
+        scope.register_token(cancel.clone());
+        let completion = scope.task_completion();
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(0),
+            scope: scope.clone(),
+        };
+        let (release, released) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _completion = completion;
+            released.await.unwrap();
+        });
+        health.fail("DeviceNotFound after confirmed Pulse loss".into());
+        assert!(cancel.is_cancelled());
+        health.stop();
+        let joined = tokio::spawn(async move { scope.cancel_and_join_report().await });
+        tokio::task::yield_now().await;
+        assert!(!joined.is_finished());
+        release.send(()).unwrap();
+        writer.await.unwrap();
+        let report = joined.await.unwrap();
+        assert!(report.quiescent);
+        assert!(report.error.unwrap().contains("DeviceNotFound"));
+    }
+
+    #[tokio::test]
+    async fn feed_eof_cannot_be_a_successful_required_source_stop() {
+        let scope = PipelineBuildScope::new_studio_lifetime();
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(7),
+            scope: scope.clone(),
+        };
+        health.fail("Requested audio feed closed before Stop".into());
+        health.stop();
+        let report = scope.cancel_and_join_report().await;
+        assert!(report.quiescent);
+        assert!(report.error.unwrap().contains("closed before Stop"));
+    }
+
+    #[tokio::test]
+    async fn healthy_required_source_stop_does_not_invent_failure() {
+        let scope = PipelineBuildScope::new_studio_lifetime();
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(7),
+            scope: scope.clone(),
+        };
+        assert!(!health.check_terminal());
+        health.stop();
+        let report = scope.cancel_and_join_report().await;
+        assert!(report.quiescent);
+        assert!(report.error.is_none());
+        assert!(!PipelineBuildScope::new_lifetime().requires_source_health());
+    }
+
+    #[tokio::test]
+    async fn committed_resume_audio_failure_still_cancels_parent_attempt() {
+        let parent = PipelineBuildScope::new_studio_lifetime();
+        let child = parent.child_transaction();
+        assert!(child.requires_source_health());
+        let cancel = CancellationToken::new();
+        child.register_token(cancel.clone());
+        assert!(child.commit());
+        let health = RequiredMicrophoneHealth {
+            source: microphone::RecordingSourceHealth::test_healthy(8),
+            scope: child,
+        };
+        health.fail("current replacement failed".into());
+        assert!(cancel.is_cancelled());
+        let report = parent.cancel_and_join_report().await;
+        assert!(report.quiescent);
+        assert!(report.error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod owned_microphone_tests {
+    use super::*;
+    use crate::output_pipeline::{PipelineBuildScope, spawn_capture_task};
+
+    #[tokio::test]
+    async fn microphone_stop_waits_for_nested_producer_acknowledgement() {
+        let scope = PipelineBuildScope::new();
+        let cancel = CancellationToken::new();
+        scope.register_token(cancel.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        scope
+            .run(async move {
+                drop(spawn_capture_task(async move {
+                    drop(spawn_capture_task(async move {
+                        let _ = ready_tx.send(());
+                        cancel.cancelled().await;
+                        release_rx.await.unwrap();
+                    }));
+                }));
+            })
+            .await;
+        ready_rx.await.unwrap();
+        let stop = tokio::spawn(async move { microphone_producers_join(&scope).await });
+        tokio::task::yield_now().await;
+        assert!(!stop.is_finished());
+        release_tx.send(()).unwrap();
+        stop.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn microphone_producer_panic_is_not_successful_stop() {
+        let scope = PipelineBuildScope::new();
+        let mut task = None;
+        scope
+            .run(async {
+                task = Some(spawn_capture_task(async {
+                    panic!("synthetic microphone producer panic")
+                }));
+            })
+            .await;
+        assert!(task.unwrap().await.is_err());
+        assert!(microphone_producers_join(&scope).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn microphone_terminal_error_is_sticky_after_producers_exit() {
+        let scope = PipelineBuildScope::new();
+        scope.fail_required("Requested microphone reconnect failed: DeviceNotFound".into());
+        assert!(microphone_producers_join(&scope).await.is_err());
+        assert!(microphone_producers_join(&scope).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unpolled_microphone_setup_drop_cancels_registered_completion() {
+        let cancel = CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
+        let setup = async move { drop(guard.disarm()) };
+        drop(setup);
+        assert!(cancel.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod digital_silence_tests {
+    use super::*;
+    use crate::{
+        feeds::microphone::synthetic::SyntheticMicrophone,
+        output_pipeline::{AudioMuxer, Muxer, OutputPipeline, TaskPool},
+    };
+    use cap_timestamp::Timestamp;
+
+    const RATE: u32 = 48_000;
+    const CHUNK: usize = 480;
+
+    fn target_info() -> AudioInfo {
+        AudioInfo::new_raw(
+            cap_media_info::Sample::F32(cap_media_info::Type::Packed),
+            RATE,
+            1,
+        )
+    }
+
+    fn frame_with(samples: &[f32]) -> ffmpeg::frame::Audio {
+        let mut frame = create_silence_frame(&target_info(), samples.len());
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_ne_bytes()).collect();
+        frame.data_mut(0)[..bytes.len()].copy_from_slice(&bytes);
+        frame
+    }
+
+    fn quiet_room(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| if i % 25 == 0 { 3.0e-5 } else { 0.0 })
+            .collect()
+    }
+
+    fn feed_seconds(
+        detector: &mut DigitalSilenceDetector,
+        samples: &[f32],
+        seconds: f64,
+    ) -> Vec<DigitalSilenceUpdate> {
+        let frame = frame_with(samples);
+        let (total, nonzero) = count_nonzero_samples(&frame).unwrap();
+        let chunks = (seconds * f64::from(RATE) / samples.len() as f64).round() as usize;
+        (0..chunks)
+            .map(|_| detector.observe(total, nonzero))
+            .filter(|update| *update != DigitalSilenceUpdate::Unchanged)
+            .collect()
+    }
+
+    #[test]
+    fn exact_zero_frames_flag_after_a_sustained_window() {
+        let mut detector = DigitalSilenceDetector::new(RATE);
+        let zeros = vec![0.0; CHUNK];
+        assert!(feed_seconds(&mut detector, &zeros, 4.99).is_empty());
+        assert_eq!(
+            feed_seconds(&mut detector, &zeros, 0.01),
+            vec![DigitalSilenceUpdate::RunStarted]
+        );
+        assert_eq!(detector.flagged_ms(), 5_000);
+        assert_eq!(
+            feed_seconds(&mut detector, &zeros, 2.0),
+            vec![DigitalSilenceUpdate::RunExtended; 2]
+        );
+        assert_eq!(detector.flagged_ms(), 7_000);
+    }
+
+    #[test]
+    fn quiet_room_noise_floor_is_not_digital_silence() {
+        let mut detector = DigitalSilenceDetector::new(RATE);
+        assert!(feed_seconds(&mut detector, &quiet_room(CHUNK), 30.0).is_empty());
+        assert_eq!(detector.flagged_ms(), 0);
+    }
+
+    #[test]
+    fn muting_breaks_a_digital_silence_run() {
+        let mut detector = DigitalSilenceDetector::new(RATE);
+        let zeros = vec![0.0; CHUNK];
+        assert!(feed_seconds(&mut detector, &zeros, 4.0).is_empty());
+        assert_eq!(detector.reset(), DigitalSilenceUpdate::Unchanged);
+        assert!(feed_seconds(&mut detector, &zeros, 4.0).is_empty());
+        assert_eq!(detector.flagged_ms(), 0);
+    }
+
+    #[test]
+    fn real_audio_ends_a_run_and_later_runs_accumulate() {
+        let mut detector = DigitalSilenceDetector::new(RATE);
+        let zeros = vec![0.0; CHUNK];
+        feed_seconds(&mut detector, &zeros, 6.0);
+        assert_eq!(
+            feed_seconds(&mut detector, &quiet_room(CHUNK), 1.0),
+            vec![DigitalSilenceUpdate::RunEnded]
+        );
+        assert_eq!(detector.flagged_ms(), 6_000);
+        assert_eq!(
+            feed_seconds(&mut detector, &zeros, 5.0),
+            vec![DigitalSilenceUpdate::RunStarted]
+        );
+        assert_eq!(detector.flagged_ms(), 11_000);
+    }
+
+    #[test]
+    fn only_bit_exact_zero_counts_as_silent() {
+        let tiny = frame_with(&[1.0e-30; CHUNK]);
+        assert_eq!(
+            count_nonzero_samples(&tiny),
+            Some((CHUNK as u64, CHUNK as u64))
+        );
+        let negative_zero = frame_with(&[-0.0; CHUNK]);
+        assert_eq!(
+            count_nonzero_samples(&negative_zero),
+            Some((CHUNK as u64, 0))
+        );
+    }
+
+    #[test]
+    fn empty_frames_are_skipped_without_touching_planes() {
+        let empty = create_silence_frame(&target_info(), 0);
+        assert_eq!(count_nonzero_samples(&empty), None);
+    }
+
+    struct SinkMuxer;
+
+    impl Muxer for SinkMuxer {
+        type Config = ();
+
+        async fn setup(
+            _: (),
+            _: std::path::PathBuf,
+            _: Option<cap_media_info::VideoInfo>,
+            _: Option<AudioInfo>,
+            _: Arc<AtomicBool>,
+            _: &mut TaskPool,
+        ) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+
+        fn finish(&mut self, _: Duration) -> anyhow::Result<anyhow::Result<()>> {
+            Ok(Ok(()))
+        }
+    }
+
+    impl AudioMuxer for SinkMuxer {
+        fn send_audio_frame(&mut self, _: AudioFrame, _: Duration) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reported {
+        DigitalSilence,
+        Restarted,
+    }
+
+    enum Push<'a> {
+        Samples(&'a [f32], u32),
+        EmptyCallbacks(u32),
+    }
+
+    // Synchronizes on the source's own health events rather than on what the
+    // muxer accepted: downstream timing stages may drop frames whose
+    // timestamps run ahead of the wall clock, but the detector sits upstream.
+    async fn record_through_feed(pushes: &[Push<'_>], expected: &[Reported]) -> Option<u32> {
+        let mic = SyntheticMicrophone::spawn("voip-held-input", RATE, 1);
+        let lock = Arc::new(mic.lock().await.unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let mut pipeline = OutputPipeline::builder(temp.path().join("audio-input.ogg"))
+            .with_audio_source::<Microphone>(lock.clone())
+            .build::<SinkMuxer>(())
+            .await
+            .unwrap();
+        let mut health = pipeline.take_health_rx().unwrap();
+        let wanted = expected.len();
+        let collector = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while seen.len() < wanted {
+                match health.recv().await {
+                    Some(PipelineHealthEvent::MicrophoneDigitalSilence) => {
+                        seen.push(Reported::DigitalSilence)
+                    }
+                    Some(PipelineHealthEvent::SourceRestarted) => seen.push(Reported::Restarted),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            seen
+        });
+
+        let start = Instant::now();
+        let mut pushed_samples: u64 = 0;
+        for push in pushes {
+            match push {
+                Push::Samples(samples, seconds) => {
+                    let chunks = RATE as usize / samples.len() * *seconds as usize;
+                    for _ in 0..chunks {
+                        let at = start
+                            + Duration::from_secs_f64(pushed_samples as f64 / f64::from(RATE));
+                        mic.push(samples, Timestamp::Instant(at)).await;
+                        pushed_samples += samples.len() as u64;
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Push::EmptyCallbacks(count) => {
+                    for _ in 0..*count {
+                        let at = start
+                            + Duration::from_secs_f64(pushed_samples as f64 / f64::from(RATE));
+                        mic.push(&[], Timestamp::Instant(at)).await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+
+        let seen = tokio::time::timeout(Duration::from_secs(20), collector)
+            .await
+            .expect("the source never reported the expected health events")
+            .unwrap();
+        assert_eq!(seen, expected);
+        pipeline.stop().await.unwrap().digital_silence_ms
+    }
+
+    #[tokio::test]
+    async fn all_zero_frames_through_the_feed_surface_on_stop() {
+        let digital_silence_ms = record_through_feed(
+            &[Push::Samples(&[0.0; 4_800], 8)],
+            &[Reported::DigitalSilence],
+        )
+        .await;
+        assert!(
+            digital_silence_ms.is_some_and(|ms| ms >= 5_000),
+            "expected the stop result to carry the silent span, got {digital_silence_ms:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_room_through_the_feed_reports_nothing() {
+        let room = quiet_room(4_800);
+        let digital_silence_ms = record_through_feed(
+            &[Push::Samples(&room, 8), Push::Samples(&[0.0; 4_800], 6)],
+            &[Reported::DigitalSilence],
+        )
+        .await;
+        assert!(
+            digital_silence_ms.is_some_and(|ms| (5_000..=6_000).contains(&ms)),
+            "only the trailing zeros may count, got {digital_silence_ms:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_audio_after_the_call_clears_the_live_warning() {
+        let room = quiet_room(4_800);
+        let digital_silence_ms = record_through_feed(
+            &[Push::Samples(&[0.0; 4_800], 6), Push::Samples(&room, 2)],
+            &[Reported::DigitalSilence, Reported::Restarted],
+        )
+        .await;
+        assert_eq!(digital_silence_ms, Some(6_000));
+    }
+
+    #[tokio::test]
+    async fn empty_device_callbacks_do_not_stop_the_forwarder() {
+        let digital_silence_ms = record_through_feed(
+            &[Push::EmptyCallbacks(50), Push::Samples(&[0.0; 4_800], 6)],
+            &[Reported::DigitalSilence],
+        )
+        .await;
+        assert!(digital_silence_ms.is_some_and(|ms| ms >= 5_000));
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    use crate::{
+        feeds::microphone::synthetic::SyntheticMicrophone,
+        output_pipeline::{AudioMuxer, Muxer, OutputPipeline, TaskPool},
+    };
+    use cap_timestamp::Timestamp;
+
+    type Captured = Arc<std::sync::Mutex<Vec<f32>>>;
+
+    struct CapturingMuxer(Captured);
+
+    impl Muxer for CapturingMuxer {
+        type Config = Captured;
+
+        async fn setup(
+            captured: Captured,
+            _: std::path::PathBuf,
+            _: Option<cap_media_info::VideoInfo>,
+            _: Option<AudioInfo>,
+            _: Arc<AtomicBool>,
+            _: &mut TaskPool,
+        ) -> anyhow::Result<Self> {
+            Ok(Self(captured))
+        }
+
+        fn finish(&mut self, _: Duration) -> anyhow::Result<anyhow::Result<()>> {
+            Ok(Ok(()))
+        }
+    }
+
+    impl AudioMuxer for CapturingMuxer {
+        fn send_audio_frame(&mut self, frame: AudioFrame, _: Duration) -> anyhow::Result<()> {
+            let data = frame.inner.data(0);
+            let samples = frame.inner.samples();
+            let peak = data
+                .chunks_exact(4)
+                .take(samples)
+                .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).abs())
+                .fold(0.0f32, f32::max);
+            self.0.lock().unwrap().push(peak);
+            Ok(())
+        }
+    }
+
+    async fn push_for(
+        mic: &SyntheticMicrophone,
+        value: f32,
+        format: (u32, u16),
+        start: Instant,
+        offset: Duration,
+        length: Duration,
+    ) {
+        let (rate, channels) = format;
+        let frames_per_chunk = (rate / 100) as usize;
+        let chunk = vec![value; frames_per_chunk * usize::from(channels)];
+        let chunks = (length.as_secs_f64() * 100.0).round() as usize;
+        for index in 0..chunks {
+            let at = start + offset + Duration::from_millis(10 * index as u64);
+            mic.push(&chunk, Timestamp::Instant(at)).await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn settle(captured: &Captured, predicate: impl Fn(&[f32]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if predicate(&captured.lock().unwrap()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the muxer never saw the expected audio"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    type Placed = Arc<std::sync::Mutex<Vec<(f32, usize)>>>;
+
+    /// Each frame's peak and sample count, in the order the muxer lays them out.
+    struct PlacingMuxer(Placed);
+
+    impl Muxer for PlacingMuxer {
+        type Config = Placed;
+
+        async fn setup(
+            placed: Placed,
+            _: std::path::PathBuf,
+            _: Option<cap_media_info::VideoInfo>,
+            _: Option<AudioInfo>,
+            _: Arc<AtomicBool>,
+            _: &mut TaskPool,
+        ) -> anyhow::Result<Self> {
+            Ok(Self(placed))
+        }
+
+        fn finish(&mut self, _: Duration) -> anyhow::Result<anyhow::Result<()>> {
+            Ok(Ok(()))
+        }
+    }
+
+    impl AudioMuxer for PlacingMuxer {
+        fn send_audio_frame(&mut self, frame: AudioFrame, _: Duration) -> anyhow::Result<()> {
+            let samples = frame.inner.samples();
+            let peak = frame
+                .inner
+                .data(0)
+                .chunks_exact(4)
+                .take(samples)
+                .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).abs())
+                .fold(0.0f32, f32::max);
+            self.0.lock().unwrap().push((peak, samples));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn switch_gap_samples_bridge_only_a_real_hand_over() {
+        assert_eq!(switch_gap_samples(0.040, 48_000), Some(1_920));
+        assert_eq!(switch_gap_samples(0.0, 48_000), None);
+        assert_eq!(switch_gap_samples(-0.010, 48_000), None);
+        assert_eq!(switch_gap_samples(5.0, 48_000), None);
+        assert_eq!(switch_gap_samples(f64::NAN, 48_000), None);
+    }
+
+    /// The muxer lays audio out by sample count and only fills gaps above its
+    /// threshold, so an unfilled hand-over between two microphones would pull
+    /// everything recorded after a switch earlier, out of sync with the video.
+    #[tokio::test]
+    async fn audio_after_a_switch_keeps_its_place_on_the_timeline() {
+        let built_in = SyntheticMicrophone::spawn("built-in", 48_000, 1);
+        let headset = SyntheticMicrophone::spawn("headset", 48_000, 1);
+        let (switch, switch_requests) = MicrophoneSwitch::channel();
+        let placed = Placed::default();
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline = OutputPipeline::builder(temp.path().join("audio.ogg"))
+            .with_audio_source::<SwitchableMicrophone>(SwitchableMicrophoneConfig {
+                lock: Arc::new(built_in.lock().await.unwrap()),
+                switch_requests,
+            })
+            .build::<PlacingMuxer>(placed.clone())
+            .await
+            .unwrap();
+
+        // Both microphones deliver in real time, as hardware does: a source
+        // left idle past its keepalive would pad the timeline itself.
+        let chunk = vec![0.1f32; 480];
+        let start = Instant::now();
+        for index in 0..30u32 {
+            let at = start + Duration::from_millis(10) * index;
+            tokio::time::sleep_until((at + Duration::from_millis(10)).into()).await;
+            built_in.push(&chunk, Timestamp::Instant(at)).await;
+        }
+        switch
+            .switch(Arc::new(headset.lock().await.unwrap()))
+            .await
+            .unwrap();
+        // The headset's first buffer starts 40 ms after the built-in
+        // microphone's audio ended (later if the switch itself was slow):
+        // under the muxer's own gap threshold.
+        let headset_at = Duration::from_millis(start.elapsed().as_millis().max(340) as u64);
+        let loud = vec![0.35f32; 480];
+        for index in 0..30u32 {
+            let at = start + headset_at + Duration::from_millis(10) * index;
+            tokio::time::sleep_until((at + Duration::from_millis(10)).into()).await;
+            headset.push(&loud, Timestamp::Instant(at)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !placed.lock().unwrap().iter().any(|(peak, _)| *peak > 0.3) {
+            assert!(
+                Instant::now() < deadline,
+                "the headset never reached the muxer"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pipeline.stop().await.unwrap();
+
+        let placed = placed.lock().unwrap().clone();
+        let first_headset = placed.iter().position(|(peak, _)| *peak > 0.3).unwrap();
+        let before: usize = placed[..first_headset].iter().map(|(_, n)| n).sum();
+        let expected = (headset_at.as_secs_f64() * 48_000.0).round() as usize;
+        assert!(
+            before.abs_diff(expected) <= 48,
+            "the headset's first sample belongs at {} ms ({expected} samples), not straight after the built-in microphone's last; it landed at {before}",
+            headset_at.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_source_moves_to_a_device_with_a_different_format_and_releases_the_old_one() {
+        let built_in = SyntheticMicrophone::spawn("built-in", 48_000, 1);
+        let headset = SyntheticMicrophone::spawn("headset", 44_100, 2);
+        let (switch, switch_requests) = MicrophoneSwitch::channel();
+        let captured = Captured::default();
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline = OutputPipeline::builder(temp.path().join("audio.ogg"))
+            .with_audio_source::<SwitchableMicrophone>(SwitchableMicrophoneConfig {
+                lock: Arc::new(built_in.lock().await.unwrap()),
+                switch_requests,
+            })
+            .build::<CapturingMuxer>(captured.clone())
+            .await
+            .unwrap();
+
+        let start = Instant::now();
+        push_for(
+            &built_in,
+            0.1,
+            (48_000, 1),
+            start,
+            Duration::ZERO,
+            Duration::from_millis(300),
+        )
+        .await;
+        settle(&captured, |peaks| {
+            peaks.iter().any(|peak| (*peak - 0.1).abs() < 0.02)
+        })
+        .await;
+
+        switch
+            .switch(Arc::new(headset.lock().await.unwrap()))
+            .await
+            .unwrap();
+        assert!(
+            built_in.lock().await.is_ok(),
+            "the recording must let go of the microphone it switched away from"
+        );
+
+        push_for(
+            &headset,
+            0.35,
+            (44_100, 2),
+            start,
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .await;
+        settle(&captured, |peaks| peaks.iter().any(|peak| *peak > 0.3)).await;
+
+        built_in
+            .push(&[0.95; 480], Timestamp::Instant(Instant::now()))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        pipeline.stop().await.unwrap();
+
+        let peaks = captured.lock().unwrap().clone();
+        let first_switched = peaks.iter().position(|peak| *peak > 0.3).unwrap();
+        assert!(
+            peaks[..first_switched].iter().all(|peak| *peak < 0.2),
+            "audio before the switch comes from the first microphone"
+        );
+        assert!(
+            peaks.iter().all(|peak| *peak < 0.8),
+            "the old microphone's samples never reach the recording after the switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_cannot_attach_leaves_the_current_microphone_recording() {
+        let built_in = SyntheticMicrophone::spawn("built-in", 48_000, 1);
+        let unplugged = SyntheticMicrophone::spawn("unplugged", 48_000, 1);
+        let unplugged_lock = Arc::new(unplugged.lock().await.unwrap());
+        unplugged.kill().await;
+        let (switch, switch_requests) = MicrophoneSwitch::channel();
+        let captured = Captured::default();
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline = OutputPipeline::builder(temp.path().join("audio.ogg"))
+            .with_audio_source::<SwitchableMicrophone>(SwitchableMicrophoneConfig {
+                lock: Arc::new(built_in.lock().await.unwrap()),
+                switch_requests,
+            })
+            .build::<CapturingMuxer>(captured.clone())
+            .await
+            .unwrap();
+
+        assert!(switch.switch(unplugged_lock).await.is_err());
+
+        let start = Instant::now();
+        push_for(
+            &built_in,
+            0.4,
+            (48_000, 1),
+            start,
+            Duration::ZERO,
+            Duration::from_millis(200),
+        )
+        .await;
+        settle(&captured, |peaks| {
+            peaks.iter().any(|peak| (*peak - 0.4).abs() < 0.02)
+        })
+        .await;
+        assert!(
+            built_in.lock().await.is_err(),
+            "the recording still holds the microphone it never left"
+        );
+        pipeline.stop().await.unwrap();
+    }
+}

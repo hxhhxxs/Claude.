@@ -1,0 +1,187 @@
+"use client";
+
+import type { Folder, Space } from "@cap/web-domain";
+import clsx from "clsx";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { toast } from "sonner";
+
+import {
+	moveFolderToFolder,
+	moveVideosToFolder,
+} from "@/actions/folders/moveVideoToFolder";
+import {
+	CAP_DRAG_TYPE,
+	describeDraggedCaps,
+	FOLDER_DRAG_TYPE,
+	parseCapDrag,
+	parseFolderDrag,
+} from "@/lib/move-items";
+import { useDashboardContext } from "../../../Contexts";
+import { AllFolders } from "../../../caps/components/Folders";
+import { notifyCapsMoved } from "../../../caps/components/useCapsMoved";
+
+interface BreadcrumbItemProps {
+	id: Folder.FolderId;
+	name: string;
+	color: "normal" | "blue" | "red" | "yellow";
+	spaceId?: Space.SpaceIdOrOrganisationId | null;
+	isLast: boolean;
+	compact?: boolean;
+}
+
+export function BreadcrumbItem({
+	id,
+	name,
+	color,
+	isLast,
+	spaceId,
+	compact = false,
+}: BreadcrumbItemProps) {
+	const [isDragOver, setIsDragOver] = useState(false);
+	const [isMoving, setIsMoving] = useState(false);
+	const router = useRouter();
+	const { activeSpace } = useDashboardContext();
+	// The route's space comes first: the context only knows spaces the viewer
+	// created, joined or can see publicly.
+	const linkSpaceId = spaceId ?? activeSpace?.id;
+
+	const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+		e.preventDefault();
+		e.stopPropagation();
+
+		const types = e.dataTransfer.types;
+		if (
+			types.includes(CAP_DRAG_TYPE) ||
+			(!isLast && types.includes(FOLDER_DRAG_TYPE))
+		) {
+			setIsDragOver(true);
+			e.dataTransfer.dropEffect = "move";
+		}
+	};
+
+	const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+		e.preventDefault();
+		e.stopPropagation();
+		setIsDragOver(false);
+	};
+
+	const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+		e.preventDefault();
+		e.stopPropagation();
+		setIsDragOver(false);
+
+		const folderPayload = parseFolderDrag(
+			e.dataTransfer.getData(FOLDER_DRAG_TYPE),
+		);
+		if (folderPayload) {
+			if (isLast || folderPayload.id === id) return;
+
+			try {
+				setIsMoving(true);
+				await moveFolderToFolder({
+					folderId: folderPayload.id,
+					parentId: id,
+					spaceId: spaceId ?? null,
+				});
+				router.refresh();
+				toast.success(`"${folderPayload.name}" moved into "${name}"`);
+			} catch (error) {
+				console.error("Error moving folder:", error);
+				toast.error("Failed to move folder");
+			} finally {
+				setIsMoving(false);
+			}
+			return;
+		}
+
+		const capPayload = parseCapDrag(e.dataTransfer.getData(CAP_DRAG_TYPE));
+		if (!capPayload) return;
+
+		try {
+			setIsMoving(true);
+			await moveVideosToFolder({
+				videoIds: capPayload.ids,
+				folderId: id,
+				spaceId: spaceId ?? null,
+			});
+			notifyCapsMoved(capPayload.ids);
+			router.refresh();
+			toast.success(
+				`${describeDraggedCaps(capPayload)} moved to "${name}" folder`,
+			);
+		} catch (error) {
+			console.error("Error moving video to folder:", error);
+			toast.error(
+				capPayload.ids.length > 1
+					? "Failed to move Caps to folder"
+					: "Failed to move video to folder",
+			);
+		} finally {
+			setIsMoving(false);
+		}
+	};
+
+	if (isLast) {
+		return (
+			<div
+				className={clsx(
+					"flex gap-1.5 items-center px-1 min-w-0 rounded-md",
+					isDragOver && "bg-gray-4",
+				)}
+				title={name}
+				onDragOver={handleDragOver}
+				onDragLeave={handleDragLeave}
+				onDrop={handleDrop}
+			>
+				<AllFolders color={color} className="size-4 shrink-0" />
+				<p
+					className={clsx("tracking-tight leading-6 truncate text-gray-12", {
+						"opacity-70": isMoving,
+					})}
+				>
+					{name}
+				</p>
+			</div>
+		);
+	}
+
+	return (
+		<div
+			onDragOver={handleDragOver}
+			onDragLeave={handleDragLeave}
+			onDrop={handleDrop}
+			title={name}
+			className={clsx(
+				"relative min-w-0 rounded-md",
+				compact ? "px-0.5" : "px-1",
+				{
+					"bg-gray-4": isDragOver,
+					"opacity-70": isMoving,
+				},
+			)}
+		>
+			<Link
+				href={
+					linkSpaceId
+						? `/dashboard/spaces/${linkSpaceId}/folder/${id}`
+						: `/dashboard/folder/${id}`
+				}
+				className="flex relative z-10 gap-1.5 items-center min-w-0 transition-colors duration-200"
+			>
+				<p
+					className={clsx(
+						"transition-colors duration-200 hover:text-gray-12",
+						compact
+							? "leading-4 [overflow-wrap:anywhere]"
+							: "tracking-tight leading-6 truncate",
+						isDragOver ? "text-gray-12" : "text-gray-10",
+					)}
+				>
+					{name}
+				</p>
+			</Link>
+		</div>
+	);
+}

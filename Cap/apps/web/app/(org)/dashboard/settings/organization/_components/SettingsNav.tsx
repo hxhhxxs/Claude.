@@ -1,0 +1,80 @@
+"use client";
+
+import { buildEnv } from "@cap/env";
+import clsx from "clsx";
+import { motion } from "framer-motion";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { TabSquiggle } from "./doodles";
+
+export function SettingsNav() {
+	const pathname = usePathname();
+	const tabs = [
+		{ label: "General", href: "/dashboard/settings/organization" },
+		{
+			label: "Preferences",
+			href: "/dashboard/settings/organization/preferences",
+		},
+		{
+			label: "Integrations",
+			href: "/dashboard/settings/organization/integrations",
+		},
+		{
+			label: "Content",
+			href: "/dashboard/settings/organization/content",
+		},
+		{
+			label: "Members",
+			href: "/dashboard/settings/organization/members",
+		},
+		...(buildEnv.NEXT_PUBLIC_IS_CAP
+			? [
+					{
+						label: "Billing",
+						href: "/dashboard/settings/organization/billing",
+					},
+					{
+						label: "Security & Compliance",
+						href: "/dashboard/settings/organization/security",
+					},
+				]
+			: []),
+	];
+
+	return (
+		<div className="flex overflow-x-auto gap-5 items-center border-b border-gray-3 custom-scroll">
+			{tabs.map((tab) => {
+				const isActive = pathname === tab.href;
+
+				return (
+					<div key={tab.href} className="relative min-w-fit">
+						<Link
+							href={tab.href}
+							className="flex relative items-center py-3 cursor-pointer group"
+						>
+							<p
+								className={clsx(
+									"text-[13px] transition-colors whitespace-nowrap",
+									isActive
+										? "font-medium text-gray-12"
+										: "text-gray-10 group-hover:text-gray-12",
+								)}
+							>
+								{tab.label}
+							</p>
+						</Link>
+						{isActive && (
+							<motion.div
+								layoutId="org-settings-tab"
+								className="absolute right-0 bottom-0 w-full"
+								transition={{ ease: "easeOut", duration: 0.2 }}
+							>
+								<TabSquiggle />
+							</motion.div>
+						)}
+					</div>
+				);
+			})}
+		</div>
+	);
+}

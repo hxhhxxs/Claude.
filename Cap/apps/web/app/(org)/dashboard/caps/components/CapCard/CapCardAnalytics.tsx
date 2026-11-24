@@ -1,0 +1,135 @@
+import type { IconDefinition } from "@fortawesome/free-solid-svg-icons";
+import { faComment } from "@fortawesome/free-solid-svg-icons/faComment";
+import { faEye } from "@fortawesome/free-solid-svg-icons/faEye";
+import { faSmile } from "@fortawesome/free-solid-svg-icons/faSmile";
+import Link from "next/link";
+import {
+	type ComponentProps,
+	type ForwardedRef,
+	forwardRef,
+	type PropsWithChildren,
+} from "react";
+import { FontAwesomeIcon } from "@/components/FontAwesomeIcon";
+import { Tooltip } from "@/components/Tooltip";
+
+export const capAnalyticsHref = (capId: string) =>
+	`/dashboard/analytics?capId=${capId}`;
+
+interface CapCardAnalyticsProps {
+	capId: string;
+	displayCount: number;
+	totalComments: number;
+	isLoadingAnalytics: boolean;
+	totalReactions: number;
+	isOwner?: boolean;
+}
+
+export const CapCardAnalytics = Object.assign(
+	({
+		capId,
+		displayCount,
+		totalComments,
+		totalReactions,
+		isLoadingAnalytics,
+		isOwner = true,
+	}: CapCardAnalyticsProps) =>
+		isLoadingAnalytics ? (
+			<CapCardAnalytics.Skeleton />
+		) : (
+			<Shell>
+				<div className="flex flex-wrap gap-3.5 items-center">
+					<Tooltip
+						content="View analytics"
+						className="bg-gray-12 text-gray-1 border-gray-11 shadow-lg"
+						delayDuration={100}
+					>
+						<Link
+							href={capAnalyticsHref(capId)}
+							className="inline-flex cursor-pointer"
+						>
+							<IconItem icon={faEye}>
+								<span className="text-[13px] tabular-nums text-gray-11">
+									{displayCount}
+								</span>
+							</IconItem>
+						</Link>
+					</Tooltip>
+					<Tooltip
+						content="View analytics"
+						className="bg-gray-12 text-gray-1 border-gray-11 shadow-lg"
+						delayDuration={100}
+					>
+						<Link
+							href={capAnalyticsHref(capId)}
+							className="inline-flex cursor-pointer"
+						>
+							<IconItem icon={faComment}>
+								<span className="text-[13px] tabular-nums text-gray-11">
+									{totalComments}
+								</span>
+							</IconItem>
+						</Link>
+					</Tooltip>
+					<Tooltip
+						content="View analytics"
+						className="bg-gray-12 text-gray-1 border-gray-11 shadow-lg"
+						delayDuration={100}
+					>
+						<Link
+							href={capAnalyticsHref(capId)}
+							className="inline-flex cursor-pointer"
+						>
+							<IconItem icon={faSmile}>
+								<span className="text-[13px] tabular-nums text-gray-11">
+									{totalReactions}
+								</span>
+							</IconItem>
+						</Link>
+					</Tooltip>
+				</div>
+				{isOwner && (
+					<Link
+						href={capAnalyticsHref(capId)}
+						target="_blank"
+						rel="noopener noreferrer"
+						className="text-xs font-medium transition-colors text-gray-10 hover:text-gray-12"
+					>
+						Analytics
+					</Link>
+				)}
+			</Shell>
+		),
+	{
+		Skeleton: () => (
+			<Shell>
+				<SkeletonItem icon={faEye} />
+				<SkeletonItem icon={faComment} />
+				<SkeletonItem icon={faSmile} />
+			</Shell>
+		),
+	},
+);
+
+const Shell = (props: PropsWithChildren) => (
+	<div className="flex flex-wrap gap-4 justify-between items-center pt-3 mt-auto text-sm border-t border-gray-3">
+		{props.children}
+	</div>
+);
+
+const IconItem = forwardRef(
+	(
+		props: { icon: IconDefinition } & Pick<ComponentProps<"div">, "children">,
+		ref: ForwardedRef<HTMLDivElement>,
+	) => (
+		<div ref={ref} className="flex gap-1.5 items-center">
+			<FontAwesomeIcon className="text-gray-8 size-3.5" icon={props.icon} />
+			{props.children}
+		</div>
+	),
+);
+
+const SkeletonItem = ({ icon }: { icon: IconDefinition }) => (
+	<IconItem icon={icon}>
+		<div className="h-1.5 w-3 -mx-0.5 bg-gray-5 rounded-full animate-pulse" />
+	</IconItem>
+);

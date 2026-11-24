@@ -1,0 +1,869 @@
+import {
+	Button,
+	Dialog,
+	DialogContent,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+	Input,
+	Switch,
+} from "@cap/ui";
+import type { SpaceRuleSource, ViewerSettingKey } from "@cap/web-backend";
+import { type ImageUpload, Space, type Video } from "@cap/web-domain";
+import { faCopy } from "@fortawesome/free-solid-svg-icons/faCopy";
+import { faShareNodes } from "@fortawesome/free-solid-svg-icons/faShareNodes";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import clsx from "clsx";
+import { Check, Globe2, Lock, Search } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { shareCap } from "@/actions/caps/share";
+import {
+	removeVideoPassword,
+	setVideoPassword,
+} from "@/actions/videos/password";
+import {
+	getVideoViewerGrants,
+	inviteVideoViewer,
+	revokeVideoViewer,
+} from "@/actions/videos/viewer-invites";
+import {
+	libraryDoodleHost,
+	SpaceDoodle,
+} from "@/app/(org)/dashboard/_components/library-doodles";
+import { useDashboardContext } from "@/app/(org)/dashboard/Contexts";
+import type { Spaces } from "@/app/(org)/dashboard/dashboard-data";
+import type { CurrentUser } from "@/app/Layout/AuthContext";
+import {
+	DEFAULT_EMBED_TOGGLES,
+	EmbedOptionsFields,
+	embedTogglesToOptions,
+} from "@/components/embed/EmbedOptionsFields";
+import { FontAwesomeIcon } from "@/components/FontAwesomeIcon";
+import { SignedImageUrl } from "@/components/SignedImageUrl";
+import { buildEmbedCode } from "@/lib/embed-code";
+import { videoShareUrl } from "@/lib/video-share-url";
+import { usePublicEnv } from "@/utils/public-env";
+
+interface SharingDialogProps {
+	isOpen: boolean;
+	onClose: () => void;
+	capId: Video.VideoId;
+	capName: string;
+	sharedSpaces: {
+		id: string;
+		name: string;
+		iconUrl?: string | null;
+		organizationId: string;
+		isOrg?: boolean;
+		settings?: Partial<Record<ViewerSettingKey, boolean>> | null;
+		hasPassword?: boolean;
+	}[];
+	onSharingUpdated: (updatedSharedSpaces: string[]) => void;
+	isPublic?: boolean;
+	spacesData?: Spaces[] | null;
+	hasPassword?: boolean;
+	allowedEmailDomain?: string | null;
+	allowLinkOverride?: boolean;
+	linkOpenToAnyone?: boolean;
+	inheritedPasswordSources?: SpaceRuleSource[];
+	onPasswordUpdated?: (protectedStatus: boolean) => void;
+	user?: CurrentUser | null;
+	onUpgradeRequest?: (open: boolean) => void;
+	shareUrl?: string;
+}
+
+export const SharingDialog: React.FC<SharingDialogProps> = ({
+	isOpen,
+	onClose,
+	capId,
+	capName,
+	sharedSpaces,
+	onSharingUpdated,
+	isPublic = false,
+	spacesData: propSpacesData = null,
+	hasPassword = false,
+	allowedEmailDomain: propAllowedEmailDomain,
+	allowLinkOverride: propAllowLinkOverride,
+	linkOpenToAnyone = false,
+	inheritedPasswordSources = [],
+	onPasswordUpdated,
+	user: propUser,
+	onUpgradeRequest: propOnUpgradeRequest,
+	shareUrl: propShareUrl,
+}) => {
+	const {
+		spacesData: contextSpacesData,
+		user: contextUser,
+		setUpgradeModalOpen,
+		activeOrganization,
+		organizationSettings,
+	} = useDashboardContext() ?? {};
+	const spacesData = propSpacesData || contextSpacesData;
+	const user = propUser ?? contextUser;
+	const onUpgradeRequest = propOnUpgradeRequest ?? setUpgradeModalOpen;
+	const allowedEmailDomain =
+		propAllowedEmailDomain ??
+		activeOrganization?.organization.allowedEmailDomain;
+	const canOverrideLink =
+		Boolean(allowedEmailDomain?.trim()) &&
+		(propAllowLinkOverride ??
+			organizationSettings?.allowPublicLinkOverride === true);
+	const [selectedSpaces, setSelectedSpaces] = useState<Set<string>>(new Set());
+	const [searchTerm, setSearchTerm] = useState("");
+	const [initialSelectedSpaces, setInitialSelectedSpaces] = useState<
+		Set<string>
+	>(new Set());
+	const [publicToggle, setPublicToggle] = useState(isPublic);
+	const [initialPublicState, setInitialPublicState] = useState(isPublic);
+	const [linkAnyone, setLinkAnyone] = useState(linkOpenToAnyone);
+	const linkAccessChanged =
+		publicToggle && canOverrideLink && linkAnyone !== linkOpenToAnyone;
+	const linkRestricted =
+		Boolean(allowedEmailDomain?.trim()) && !(canOverrideLink && linkAnyone);
+	const [passwordEnabled, setPasswordEnabled] = useState(hasPassword);
+	const [passwordValue, setPasswordValue] = useState("");
+	const [initialPasswordEnabled, setInitialPasswordEnabled] =
+		useState(hasPassword);
+	const tabs = ["Share", "Embed"] as const;
+	const [activeTab, setActiveTab] = useState<(typeof tabs)[number]>("Share");
+	const [viewerEmail, setViewerEmail] = useState("");
+	const router = useRouter();
+	const { webUrl } = usePublicEnv();
+	const shareUrl =
+		propShareUrl ??
+		videoShareUrl(webUrl, capId, activeOrganization?.organization);
+	const viewerGrants = useQuery({
+		queryKey: ["video-viewer-grants", capId],
+		queryFn: () => getVideoViewerGrants(capId),
+		enabled: isOpen,
+	});
+	const inviteViewer = useMutation({
+		mutationFn: () => inviteVideoViewer(capId, viewerEmail),
+		onSuccess: async (result) => {
+			if (!result.success) {
+				toast.error(result.error);
+				return;
+			}
+			await viewerGrants.refetch();
+			router.refresh();
+			setViewerEmail("");
+			if (result.alreadyAdded) {
+				toast.info("This viewer already has access");
+			} else if (result.emailSent) {
+				toast.success("Viewer invited");
+			} else {
+				toast.warning(
+					"Access added, but the invitation email was not sent. Copy the link to share it.",
+				);
+			}
+		},
+		onError: (error) => {
+			toast.error(
+				error instanceof Error ? error.message : "Failed to invite viewer",
+			);
+		},
+	});
+	const revokeViewer = useMutation({
+		mutationFn: (email: string) => revokeVideoViewer(capId, email),
+		onSuccess: async () => {
+			await viewerGrants.refetch();
+			router.refresh();
+			toast.success("Viewer access removed");
+		},
+		onError: () => toast.error("Failed to remove viewer access"),
+	});
+	const copyShareUrl = async () => {
+		try {
+			await navigator.clipboard.writeText(shareUrl);
+			toast.success("Link copied");
+		} catch {
+			toast.error("Failed to copy link");
+		}
+	};
+
+	const updateSharing = useMutation({
+		mutationFn: async ({
+			capId,
+			spaceIds,
+			public: isPublic,
+		}: {
+			capId: Video.VideoId;
+			spaceIds: Space.SpaceIdOrOrganisationId[];
+			public: boolean;
+		}) => {
+			const result = await shareCap({
+				capId,
+				spaceIds,
+				public: isPublic,
+				...(linkAccessChanged
+					? { linkAccess: linkAnyone ? "anyone" : "restricted" }
+					: {}),
+			});
+
+			if (!result.success) {
+				throw new Error(result.error || "Failed to update sharing settings");
+			}
+
+			if (passwordEnabled && passwordValue.trim()) {
+				const pwResult = await setVideoPassword(capId, passwordValue);
+				if (!pwResult.success) {
+					throw new Error(pwResult.error || "Failed to set password");
+				}
+			} else if (!passwordEnabled && initialPasswordEnabled) {
+				const pwResult = await removeVideoPassword(capId);
+				if (!pwResult.success) {
+					throw new Error(pwResult.error || "Failed to remove password");
+				}
+			}
+		},
+		onSuccess: () => {
+			const newSelectedSpaces = Array.from(selectedSpaces);
+			const initialSpaces = Array.from(initialSelectedSpaces);
+
+			const addedSpaceIds = newSelectedSpaces.filter(
+				(id) => !initialSpaces.includes(id),
+			);
+			const removedSpaceIds = initialSpaces.filter(
+				(id) => !newSelectedSpaces.includes(id),
+			);
+
+			const visibilityChanged = publicToggle !== initialPublicState;
+			const publicChanged = visibilityChanged || linkAccessChanged;
+			const passwordChanged =
+				passwordEnabled !== initialPasswordEnabled ||
+				(passwordEnabled && passwordValue.trim().length > 0);
+
+			if (passwordChanged) {
+				onPasswordUpdated?.(passwordEnabled);
+			}
+
+			if (
+				publicChanged &&
+				addedSpaceIds.length === 0 &&
+				removedSpaceIds.length === 0 &&
+				!passwordChanged
+			) {
+				toast.success(
+					visibilityChanged
+						? publicToggle
+							? "Video is now public"
+							: "Video is now private"
+						: linkAnyone
+							? "Anyone with the link can now view"
+							: "Link limited to matching emails",
+				);
+			} else if (
+				passwordChanged &&
+				!publicChanged &&
+				addedSpaceIds.length === 0 &&
+				removedSpaceIds.length === 0
+			) {
+				toast.success(
+					passwordEnabled
+						? "Password protection enabled"
+						: "Password protection removed",
+				);
+			} else if (
+				addedSpaceIds.length === 1 &&
+				removedSpaceIds.length === 0 &&
+				!publicChanged &&
+				!passwordChanged
+			) {
+				toast.success(`Shared to ${getSpaceName(addedSpaceIds[0] as string)}`);
+			} else if (
+				removedSpaceIds.length === 1 &&
+				addedSpaceIds.length === 0 &&
+				!publicChanged &&
+				!passwordChanged
+			) {
+				toast.success(
+					`Unshared from ${getSpaceName(removedSpaceIds[0] as string)}`,
+				);
+			} else if (
+				addedSpaceIds.length > 0 &&
+				removedSpaceIds.length === 0 &&
+				!publicChanged &&
+				!passwordChanged
+			) {
+				toast.success(`Shared to ${addedSpaceIds.length} spaces`);
+			} else if (
+				removedSpaceIds.length > 0 &&
+				addedSpaceIds.length === 0 &&
+				!publicChanged &&
+				!passwordChanged
+			) {
+				toast.success(`Unshared from ${removedSpaceIds.length} spaces`);
+			} else if (
+				addedSpaceIds.length > 0 ||
+				removedSpaceIds.length > 0 ||
+				publicChanged ||
+				passwordChanged
+			) {
+				toast.success("Sharing settings updated");
+			} else {
+				toast.info("No changes to sharing settings");
+			}
+			onSharingUpdated(newSelectedSpaces);
+			onClose();
+		},
+		onError: () => {
+			toast.error("Failed to update sharing settings");
+		},
+	});
+
+	const getSpaceName = (id: string) => {
+		const space = spacesData?.find((space) => space.id === id);
+		return space?.name || `Space ${id}`;
+	};
+
+	const handlePasswordToggle = (checked: boolean) => {
+		if (checked && user && !user.isPro) {
+			onUpgradeRequest?.(true);
+			return;
+		}
+		setPasswordEnabled(checked);
+		if (!checked) {
+			setPasswordValue("");
+		}
+	};
+
+	// Reset to the saved settings once each time the dialog opens. Inviting or
+	// removing a viewer refreshes the page, which hands in a new sharedSpaces
+	// array; resetting on that would drop the edits the user has not saved.
+	const initializedForOpen = useRef(false);
+	useEffect(() => {
+		if (!isOpen) {
+			initializedForOpen.current = false;
+			return;
+		}
+		if (sharedSpaces && !initializedForOpen.current) {
+			initializedForOpen.current = true;
+			const spaceIds = new Set(sharedSpaces.map((space) => space.id));
+			setSelectedSpaces(spaceIds);
+			setInitialSelectedSpaces(spaceIds);
+			setPublicToggle(isPublic);
+			setInitialPublicState(isPublic);
+			setLinkAnyone(linkOpenToAnyone);
+			setPasswordEnabled(hasPassword);
+			setPasswordValue("");
+			setInitialPasswordEnabled(hasPassword);
+			setSearchTerm("");
+			setViewerEmail("");
+			setActiveTab(tabs[0]);
+		}
+	}, [isOpen, sharedSpaces, isPublic, linkOpenToAnyone, hasPassword, tabs[0]]);
+
+	const handleToggleSpace = (spaceId: string) => {
+		setSelectedSpaces((prev) => {
+			const newSet = new Set(prev);
+			if (newSet.has(spaceId)) {
+				newSet.delete(spaceId);
+			} else {
+				newSet.add(spaceId);
+			}
+			return newSet;
+		});
+	};
+
+	const [embedToggles, setEmbedToggles] = useState(DEFAULT_EMBED_TOGGLES);
+	const canHideEmbedBranding = Boolean(user?.isPro);
+	const embedCode = useEmbedCode(
+		capId,
+		embedTogglesToOptions({
+			...embedToggles,
+			showBranding: canHideEmbedBranding ? embedToggles.showBranding : true,
+		}),
+	);
+
+	const handleCopyEmbedCode = async () => {
+		try {
+			await navigator.clipboard.writeText(embedCode);
+			toast.success("Embed code copied to clipboard");
+		} catch (_error) {
+			toast.error("Failed to copy embed code");
+		}
+	};
+
+	// Separate organization entries from real spaces
+	const organizationEntries =
+		spacesData?.filter(
+			(space) => space.id === space.organizationId && space.primary === true,
+		) || [];
+
+	const realSpaces =
+		spacesData?.filter(
+			(space) => !(space.id === space.organizationId && space.primary === true),
+		) || [];
+
+	const allShareableItems = [...organizationEntries, ...realSpaces];
+	const selectedInheritedPasswordSources = [
+		...inheritedPasswordSources.filter((source) =>
+			selectedSpaces.has(source.id),
+		),
+		...sharedSpaces
+			.filter((space) => selectedSpaces.has(space.id) && space.hasPassword)
+			.map((space) => ({ id: space.id, name: space.name })),
+		...allShareableItems
+			.filter((space) => selectedSpaces.has(space.id) && space.hasPassword)
+			.map((space) => ({ id: space.id, name: space.name })),
+	].filter(
+		(source, index, sources) =>
+			sources.findIndex((item) => item.id === source.id) === index,
+	);
+	const inheritedPasswordLabel =
+		selectedInheritedPasswordSources.length === 1
+			? `Required by ${selectedInheritedPasswordSources[0]?.name}`
+			: selectedInheritedPasswordSources.length > 1
+				? `Required by ${selectedInheritedPasswordSources.length} spaces`
+				: null;
+
+	const filteredSpaces = searchTerm
+		? allShareableItems.filter((space) =>
+				space.name.toLowerCase().includes(searchTerm.toLowerCase()),
+			)
+		: allShareableItems;
+
+	return (
+		<Dialog open={isOpen} onOpenChange={onClose}>
+			<DialogContent className="p-0 w-full max-w-md max-h-[90vh] overflow-y-auto rounded-xl border bg-gray-2 border-gray-4">
+				<DialogHeader
+					icon={<FontAwesomeIcon icon={faShareNodes} className="size-3.5" />}
+					description={
+						activeTab === "Share"
+							? "Select how you would like to share the cap"
+							: "Copy the embed code to share your cap"
+					}
+				>
+					<DialogTitle className="truncate w-full max-w-[320px]">
+						{activeTab === "Share" ? `Share ${capName}` : `Embed ${capName}`}
+					</DialogTitle>
+				</DialogHeader>
+
+				<div className="flex w-full h-12 border-b bg-gray-1 border-gray-4">
+					{tabs.map((tab) => (
+						<button
+							type="button"
+							key={tab}
+							className={clsx(
+								"flex relative flex-1 justify-center items-center w-full min-w-0 text-sm font-medium transition-colors",
+								activeTab === tab
+									? "cursor-not-allowed bg-gray-3"
+									: "cursor-pointer",
+							)}
+							onClick={() => setActiveTab(tab)}
+						>
+							<p
+								className={clsx(
+									activeTab === tab
+										? "text-gray-12 font-medium"
+										: "text-gray-10",
+									"text-sm",
+								)}
+							>
+								{tab}
+							</p>
+						</button>
+					))}
+				</div>
+
+				<div className="p-5">
+					{activeTab === "Share" ? (
+						<>
+							{/* Public sharing toggle */}
+							<div className="mb-4 rounded-lg border bg-gray-1 border-gray-4">
+								<div className="flex justify-between items-center p-3">
+									<div className="flex gap-3 items-center">
+										<div className="flex justify-center items-center w-8 h-8 rounded-full bg-gray-3">
+											<Globe2 className="w-4 h-4 text-gray-11" />
+										</div>
+										<div>
+											<p className="text-sm font-medium text-gray-12">
+												{!publicToggle
+													? "Private"
+													: linkRestricted
+														? "Restricted link access"
+														: "Anyone with the link"}
+											</p>
+											<p className="text-xs text-gray-10">
+												{!publicToggle
+													? "Only people with access can view"
+													: linkRestricted
+														? `Only users with matching ${allowedEmailDomain?.trim().includes(",") ? "emails" : "email"} can view`
+														: "Anyone on the internet with the link can view"}
+											</p>
+										</div>
+									</div>
+									<Switch
+										checked={publicToggle}
+										onCheckedChange={setPublicToggle}
+									/>
+								</div>
+								{publicToggle && canOverrideLink && (
+									<div className="grid grid-cols-2 gap-1 p-1 mx-3 mb-3 rounded-lg bg-gray-3">
+										{[
+											{ anyone: false, label: "Matching emails only" },
+											{ anyone: true, label: "Anyone with the link" },
+										].map((option) => (
+											<button
+												type="button"
+												aria-pressed={linkAnyone === option.anyone}
+												key={option.label}
+												onClick={() => setLinkAnyone(option.anyone)}
+												className={clsx(
+													"px-2 py-1.5 text-xs font-medium rounded-md transition-colors",
+													linkAnyone === option.anyone
+														? "bg-gray-1 text-gray-12 shadow-sm"
+														: "text-gray-10 hover:text-gray-12",
+												)}
+											>
+												{option.label}
+											</button>
+										))}
+									</div>
+								)}
+							</div>
+
+							<div className="p-3 mb-4 rounded-lg border bg-gray-1 border-gray-4">
+								<div className="flex items-center justify-between gap-2">
+									<p className="text-sm font-medium text-gray-12">
+										People with access
+									</p>
+									<Button
+										size="xs"
+										variant="gray"
+										className="shrink-0 whitespace-nowrap"
+										onClick={copyShareUrl}
+									>
+										<FontAwesomeIcon icon={faCopy} className="size-3 mr-1" />
+										Copy link
+									</Button>
+								</div>
+								<p className="mt-1 mb-2 text-xs text-gray-10">
+									Invite someone by email. They can view with a Cap account
+									using that address.
+								</p>
+								<div className="flex gap-2">
+									<Input
+										className="min-w-0 flex-1"
+										type="email"
+										placeholder="viewer@example.com"
+										value={viewerEmail}
+										disabled={inviteViewer.isPending}
+										onChange={(event) => setViewerEmail(event.target.value)}
+									/>
+									<Button
+										size="sm"
+										variant="dark"
+										className="shrink-0"
+										spinner={inviteViewer.isPending}
+										disabled={
+											inviteViewer.isPending ||
+											!viewerEmail.trim() ||
+											publicToggle !== initialPublicState
+										}
+										onClick={() => inviteViewer.mutate()}
+									>
+										Invite
+									</Button>
+								</div>
+								{publicToggle !== initialPublicState && (
+									<p className="mt-2 text-xs text-gray-10">
+										Save the link access change before inviting viewers.
+									</p>
+								)}
+								{viewerGrants.isError && (
+									<p className="mt-2 text-xs text-red-11">
+										Could not load invited viewers.
+									</p>
+								)}
+								{viewerGrants.data && viewerGrants.data.length > 0 && (
+									<div className="mt-3 space-y-1">
+										{viewerGrants.data.map(({ email }) => (
+											<div
+												key={email}
+												className="flex items-center justify-between gap-2 text-xs text-gray-11"
+											>
+												<span className="truncate">{email}</span>
+												<Button
+													size="xs"
+													variant="gray"
+													disabled={revokeViewer.isPending}
+													onClick={() => revokeViewer.mutate(email)}
+												>
+													Remove
+												</Button>
+											</div>
+										))}
+									</div>
+								)}
+							</div>
+
+							{inheritedPasswordLabel && (
+								<div className="flex justify-between items-center p-3 mb-4 rounded-lg border bg-gray-1 border-gray-4">
+									<div className="flex gap-3 items-center">
+										<div className="flex justify-center items-center w-8 h-8 rounded-full bg-gray-3">
+											<Lock className="w-4 h-4 text-gray-11" />
+										</div>
+										<div>
+											<p className="text-sm font-medium text-gray-12">
+												Password required
+											</p>
+											<p className="text-xs text-gray-10">
+												{inheritedPasswordLabel}
+											</p>
+										</div>
+									</div>
+									<Switch checked disabled />
+								</div>
+							)}
+
+							<div
+								className={clsx(
+									"mb-4 rounded-lg border bg-gray-1 border-gray-4",
+									passwordEnabled && "overflow-hidden",
+								)}
+							>
+								<div className="flex justify-between items-center p-3">
+									<div className="flex gap-3 items-center">
+										<div className="flex justify-center items-center w-8 h-8 rounded-full bg-gray-3">
+											<Lock className="w-4 h-4 text-gray-11" />
+										</div>
+										<div>
+											<p className="text-sm font-medium text-gray-12">
+												{passwordEnabled
+													? initialPasswordEnabled
+														? "Password protected"
+														: "Password protection"
+													: inheritedPasswordLabel
+														? "Add another password"
+														: "Add password"}
+											</p>
+											<p className="text-xs text-gray-10">
+												{passwordEnabled
+													? inheritedPasswordLabel
+														? "Viewers can use this password or a space password"
+														: "Viewers must enter a password to view"
+													: "Restrict access with a password"}
+											</p>
+										</div>
+									</div>
+									<Switch
+										checked={passwordEnabled}
+										onCheckedChange={handlePasswordToggle}
+									/>
+								</div>
+								{passwordEnabled && (
+									<div className="px-3 pb-3">
+										<Input
+											type="password"
+											placeholder={
+												initialPasswordEnabled
+													? "Enter new password"
+													: "Set a password"
+											}
+											value={passwordValue}
+											onChange={(e) => setPasswordValue(e.target.value)}
+										/>
+										{initialPasswordEnabled && !passwordValue && (
+											<p className="mt-1.5 text-xs text-gray-9">
+												Leave blank to keep existing password
+											</p>
+										)}
+									</div>
+								)}
+							</div>
+
+							<div className="rounded-lg border bg-gray-1 border-gray-4">
+								<div
+									className={clsx(
+										libraryDoodleHost,
+										"flex gap-3 items-center p-3 pb-2",
+									)}
+								>
+									<span className="flex justify-center items-center rounded-full size-8 shrink-0 bg-gray-3">
+										<SpaceDoodle size={20} />
+									</span>
+									<div className="min-w-0">
+										<p className="text-sm font-medium text-gray-12">Spaces</p>
+										<p className="text-xs text-gray-10 text-pretty">
+											Members of a space can watch it there. It also stays in My
+											Caps. To file it in a folder, use Move.
+										</p>
+									</div>
+								</div>
+								{allShareableItems.length > SPACE_SEARCH_THRESHOLD && (
+									<div className="relative px-3 pb-2">
+										<Search className="absolute left-6 top-1/2 size-4 -translate-y-1/2 pointer-events-none text-gray-9" />
+										<Input
+											type="text"
+											placeholder="Search spaces"
+											aria-label="Search spaces"
+											value={searchTerm}
+											className="pl-9 h-9"
+											onChange={(e) => setSearchTerm(e.target.value)}
+										/>
+									</div>
+								)}
+								<div className="overflow-y-auto pb-1 max-h-56 custom-scroll">
+									{filteredSpaces.length > 0 ? (
+										filteredSpaces.map((space) => (
+											<SpaceRow
+												key={space.id}
+												space={space}
+												selected={selectedSpaces.has(space.id)}
+												onToggle={() => handleToggleSpace(space.id)}
+											/>
+										))
+									) : (
+										<p className="px-3 py-4 text-sm text-center text-gray-10">
+											{allShareableItems.length > 0
+												? "No spaces match your search"
+												: "No spaces yet"}
+										</p>
+									)}
+								</div>
+							</div>
+						</>
+					) : (
+						<div className="space-y-4">
+							<div className="p-3 rounded-lg border bg-gray-3 border-gray-4">
+								<code className="font-mono text-xs break-all text-gray-11">
+									{embedCode}
+								</code>
+							</div>
+							<EmbedOptionsFields
+								value={embedToggles}
+								onChange={setEmbedToggles}
+								canHideBranding={canHideEmbedBranding}
+							/>
+							<Button
+								className="w-full font-medium"
+								variant="dark"
+								onClick={handleCopyEmbedCode}
+							>
+								<FontAwesomeIcon icon={faCopy} className="size-3.5 mr-1" />
+								Copy embed code
+							</Button>
+						</div>
+					)}
+				</div>
+
+				<DialogFooter className="p-5 border-t border-gray-4">
+					{activeTab === "Share" ? (
+						<>
+							<Button size="sm" variant="gray" onClick={onClose}>
+								Cancel
+							</Button>
+							<Button
+								spinner={updateSharing.isPending}
+								disabled={updateSharing.isPending}
+								size="sm"
+								variant="dark"
+								onClick={() => {
+									if (
+										passwordEnabled &&
+										!initialPasswordEnabled &&
+										!passwordValue.trim()
+									) {
+										toast.error("Please enter a password");
+										return;
+									}
+									updateSharing.mutate({
+										capId,
+										spaceIds: Array.from(selectedSpaces).map((v) =>
+											Space.SpaceId.make(v),
+										),
+										public: publicToggle,
+									});
+								}}
+							>
+								{updateSharing.isPending ? "Saving..." : "Save"}
+							</Button>
+						</>
+					) : (
+						<Button size="sm" variant="gray" onClick={onClose}>
+							Close
+						</Button>
+					)}
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
+	);
+};
+
+const SPACE_SEARCH_THRESHOLD = 6;
+
+const SpaceRow = ({
+	space,
+	selected,
+	onToggle,
+}: {
+	space: {
+		id: string;
+		name: string;
+		iconUrl?: ImageUpload.ImageUrl | null;
+		hasPassword?: boolean;
+	};
+	selected: boolean;
+	onToggle: () => void;
+}) => (
+	<button
+		type="button"
+		aria-pressed={selected}
+		title={space.name}
+		onClick={onToggle}
+		className="flex gap-3 items-center px-3 w-full h-11 text-left transition-colors hover:bg-gray-3"
+	>
+		<SignedImageUrl
+			image={space.iconUrl}
+			name={space.name}
+			letterClass="text-[11px]"
+			className="flex-shrink-0 size-5"
+		/>
+		<span className="flex-1 min-w-0 text-sm truncate text-gray-12">
+			{space.name}
+		</span>
+		{space.hasPassword && (
+			<Lock
+				aria-label="Password protected"
+				className="size-3.5 text-amber-600"
+			/>
+		)}
+		<span
+			className={clsx(
+				"flex justify-center items-center rounded-md border transition-colors size-5 shrink-0",
+				selected ? "bg-blue-10 border-blue-10" : "border-gray-6 bg-gray-1",
+			)}
+		>
+			{selected && <Check className="text-white" size={12} strokeWidth={3} />}
+		</span>
+	</button>
+);
+
+function useEmbedCode(
+	capId: Video.VideoId,
+	options: ReturnType<typeof embedTogglesToOptions>,
+) {
+	const publicEnv = usePublicEnv();
+	const { showTitle, showOwner, showBranding, autoplay, muted } = options;
+
+	return useMemo(
+		() =>
+			buildEmbedCode({
+				webUrl: publicEnv.webUrl,
+				videoId: capId,
+				options: { showTitle, showOwner, showBranding, autoplay, muted },
+			}),
+		[
+			publicEnv.webUrl,
+			capId,
+			showTitle,
+			showOwner,
+			showBranding,
+			autoplay,
+			muted,
+		],
+	);
+}
