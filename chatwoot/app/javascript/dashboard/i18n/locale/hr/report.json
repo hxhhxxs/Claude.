@@ -1,0 +1,854 @@
+{
+  "MONITORS": {
+    "TITLE": "Praćenje tema",
+    "SLACK_ALERT": {
+      "TITLE": "Slack upozorenja",
+      "DESCRIPTION": "Objavi poruku u Slack kanalu kada ovaj nadzor prvi put pronađe razgovor koji odgovara novoj aktivnosti.",
+      "NONE": "Ne šalji upozorenja",
+      "PLACEHOLDER": "Odaberite kanal",
+      "LOADING": "Učitavanje kanala…",
+      "CONNECT": "Poveži Slack",
+      "ON": "Uključeno",
+      "OFF": "Isključeno",
+      "SAVED": "Slack upozorenja su ažurirana.",
+      "FETCH_FAILED": "Učitavanje kanala nije uspjelo. Otvorite za ponovni pokušaj.",
+      "SAVE_FAILED": "Ažuriranje Slack upozorenja nije uspjelo. Pokušajte ponovno."
+    },
+    "AUTOMATIONS": {
+      "TITLE": "Automatizacije",
+      "DESCRIPTION": "Pokrenite radnje kada ovo praćenje prvi put prepozna odgovarajući razgovor na temelju nove aktivnosti u stvarnom vremenu.",
+      "CREATE": "Izradi automatizaciju",
+      "EMPTY": "Još nijedna automatizacija nije povezana s ovim praćenjem.",
+      "ACTIVE": "Aktivno",
+      "DISABLED": "Onemogućeno",
+      "FETCH_FAILED": "Učitavanje povezanih automatizacija nije uspjelo."
+    },
+    "LIST": {
+      "CONVERSATIONS_COUNT": "{count} razgovor | {count} razgovora",
+      "CONVERSATIONS_HELP": "Broj razgovora koji odgovaraju ovom praćenju u posljednjih 7 dana.",
+      "RUNNING": "Izvođenje u tijeku",
+      "FETCH_FAILED": "Učitavanje praćenja nije uspjelo. Pokušajte ponovno.",
+      "PAGINATION": "Prikaz {startItem} – {endItem} od {totalItems} praćenja | Prikaz {startItem} – {endItem} od {totalItems} praćenja"
+    },
+    "DESCRIPTION": "Pratite važne teme u razgovorima s kupcima. Opišite temu jednostavnim engleskim jezikom, a praćenje će prikazivati odgovarajuće razgovore na grafikonu kako stižu nove poruke kupaca.",
+    "CREATE": "Izradi praćenje",
+    "PREVIEW": "Pregledaj podudaranja",
+    "PREVIEW_COOLDOWN": "Ponovni pregled bit će dostupan za {count} sekundu. | Ponovni pregled bit će dostupan za {count} sekundi.",
+    "PREVIEW_FAILED": "Pregled podudaranja nije uspio. Pokušajte ponovno.",
+    "PREVIEW_HELP": "{count} podudaranje u uzorku od {sampled} nedavnih razgovora ({excluded} bez upotrebljivog konteksta). Ovaj uzorak ne predstavlja potpun pregled. | {count} podudaranja u uzorku od {sampled} nedavnih razgovora ({excluded} bez upotrebljivog konteksta). Ovaj uzorak ne predstavlja potpun pregled.",
+    "NAME": "Ime",
+    "NAME_PLACEHOLDER": "Razgovori o povratu sredstava",
+    "CHOOSE_ICON": "Odaberi ikonu ili emotikon",
+    "CONDITION": "Koje razgovore ovo praćenje treba pronaći?",
+    "CONDITION_PLACEHOLDER": "Svi razgovori u kojima se spominje povrat sredstava",
+    "CREATE_HELP": "Provjerit ćemo razgovore izrađene u posljednjih sedam dana, a zatim nastaviti provjeravati nove poruke kupaca. Javni odgovori i postavljeni atributi kupaca daju kontekst. Privatne bilješke nisu uključene.",
+    "SECTIONS": {
+      "YOUR_MONITORS": "Vaša praćenja",
+      "TEMPLATES": "Predlošci"
+    },
+    "TEMPLATES": {
+      "TITLE": "Započnite s predloškom",
+      "USE_NAMED": "Koristi predložak {name}",
+      "EDIT_HINT": "Na temelju predloška {name}. Prije izrade možete sve urediti.",
+      "ADMIN_HELP": "Zatražite od administratora da izradi praćenje iz predloška.",
+      "LOGIN_PROBLEMS": {
+        "NAME": "Problemi s prijavom",
+        "AUDIENCE": "Za timove podrške",
+        "SUMMARY": "Uočite kada pritužbe na prijavu počnu rasti.",
+        "CONDITION": "Kupac navodi da se ne može prijaviti na svoj račun, uključujući neuspjele ponovne postavke lozinke i kodove za provjeru koji ne stižu. Isključite pitanja o promjeni lozinke kada je korisnik već prijavljen."
+      },
+      "MISSING_ORDER_UPDATES": {
+        "NAME": "Nedostaju obavijesti o narudžbi",
+        "AUDIENCE": "Za operativne timove",
+        "SUMMARY": "Pratite ponavljajuće probleme u komunikaciji o dostavi.",
+        "CONDITION": "Kupac navodi da potvrda narudžbe, obavijest o slanju ili obavijest o dostavi nije stigla ili je stigla za pogrešnu narudžbu. Isključite kupce koji pitaju gdje je paket, a primili su e-poruku za praćenje."
+      },
+      "COMPETITOR_MENTIONS": {
+        "NAME": "Spominjanje konkurencije",
+        "AUDIENCE": "Za osnivače i prodajne timove",
+        "SUMMARY": "Pronađite razgovore na koje se vrijedi naknadno javiti.",
+        "CONDITION": "Kupac nas uspoređuje s konkurentskim proizvodom, navodi da ga razmatra ili spominje mogućnost prelaska na njega. Isključite kupce koji su nam prešli od konkurencije i pitaju kako uvesti svoje podatke."
+      },
+      "FEATURE_REQUESTS": {
+        "NAME": "Zahtjevi za novim značajkama",
+        "AUDIENCE": "Za timove za razvoj proizvoda",
+        "SUMMARY": "Kontinuirano pratite broj razgovora o nezadovoljenim potrebama.",
+        "CONDITION": "Kupac traži mogućnost koju proizvod trenutačno ne nudi ili pita je li nešto moguće, a nije. Isključite pitanja o korištenju postojeće značajke."
+      },
+      "REFUND_REQUESTS": {
+        "NAME": "Zahtjevi za povrat sredstava",
+        "AUDIENCE": "Za financijske timove",
+        "SUMMARY": "Ujednačite kriterije za tjedno brojanje zahtjeva za povrat sredstava.",
+        "CONDITION": "Kupac traži povrat već izvršenog plaćanja, uključujući dvostruke naplate i povrate nakon otkazivanja. Isključite pitanja o pravilima povrata sredstava i zahtjeve za popust."
+      },
+      "CANCELLATION_INTENT": {
+        "NAME": "Namjera otkazivanja",
+        "AUDIENCE": "Za voditelje odnosa s klijentima",
+        "SUMMARY": "Pronađite kupce s kojima bi trebalo razgovarati prije nego što odu.",
+        "CONDITION": "Kupac navodi da namjerava otkazati, da neće obnoviti pretplatu ili da planira prestati koristiti proizvod. Isključite zahtjeve za smanjenje broja korisničkih mjesta ili prelazak na niži paket te otkazivanja od kojih kupac odustane u istom razgovoru."
+      },
+      "PAYMENT_FAILURES": {
+        "NAME": "Neuspjela plaćanja",
+        "AUDIENCE": "Za timove naplate i podrške",
+        "SUMMARY": "Prepoznajte kupce koji ne mogu izvršiti plaćanje.",
+        "CONDITION": "Kupac navodi da plaćanje, završetak kupnje ili plaćanje računa nije uspjelo ili da je kartica odbijena. Isključite zahtjeve za povrat sredstava, sporove oko izvršenih naplata i opća pitanja o načinima plaćanja."
+      },
+      "PRODUCT_ERRORS": {
+        "NAME": "Pogreške proizvoda",
+        "AUDIENCE": "Za timove podrške i tehničkog razvoja",
+        "SUMMARY": "Uočite kada se pogreške i rušenja počnu širiti.",
+        "CONDITION": "Kupac prijavljuje pogrešku, rušenje, nedostupnu uslugu ili izrazitu sporost koja ga sprječava u izvršavanju zadatka. Isključite probleme s prijavom i pitanja o korištenju značajke koja ispravno radi."
+      },
+      "ISSUE_STILL_UNRESOLVED": {
+        "NAME": "Problem još nije riješen",
+        "AUDIENCE": "Za voditelje podrške",
+        "SUMMARY": "Pronađite razgovore koje treba ponovno pregledati.",
+        "CONDITION": "Kupac navodi da predloženo rješenje nije pomoglo, da se isti problem vratio ili da problem i dalje postoji nakon što ga je podrška proglasila riješenim. Isključite prve prijave i zahtjeve koji traže samo obavijest o statusu."
+      },
+      "ESCALATION_REQUESTS": {
+        "NAME": "Zahtjevi za eskalaciju",
+        "AUDIENCE": "Za voditelje podrške",
+        "SUMMARY": "Istaknite zahtjeve koje treba brzo razmotriti.",
+        "CONDITION": "Kupac izričito traži djelatnika, voditelja, stručnjaka ili višu razinu podrške jer njegov problem nije riješen. Isključite uobičajene prijenose i prodajne upite."
+      }
+    },
+    "MATCHING_CONVERSATIONS": "Izrađeni razgovori koji odgovaraju uvjetima",
+    "LAST_DAYS": "Posljednji {count} dan | Posljednjih {count} dana",
+    "LAST_DAYS_BEFORE_PAUSE": "{count} dan prije pauziranja | {count} dana prije pauziranja",
+    "GROUP_BY": "Grupiraj prema intervalu {interval}",
+    "INTERVALS": {
+      "HOUR": "1 sat",
+      "SIX_HOURS": "6 sati",
+      "DAY": "1 dan"
+    },
+    "EDIT": "Uredi",
+    "UPDATE": "Ažuriraj",
+    "MONITOR_DESCRIPTION": "Opis",
+    "EDIT_HELP": "Opis određuje koji razgovori odgovaraju uvjetima. Njegovom promjenom brišu se postojeća podudaranja i ponovno provjeravaju prethodno provjereni razgovori. Preskočena razdoblja ostaju preskočena. Ako je praćenje pauzirano, ponovna provjera počinje nakon nastavka.",
+    "DUPLICATE": "Dupliciraj",
+    "PAUSE": "Pauziraj",
+    "RESUME": "Nastavi",
+    "RESUME_HELP": "Odaberite odakle ovo praćenje treba nastaviti. Postojeći rezultati ostat će dostupni.",
+    "RESUME_CATCH_UP": "Provjeri razdoblje pauze",
+    "RESUME_CATCH_UP_HELP": "Provjerite razgovore izrađene i poruke kupaca primljene od pauziranja praćenja do sada, a zatim nastavite ažuriranje u stvarnom vremenu.",
+    "RESUME_FROM_NOW": "Počni od sada",
+    "RESUME_FROM_NOW_HELP": "Od sada provjeravajte samo nove poruke kupaca i razgovore. Nemojte provjeravati razdoblje pauze.",
+    "DELETE": "Izbriši",
+    "DELETE_HELP": "Izbrisati ovo praćenje i njegove rezultate? Time se ne brišu razgovori.",
+    "PAUSE_HELP": "Pauzirati ovo praćenje? Njegovi rezultati ostat će dostupni, a provjera poruka i razgovora prestat će.",
+    "PAUSED_HELP": "Pauzirano {time}. Prethodni rezultati ostaju dostupni. Nove poruke i razgovori ne provjeravaju se.",
+    "COLLECTED_UNTIL": "Rezultati prikupljeni do {time}.",
+    "RETRY": "Pokušaj ponovno",
+    "RESULTS_UPDATED": "Dostupni su novi rezultati. Grafikon je osvježen. Odaberite stupac za prikaz ažuriranog popisa razgovora.",
+    "TIME_BASIS_HELP": "Svaki razgovor broji se jednom, na datum izrade. Novo podudaranje može ažurirati raniji stupac.",
+    "COVERAGE_HELP": "Ovaj raspon uključuje razdoblja koja nisu potpuno provjerena. Brojčani podaci mogu biti nepotpuni.",
+    "REFRESHED": "Posljednje osvježavanje: {time}. Ažuriranja se prikazuju automatski.",
+    "USAGE": {
+      "LIMIT_REACHED": "Ovaj je račun potrošio mjesečno ograničenje od {limit} AI klasifikacijskih poziva. Nadzori, Captain uvjeti automatizacija te prijedlozi oznaka i prioriteta dijele to ograničenje.",
+      "RESETS": "Provjere i pregledi nadzora, Captain uvjeti automatizacija te prijedlozi oznaka i prioriteta nisu dostupni do {time}. Postojeći rezultati ostaju dostupni.",
+      "REACHED_AT": "Ograničenje je dosegnuto {time}."
+    },
+    "STATES": {
+      "SCANNING": "Provjera nedavnih razgovora",
+      "PROCESSING": "Provjera razgovora",
+      "RECHECKING": "Ponovna provjera razgovora prema ažuriranom opisu",
+      "LIVE": "Ažurno",
+      "DELAYED": "Ažuriranja kasne",
+      "NEEDS_ATTENTION": "Potrebna je provjera",
+      "PAUSED": "Pauzirano",
+      "CATCHING_UP": "Provjera razdoblja pauze"
+    },
+    "ERRORS": {
+      "FETCH_FAILED": "Učitavanje ovog praćenja nije uspjelo. Osvježite i pokušajte ponovno.",
+      "SAVE_FAILED": "Spremanje praćenja nije uspjelo. Provjerite naziv i uvjet pa pokušajte ponovno.",
+      "NOT_CONFIGURED": "Postavite vezu s uslugom OpenRouter, a zatim kliknite Pokušaj ponovno.",
+      "CREDENTIALS_INVALID": "Potrebno je provjeriti vezu s uslugom OpenRouter. Zatražite od administratora instalacije da provjeri pristupne podatke.",
+      "PROVIDER_CREDITS_EXHAUSTED": "OpenRouter račun nema dovoljno kredita. Zatražite od administratora instalacije da provjeri stanje pa pokušajte ponovno.",
+      "INVALID_REQUEST": "Potrebno je provjeriti zahtjev za procjenu. Obratite se administratoru instalacije.",
+      "INVALID_RESPONSE": "Pružatelj usluge procjene vratio je nepotpun rezultat. Zahvaćeni razgovori nisu uračunati.",
+      "PROVIDER_BUSY": "Pružatelj usluge procjene je zauzet. Razgovore na čekanju potrebno je ponovno procijeniti.",
+      "PROVIDER_UNAVAILABLE": "Pružatelj usluge procjene privremeno nije dostupan. Ažuriranja mogu kasniti.",
+      "BUDGET_LIMIT": "Dosegnuto je dnevno ograničenje procjena. Obrada na čekanju nastavit će se kada ograničenje bude poništeno za novo razdoblje.",
+      "MONTHLY_LIMIT": "Ovaj je račun dosegnuo zajedničko mjesečno ograničenje AI klasifikacija. Provjere na čekanju nastavit će se sljedeći mjesec.",
+      "CONTEXT_LIMIT": "Neki su razgovori predugi za potpunu procjenu. Isključeni su iz rezultata.",
+      "INVALID_PARAMETERS": "Provjerite naziv, uvjet, datumski raspon i interval.",
+      "TOO_MANY_BUCKETS": "Odaberite kraći datumski raspon ili veći interval. Grafikon može prikazati najviše 744 stupca.",
+      "MONITOR_LIMIT": "Ovaj je račun dosegnuo ograničenje aktivnih praćenja. Pauzirajte jedno praćenje prije izrade novog.",
+      "MONITOR_PAUSED": "Ovo je praćenje pauzirano i više ne provjerava razgovore.",
+      "MONITOR_CHANGED": "Ovo je praćenje promijenjeno u drugoj sesiji. Njegovo trenutačno stanje je osvježeno. Pokušajte ponovno."
+    }
+  },
+  "REPORT": {
+    "HEADER": "Conversations",
+    "LOADING_CHART": "Loading chart data...",
+    "NO_ENOUGH_DATA": "We've not received enough data points to generate report, Please try again later.",
+    "DOWNLOAD_CONVERSATION_REPORTS": "Download conversation reports",
+    "DATA_FETCHING_FAILED": "Failed to fetch data, please try again later.",
+    "SUMMARY_FETCHING_FAILED": "Failed to fetch summary, please try again later.",
+    "METRICS": {
+      "CONVERSATIONS": {
+        "NAME": "Conversations",
+        "DESC": "( Total )"
+      },
+      "INCOMING_MESSAGES": {
+        "NAME": "Incoming Messages",
+        "DESC": "( Total )"
+      },
+      "OUTGOING_MESSAGES": {
+        "NAME": "Outgoing Messages",
+        "DESC": "( Total )"
+      },
+      "FIRST_RESPONSE_TIME": {
+        "NAME": "First Response Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_DESCRIPTION": "Na temelju {count} razgovora | Na temelju {count} razgovora",
+        "TOOLTIP_TEXT": "First Response Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_TIME": {
+        "NAME": "Resolution Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_DESCRIPTION": "Na temelju {count} razgovora | Na temelju {count} razgovora",
+        "TOOLTIP_TEXT": "Resolution Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_COUNT": {
+        "NAME": "Resolution Count",
+        "DESC": "( Total )"
+      },
+      "BOT_RESOLUTION_COUNT": {
+        "NAME": "Resolution Count",
+        "DESC": "( Total )"
+      },
+      "BOT_HANDOFF_COUNT": {
+        "NAME": "Handoff Count",
+        "DESC": "( Total )"
+      },
+      "REPLY_TIME": {
+        "NAME": "Customer waiting time",
+        "TOOLTIP_LABEL": "Vrijeme čekanja",
+        "TOOLTIP_DESCRIPTION": "Na temelju {count} odgovora | Na temelju {count} odgovora",
+        "TOOLTIP_TEXT": "Waiting time is {metricValue} (based on {conversationCount} replies)",
+        "DESC": ""
+      }
+    },
+    "DATE_RANGE_OPTIONS": {
+      "LAST_7_DAYS": "Last 7 days",
+      "LAST_14_DAYS": "Last 14 days",
+      "LAST_30_DAYS": "Last 30 days",
+      "THIS_MONTH": "This month",
+      "LAST_MONTH": "Last month",
+      "LAST_3_MONTHS": "Last 3 months",
+      "LAST_6_MONTHS": "Last 6 months",
+      "LAST_YEAR": "Last year",
+      "CUSTOM_DATE_RANGE": "Custom date range"
+    },
+    "CUSTOM_DATE_RANGE": {
+      "CONFIRM": "Apply",
+      "PLACEHOLDER": "Select date range"
+    },
+    "GROUP_BY_FILTER_DROPDOWN_LABEL": "Group By",
+    "DURATION_FILTER_LABEL": "Duration",
+    "GROUPING_OPTIONS": {
+      "DAY": "Day",
+      "WEEK": "Week",
+      "MONTH": "Month",
+      "YEAR": "Month"
+    },
+    "GROUP_BY_DAY_OPTIONS": [
+      {
+        "id": 1,
+        "groupBy": "Day"
+      }
+    ],
+    "GROUP_BY_WEEK_OPTIONS": [
+      {
+        "id": 1,
+        "groupBy": "Day"
+      },
+      {
+        "id": 2,
+        "groupBy": "Week"
+      }
+    ],
+    "GROUP_BY_MONTH_OPTIONS": [
+      {
+        "id": 1,
+        "groupBy": "Day"
+      },
+      {
+        "id": 2,
+        "groupBy": "Week"
+      },
+      {
+        "id": 3,
+        "groupBy": "Month"
+      }
+    ],
+    "GROUP_BY_YEAR_OPTIONS": [
+      {
+        "id": 1,
+        "groupBy": "Day"
+      },
+      {
+        "id": 2,
+        "groupBy": "Week"
+      },
+      {
+        "id": 3,
+        "groupBy": "Month"
+      }
+    ],
+    "BUSINESS_HOURS": "Business Hours",
+    "FILTER_ACTIONS": {
+      "CLEAR_FILTER": "Clear filter",
+      "EMPTY_LIST": "Nisu pronađeni rezultati"
+    },
+    "DRILLDOWN": {
+      "TITLE": "Pojedinosti pokazatelja: {metric}",
+      "RESULT_COUNT_CONVERSATION": "{count} razgovor | {count} razgovora",
+      "RESULT_COUNT_MESSAGE": "{count} poruka | {count} poruka",
+      "EMPTY": "Nisu pronađeni zapisi za ovaj stupac.",
+      "ERROR": "Učitavanje zapisa nije uspjelo. Pokušajte ponovno.",
+      "ADMIN_ONLY": "Samo administratori mogu pregledavati pojedinačne zapise izvještaja.",
+      "LOAD_MORE": "Učitaj više",
+      "PREVIOUS_BUCKET": "Prethodni stupac",
+      "NEXT_BUCKET": "Sljedeći stupac",
+      "VIEW_ALL": "Prikaži sve",
+      "UNKNOWN_CONTACT": "Nepoznati kontakt",
+      "UNKNOWN_INBOX": "Nepoznati pretinac",
+      "UNASSIGNED_AGENT": "Nedodijeljeno",
+      "NO_MESSAGE_CONTENT": "Nema sadržaja poruke",
+      "MESSAGE_CREATED_AT": "Poruka je izrađena {time}",
+      "EVENT_OCCURRED_AT": "Događaj se dogodio {time}",
+      "INCOMING_MESSAGE": "Dolazna poruka",
+      "OUTGOING_MESSAGE": "Odlazna poruka"
+    },
+    "PAGINATION": {
+      "RESULTS": "Showing {start} to {end} of {total} results",
+      "PER_PAGE_TEMPLATE": "{size} / page"
+    }
+  },
+  "AGENT_REPORTS": {
+    "HEADER": "Agents Overview",
+    "DESCRIPTION": "Easily track agent performance with key metrics such as conversations, response times, resolution times, and resolved cases. Click an agent's name to learn more.",
+    "LOADING_CHART": "Loading chart data...",
+    "NO_ENOUGH_DATA": "We've not received enough data points to generate report, Please try again later.",
+    "DOWNLOAD_AGENT_REPORTS": "Download agent reports",
+    "FILTER_DROPDOWN_LABEL": "Select Agent",
+    "FILTERS": {
+      "INPUT_PLACEHOLDER": {
+        "AGENTS": "Search agents"
+      }
+    },
+    "METRICS": {
+      "CONVERSATIONS": {
+        "NAME": "Conversations",
+        "DESC": "( Total )"
+      },
+      "INCOMING_MESSAGES": {
+        "NAME": "Incoming Messages",
+        "DESC": "( Total )"
+      },
+      "OUTGOING_MESSAGES": {
+        "NAME": "Outgoing Messages",
+        "DESC": "( Total )"
+      },
+      "FIRST_RESPONSE_TIME": {
+        "NAME": "First Response Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "First Response Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_TIME": {
+        "NAME": "Resolution Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "Resolution Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_COUNT": {
+        "NAME": "Resolution Count",
+        "DESC": "( Total )"
+      }
+    },
+    "DATE_RANGE": [
+      {
+        "id": 0,
+        "name": "Last 7 days"
+      },
+      {
+        "id": 1,
+        "name": "Last 30 days"
+      },
+      {
+        "id": 2,
+        "name": "Last 3 months"
+      },
+      {
+        "id": 3,
+        "name": "Last 6 months"
+      },
+      {
+        "id": 4,
+        "name": "Last year"
+      },
+      {
+        "id": 5,
+        "name": "Custom date range"
+      }
+    ],
+    "CUSTOM_DATE_RANGE": {
+      "CONFIRM": "Apply",
+      "PLACEHOLDER": "Select date range"
+    }
+  },
+  "LABEL_REPORTS": {
+    "HEADER": "Labels Overview",
+    "DESCRIPTION": "Track label performance with key metrics including conversations, response times, resolution times, and resolved cases. Click a label name for detailed insights.",
+    "LOADING_CHART": "Loading chart data...",
+    "NO_ENOUGH_DATA": "We've not received enough data points to generate report, Please try again later.",
+    "DOWNLOAD_LABEL_REPORTS": "Download label reports",
+    "FILTER_DROPDOWN_LABEL": "Select Label",
+    "FILTERS": {
+      "INPUT_PLACEHOLDER": {
+        "LABELS": "Search labels"
+      }
+    },
+    "METRICS": {
+      "CONVERSATIONS": {
+        "NAME": "Conversations",
+        "DESC": "( Total )"
+      },
+      "INCOMING_MESSAGES": {
+        "NAME": "Incoming Messages",
+        "DESC": "( Total )"
+      },
+      "OUTGOING_MESSAGES": {
+        "NAME": "Outgoing Messages",
+        "DESC": "( Total )"
+      },
+      "FIRST_RESPONSE_TIME": {
+        "NAME": "First Response Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "First Response Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_TIME": {
+        "NAME": "Resolution Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "Resolution Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_COUNT": {
+        "NAME": "Resolution Count",
+        "DESC": "( Total )"
+      }
+    },
+    "DATE_RANGE": [
+      {
+        "id": 0,
+        "name": "Last 7 days"
+      },
+      {
+        "id": 1,
+        "name": "Last 30 days"
+      },
+      {
+        "id": 2,
+        "name": "Last 3 months"
+      },
+      {
+        "id": 3,
+        "name": "Last 6 months"
+      },
+      {
+        "id": 4,
+        "name": "Last year"
+      },
+      {
+        "id": 5,
+        "name": "Custom date range"
+      }
+    ],
+    "CUSTOM_DATE_RANGE": {
+      "CONFIRM": "Apply",
+      "PLACEHOLDER": "Select date range"
+    }
+  },
+  "INBOX_REPORTS": {
+    "HEADER": "Inbox Overview",
+    "DESCRIPTION": "Quickly view your inbox performance with key metrics like conversations, response times, resolution times, and resolved cases—all in one place. Click an inbox name for more details.",
+    "LOADING_CHART": "Loading chart data...",
+    "NO_ENOUGH_DATA": "We've not received enough data points to generate report, Please try again later.",
+    "DOWNLOAD_INBOX_REPORTS": "Download inbox reports",
+    "FILTER_DROPDOWN_LABEL": "Select Inbox",
+    "ALL_INBOXES": "All Inboxes",
+    "SEARCH_INBOX": "Search Inbox",
+    "FILTERS": {
+      "INPUT_PLACEHOLDER": {
+        "INBOXES": "Search inboxes"
+      }
+    },
+    "METRICS": {
+      "CONVERSATIONS": {
+        "NAME": "Conversations",
+        "DESC": "( Total )"
+      },
+      "INCOMING_MESSAGES": {
+        "NAME": "Incoming Messages",
+        "DESC": "( Total )"
+      },
+      "OUTGOING_MESSAGES": {
+        "NAME": "Outgoing Messages",
+        "DESC": "( Total )"
+      },
+      "FIRST_RESPONSE_TIME": {
+        "NAME": "First Response Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "First Response Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_TIME": {
+        "NAME": "Resolution Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "Resolution Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_COUNT": {
+        "NAME": "Resolution Count",
+        "DESC": "( Total )"
+      }
+    },
+    "DATE_RANGE": [
+      {
+        "id": 0,
+        "name": "Last 7 days"
+      },
+      {
+        "id": 1,
+        "name": "Last 30 days"
+      },
+      {
+        "id": 2,
+        "name": "Last 3 months"
+      },
+      {
+        "id": 3,
+        "name": "Last 6 months"
+      },
+      {
+        "id": 4,
+        "name": "Last year"
+      },
+      {
+        "id": 5,
+        "name": "Custom date range"
+      }
+    ],
+    "CUSTOM_DATE_RANGE": {
+      "CONFIRM": "Apply",
+      "PLACEHOLDER": "Select date range"
+    }
+  },
+  "TEAM_REPORTS": {
+    "HEADER": "Team Overview",
+    "DESCRIPTION": "Get a snapshot of your team's performance with essential metrics, including conversations, response times, resolution times, and resolved cases. Click a team name for more details.",
+    "LOADING_CHART": "Loading chart data...",
+    "NO_ENOUGH_DATA": "We've not received enough data points to generate report, Please try again later.",
+    "DOWNLOAD_TEAM_REPORTS": "Download team reports",
+    "FILTER_DROPDOWN_LABEL": "Select Team",
+    "FILTERS": {
+      "ADD_FILTER": "Dodaj filter",
+      "CLEAR_ALL": "Clear all",
+      "NO_FILTER": "No filters available",
+      "INPUT_PLACEHOLDER": {
+        "TEAMS": "Search teams"
+      }
+    },
+    "METRICS": {
+      "CONVERSATIONS": {
+        "NAME": "Conversations",
+        "DESC": "( Total )"
+      },
+      "INCOMING_MESSAGES": {
+        "NAME": "Incoming Messages",
+        "DESC": "( Total )"
+      },
+      "OUTGOING_MESSAGES": {
+        "NAME": "Outgoing Messages",
+        "DESC": "( Total )"
+      },
+      "FIRST_RESPONSE_TIME": {
+        "NAME": "First Response Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "First Response Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_TIME": {
+        "NAME": "Resolution Time",
+        "DESC": "( Avg )",
+        "INFO_TEXT": "Total number of conversations used for computation:",
+        "TOOLTIP_TEXT": "Resolution Time is {metricValue} (based on {conversationCount} conversations)"
+      },
+      "RESOLUTION_COUNT": {
+        "NAME": "Resolution Count",
+        "DESC": "( Total )"
+      }
+    },
+    "DATE_RANGE": [
+      {
+        "id": 0,
+        "name": "Last 7 days"
+      },
+      {
+        "id": 1,
+        "name": "Last 30 days"
+      },
+      {
+        "id": 2,
+        "name": "Last 3 months"
+      },
+      {
+        "id": 3,
+        "name": "Last 6 months"
+      },
+      {
+        "id": 4,
+        "name": "Last year"
+      },
+      {
+        "id": 5,
+        "name": "Custom date range"
+      }
+    ],
+    "CUSTOM_DATE_RANGE": {
+      "CONFIRM": "Apply",
+      "PLACEHOLDER": "Select date range"
+    }
+  },
+  "CSAT_REPORTS": {
+    "HEADER": "CSAT Reports",
+    "NO_RECORDS": "No responses yet",
+    "NO_RECORDS_DESCRIPTION": "CSAT survey responses will appear here once customers start providing feedback.",
+    "DOWNLOAD": "Download CSAT Reports",
+    "DOWNLOAD_FAILED": "Failed to download CSAT Reports",
+    "FILTERS": {
+      "ADD_FILTER": "Dodaj filter",
+      "CLEAR_ALL": "Clear all",
+      "NO_FILTER": "No filters available",
+      "INPUT_PLACEHOLDER": {
+        "AGENTS": "Search agents",
+        "INBOXES": "Search inboxes",
+        "TEAMS": "Search teams",
+        "RATINGS": "Search ratings"
+      },
+      "AGENTS": {
+        "LABEL": "Agent"
+      },
+      "INBOXES": {
+        "LABEL": "Inbox"
+      },
+      "TEAMS": {
+        "LABEL": "Tim"
+      },
+      "RATINGS": {
+        "LABEL": "Rating"
+      }
+    },
+    "TABLE": {
+      "HEADER": {
+        "CONTACT_NAME": "Contact",
+        "AGENT_NAME": "Agent",
+        "RATING": "Rating",
+        "FEEDBACK_TEXT": "Feedback comment",
+        "CONVERSATION": "Conversation",
+        "CUSTOMER": "Customer",
+        "RESPONSE": "Response",
+        "HANDLED_BY": "Handled by"
+      },
+      "UNKNOWN_CUSTOMER": "Unknown customer"
+    },
+    "NO_AGENT": "No assigned agent",
+    "NO_FEEDBACK": "No feedback provided",
+    "METRIC": {
+      "TOTAL_RESPONSES": {
+        "LABEL": "Total responses",
+        "TOOLTIP": "Total number of responses collected"
+      },
+      "SATISFACTION_SCORE": {
+        "LABEL": "Satisfaction score",
+        "TOOLTIP": "Total number of positive responses / Total number of responses * 100"
+      },
+      "RESPONSE_RATE": {
+        "LABEL": "Response rate",
+        "TOOLTIP": "Total number of responses / Total number of CSAT survey messages sent * 100"
+      },
+      "RATING_DISTRIBUTION": "Rating distribution"
+    },
+    "REVIEW_NOTES": {
+      "TITLE": "Review notes",
+      "PLACEHOLDER": "Add review notes about this rating...",
+      "SAVE": "Save",
+      "CANCEL": "Odustani",
+      "SAVING": "Saving...",
+      "SAVED": "Notes saved successfully",
+      "SAVE_ERROR": "Failed to save notes",
+      "UPDATED_BY": "Updated by {name} {time}",
+      "UPDATED_BY_LABEL": "Updated by",
+      "PAYWALL": {
+        "TITLE": "Upgrade to add review notes",
+        "AVAILABLE_ON": "The review notes feature is only available in the Business and Enterprise plans.",
+        "UPGRADE_PROMPT": "Add internal context to every CSAT response with review notes. Capture what really happened, spot patterns faster, and make better decisions from your feedback.",
+        "UPGRADE_NOW": "Upgrade now",
+        "CANCEL_ANYTIME": "You can change or cancel your plan anytime"
+      }
+    }
+  },
+  "BOT_REPORTS": {
+    "HEADER": "Bot Reports",
+    "METRIC": {
+      "TOTAL_CONVERSATIONS": {
+        "LABEL": "No. of Conversations",
+        "TOOLTIP": "Total number of conversations handled by the bot"
+      },
+      "TOTAL_RESPONSES": {
+        "LABEL": "Total Responses",
+        "TOOLTIP": "Total number of responses sent by the bot"
+      },
+      "RESOLUTION_RATE": {
+        "LABEL": "Resolution Rate",
+        "TOOLTIP": "Total number of conversations resolved by the bot / Total number of conversations handled by the bot * 100"
+      },
+      "HANDOFF_RATE": {
+        "LABEL": "Handoff Rate",
+        "TOOLTIP": "Total number of conversations handed off to agents / Total number of conversations handled by the bot * 100"
+      }
+    }
+  },
+  "OVERVIEW_REPORTS": {
+    "HEADER": "Pregled",
+    "LIVE": "Live",
+    "HEATMAP_ARIA_LABEL": "{metric} prema danu i satu",
+    "ACCOUNT_CONVERSATIONS": {
+      "HEADER": "Open Conversations",
+      "LOADING_MESSAGE": "Loading conversation metrics...",
+      "OPEN": "Open",
+      "UNATTENDED": "Unattended",
+      "UNASSIGNED": "Unassigned",
+      "PENDING": "Pending"
+    },
+    "CONVERSATION_HEATMAP": {
+      "HEADER": "Conversation Traffic",
+      "NO_CONVERSATIONS": "No conversations",
+      "CONVERSATION": "{count} conversation",
+      "CONVERSATIONS": "{count} conversations",
+      "DOWNLOAD_REPORT": "Download report"
+    },
+    "RESOLUTION_HEATMAP": {
+      "HEADER": "Resolutions",
+      "NO_CONVERSATIONS": "No conversations",
+      "CONVERSATION": "{count} conversation",
+      "CONVERSATIONS": "{count} conversations",
+      "DOWNLOAD_REPORT": "Download report"
+    },
+    "AGENT_CONVERSATIONS": {
+      "HEADER": "Conversations by agents",
+      "LOADING_MESSAGE": "Loading agent metrics...",
+      "NO_AGENTS": "There are no conversations by agents",
+      "TABLE_HEADER": {
+        "AGENT": "Agent",
+        "OPEN": "Open",
+        "UNATTENDED": "Unattended",
+        "STATUS": "Status"
+      }
+    },
+    "TEAM_CONVERSATIONS": {
+      "ALL_TEAMS": "All Teams",
+      "HEADER": "Conversations by teams",
+      "LOADING_MESSAGE": "Loading team metrics...",
+      "NO_TEAMS": "There is no data available",
+      "TABLE_HEADER": {
+        "TEAM": "Tim",
+        "OPEN": "Open",
+        "UNATTENDED": "Unattended",
+        "STATUS": "Status"
+      }
+    },
+    "AGENT_STATUS": {
+      "HEADER": "Agent status",
+      "ONLINE": "Online",
+      "BUSY": "Busy",
+      "OFFLINE": "Offline"
+    }
+  },
+  "DAYS_OF_WEEK": {
+    "SUNDAY": "Sunday",
+    "MONDAY": "Monday",
+    "TUESDAY": "Tuesday",
+    "WEDNESDAY": "Wednesday",
+    "THURSDAY": "Thursday",
+    "FRIDAY": "Friday",
+    "SATURDAY": "Saturday"
+  },
+  "SLA_REPORTS": {
+    "HEADER": "SLA Reports",
+    "NO_RECORDS": "SLA applied conversations are not available.",
+    "LOADING": "Loading SLA data...",
+    "DOWNLOAD_SLA_REPORTS": "Download SLA reports",
+    "DOWNLOAD_FAILED": "Failed to download SLA Reports",
+    "DROPDOWN": {
+      "ADD_FIlTER": "Dodaj filter",
+      "CLEAR_ALL": "Clear all",
+      "CLEAR_FILTER": "Clear filter",
+      "EMPTY_LIST": "Nisu pronađeni rezultati",
+      "NO_FILTER": "No filters available",
+      "SEARCH": "Search filter",
+      "INPUT_PLACEHOLDER": {
+        "SLA": "SLA name",
+        "AGENTS": "Agent name",
+        "INBOXES": "Inbox name",
+        "LABELS": "Label name",
+        "TEAMS": "Team name"
+      },
+      "SLA": "SLA Policy",
+      "INBOXES": "Inbox",
+      "AGENTS": "Agent",
+      "LABELS": "Label",
+      "TEAMS": "Tim"
+    },
+    "WITH": "with",
+    "METRICS": {
+      "HIT_RATE": {
+        "LABEL": "Hit Rate",
+        "TOOLTIP": "Percentage of SLAs created were completed successfully"
+      },
+      "NO_OF_MISSES": {
+        "LABEL": "Number of Misses",
+        "TOOLTIP": "Total SLA misses in a certain period"
+      },
+      "NO_OF_CONVERSATIONS": {
+        "LABEL": "Number of Conversations",
+        "TOOLTIP": "Total number of conversations with SLA"
+      }
+    },
+    "TABLE": {
+      "HEADER": {
+        "POLICY": "Policy",
+        "CONVERSATION": "Conversation",
+        "AGENT": "Agent"
+      },
+      "VIEW_DETAILS": "View Details"
+    }
+  },
+  "SUMMARY_REPORTS": {
+    "INBOX": "Inbox",
+    "AGENT": "Agent",
+    "TEAM": "Tim",
+    "LABEL": "Label",
+    "AVG_RESOLUTION_TIME": "Avg. Resolution Time",
+    "AVG_FIRST_RESPONSE_TIME": "Avg. First Response Time",
+    "AVG_REPLY_TIME": "Avg. Customer Waiting Time",
+    "RESOLUTION_COUNT": "Resolution Count",
+    "CONVERSATIONS": "No. of conversations"
+  }
+}

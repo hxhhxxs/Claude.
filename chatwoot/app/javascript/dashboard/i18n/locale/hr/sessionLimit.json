@@ -1,0 +1,12 @@
+{
+  "SESSION_LIMIT": {
+    "TITLE": "Dosegnuto je ograničenje aktivnih sesija",
+    "DESCRIPTION": "Dosegnuli ste dopušteni broj aktivnih sesija. Završite jednu sesiju prije prijave.",
+    "END": "Završi",
+    "END_ALL": "Završi sve sesije",
+    "LOG_IN": "Prijavi se",
+    "CANCEL": "Natrag na prijavu",
+    "UNKNOWN_DEVICE": "Nepoznati uređaj",
+    "STARTED": "Početak sesije"
+  }
+}

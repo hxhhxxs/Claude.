@@ -1,0 +1,53 @@
+{
+  "WHATSAPP_TEMPLATE_MGMT": {
+    "TITLE": "Predlošci",
+    "DESCRIPTION": "Pregledajte predloške poruka sinkronizirane iz svojih WhatsApp pretinaca. Za izradu ili uređivanje predloška upotrijebite sučelje svojeg pružatelja usluge.",
+    "COUNT": "{n} predložak | {n} predložaka",
+    "LEARN_MORE": "Saznajte više o WhatsApp predlošcima",
+    "SYNC_TEMPLATES": "Sinkroniziraj predloške",
+    "SYNC_SUCCESS": "Pokrenuta je sinkronizacija predložaka za sve WhatsApp pretince. Ažuriranje može potrajati nekoliko minuta.",
+    "PARTIAL_SYNC_ERROR": "Pokrenuta je sinkronizacija predložaka za neke WhatsApp pretince, ali za ostale nije uspjela.",
+    "SYNC_ERROR": "Pokretanje sinkronizacije predložaka nije uspjelo. Pokušajte ponovno.",
+    "SEARCH_PLACEHOLDER": "Pretraži prema sadržaju ili nazivu…",
+    "MANAGE_IN_META": "Upravljaj u Meti",
+    "MANAGE_IN_TWILIO": "Upravljaj u Twiliju",
+    "LOADING": "Učitavanje WhatsApp predložaka…",
+    "EMPTY": "Nisu pronađeni WhatsApp predlošci.",
+    "NO_RESULTS": "Nijedan predložak ne odgovara vašim filtrima.",
+    "FETCH_ERROR": "Učitavanje WhatsApp predložaka nije uspjelo. Pokušajte ponovno.",
+    "PARTIAL_FETCH_ERROR": "Učitavanje nekih WhatsApp predložaka nije uspjelo. Pokušajte ponovno.",
+    "LAST_SYNC_ATTEMPT": "Posljednji pokušaj sinkronizacije: {date}",
+    "MORE_INBOXES": "+{n}",
+    "STATUSES": {
+      "UNSUBMITTED": "Nije poslano WhatsAppu na odobrenje"
+    },
+    "FILTERS": {
+      "ALL_INBOXES": "Svi pretinci",
+      "ALL_LANGUAGES": "Svi jezici",
+      "ALL_TYPES": "Sve vrste"
+    },
+    "TYPES": {
+      "TEXT": "Tekst",
+      "IMAGE": "Slika",
+      "VIDEO": "Video",
+      "DOCUMENT": "Dokument",
+      "MEDIA": "Mediji",
+      "QUICK_REPLY": "Brzi odgovor",
+      "CALL_TO_ACTION": "Poziv na radnju",
+      "CATALOG": "Katalog",
+      "COPY_CODE": "Kopiraj kod"
+    },
+    "PREVIEW": {
+      "TITLE": "Pretpregled predloška",
+      "DESCRIPTION": "Pogledajte kako se ovaj predložak prikazuje u WhatsAppu.",
+      "OPEN": "Pretpregled predloška {name}",
+      "CLOSE": "Zatvori pretpregled",
+      "DETAILS": "Pojedinosti predloška",
+      "STATUS": "Status",
+      "TYPE": "Vrsta sadržaja",
+      "CATEGORY": "Kategorija",
+      "LANGUAGE": "Jezik",
+      "INBOXES": "Pretinci"
+    }
+  }
+}

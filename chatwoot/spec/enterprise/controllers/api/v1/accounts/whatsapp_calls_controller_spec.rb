@@ -1,0 +1,458 @@
+require 'rails_helper'
+
+RSpec.describe 'WhatsApp Calls API', type: :request do
+  let(:account) { create(:account) }
+  let(:agent) { create(:user, account: account, role: :agent) }
+  let(:channel) do
+    create(:channel_whatsapp, provider: 'whatsapp_cloud', account: account,
+                              validate_provider_config: false, sync_templates: false)
+  end
+  let(:inbox) { channel.inbox }
+  let(:conversation) { create(:conversation, account: account, inbox: inbox) }
+  let(:call) do
+    create(:call, account: account, inbox: inbox, conversation: conversation, contact: conversation.contact,
+                  provider: :whatsapp, direction: :incoming, status: 'ringing', provider_call_id: 'wacid_abc')
+  end
+  let(:provider_service) { instance_double(Whatsapp::Providers::WhatsappCloudService) }
+
+  before do
+    account.enable_features!('channel_voice')
+    channel.provider_config = channel.provider_config.merge('source' => 'embedded_signup', 'calling_enabled' => true)
+    channel.save!
+    create(:inbox_member, user: agent, inbox: inbox)
+    allow(Whatsapp::Providers::WhatsappCloudService).to receive(:new).and_return(provider_service)
+  end
+
+  describe 'GET /api/v1/accounts/:account_id/whatsapp_calls/:id' do
+    it 'returns the call payload' do
+      get "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}", headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      body = response.parsed_body
+      expect(body['id']).to eq(call.id)
+      expect(body['call_id']).to eq('wacid_abc')
+      expect(body['provider']).to eq('whatsapp')
+    end
+
+    it 'identifies the accepted answer by its digest, not its content' do
+      call.update!(meta: { 'sdp_answer' => 'v=0 answer' })
+
+      get "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}", headers: agent.create_new_auth_token
+
+      body = response.parsed_body
+      expect(body['answer_digest']).to eq(Digest::SHA256.hexdigest('v=0 answer'))
+      expect(response.body).not_to include('v=0 answer')
+    end
+
+    it 'returns 401 when unauthenticated' do
+      get "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}"
+      expect(response).to have_http_status(:unauthorized)
+    end
+
+    # acceptIncomingCall falls back to this payload when the ring broadcast raced the agent's click,
+    # so it must report the decision taken when the call started, not the inbox's current flag.
+    it 'reports the recording decision taken when the call started' do
+      call # created while the inbox still had recording on
+      channel.update!(provider_config: channel.provider_config.merge('recording_enabled' => false))
+
+      get "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}", headers: agent.create_new_auth_token
+
+      expect(response.parsed_body['recording_enabled']).to be true
+    end
+  end
+
+  describe 'POST /api/v1/accounts/:account_id/whatsapp_calls/:id/accept' do
+    it 'forwards SDP and returns the updated call payload' do
+      allow(provider_service).to receive(:pre_accept_call).and_return(true)
+      allow(provider_service).to receive(:accept_call).and_return(true)
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/accept",
+           params: { sdp_answer: 'sdp_answer' }, headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(call.reload.status).to eq('in_progress')
+    end
+
+    it 'returns 422 when sdp_answer is missing' do
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/accept",
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:unprocessable_entity)
+    end
+
+    it 'returns 409 when the call has already ended (caller hung up mid-ring)' do
+      call.update!(status: 'no_answer')
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/accept",
+           params: { sdp_answer: 'sdp_answer' }, headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:conflict)
+    end
+  end
+
+  describe 'POST /api/v1/accounts/:account_id/whatsapp_calls/:id/dismiss' do
+    it 'stops the ring for this agent only, without telling Meta' do
+      call.update!(ring_state: { 'ring_recipient_ids' => [agent.id] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/dismiss", headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(call.reload).to have_attributes(status: 'ringing', dismissed_user_ids: [agent.id])
+    end
+
+    it 'does not find a call the agent cannot open' do
+      outsider = create(:user, account: account, role: :agent)
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/dismiss", headers: outsider.create_new_auth_token
+
+      expect(response).to have_http_status(:unauthorized)
+    end
+  end
+
+  describe 'POST /api/v1/accounts/:account_id/whatsapp_calls/:id/reject' do
+    it 'rejects the call via Meta and returns its new status' do
+      allow(provider_service).to receive(:reject_call).and_return(true)
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/reject",
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(call.reload.status).to eq('rejected')
+    end
+  end
+
+  describe 'POST /api/v1/accounts/:account_id/whatsapp_calls/:id/terminate' do
+    it 'terminates the call via Meta and returns its new status' do
+      call.update!(status: 'in_progress')
+      allow(provider_service).to receive(:terminate_call).and_return(true)
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/terminate",
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(call.reload.status).to eq('completed')
+    end
+  end
+
+  describe 'POST /api/v1/accounts/:account_id/whatsapp_calls/initiate' do
+    let(:contact) { create(:contact, account: account, phone_number: '+15551234567') }
+    let!(:contact_inbox) { create(:contact_inbox, contact: contact, inbox: inbox, source_id: '15551234567') }
+    let(:initiate_conversation) do
+      create(:conversation, account: account, inbox: inbox, contact: contact, contact_inbox: contact_inbox)
+    end
+
+    it 'creates an outbound Call and returns calling status' do
+      allow(provider_service).to receive(:initiate_call).and_return({ 'calls' => [{ 'id' => 'wacid_outbound' }] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(response.parsed_body).to include('status' => 'calling', 'call_id' => 'wacid_outbound')
+      expect(Call.find_by(provider_call_id: 'wacid_outbound')).to have_attributes(direction: 'outgoing', status: 'ringing')
+    end
+
+    it 'uses the exact conversation BSUID when the contact has no phone number' do
+      contact.update!(phone_number: nil)
+      contact_inbox.update!(source_id: 'IN.2081978709342942')
+      expect(provider_service).to receive(:initiate_call)
+        .with('IN.2081978709342942', 'sdp_offer')
+        .and_return({ 'calls' => [{ 'id' => 'wacid_bsuid' }] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(Call.find_by(provider_call_id: 'wacid_bsuid').conversation).to eq(initiate_conversation)
+    end
+
+    it 'assigns the conversation to the agent placing the call when it is unassigned' do
+      allow(provider_service).to receive(:initiate_call).and_return({ 'calls' => [{ 'id' => 'wacid_outbound' }] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(initiate_conversation.reload.assignee_id).to eq(agent.id)
+    end
+
+    it 'keeps the existing assignee when the conversation is already assigned' do
+      other_agent = create(:user, account: account, role: :agent)
+      create(:inbox_member, user: other_agent, inbox: inbox)
+      initiate_conversation.update!(assignee: other_agent)
+      allow(provider_service).to receive(:initiate_call).and_return({ 'calls' => [{ 'id' => 'wacid_outbound' }] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(initiate_conversation.reload.assignee_id).to eq(other_agent.id)
+    end
+
+    it 'keeps the AgentBot owner when the conversation is already assigned' do
+      agent_bot = create(:agent_bot, account: account)
+      initiate_conversation.update!(ai_assignee: agent_bot)
+      allow(provider_service).to receive(:initiate_call).and_return({ 'calls' => [{ 'id' => 'wacid_outbound' }] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(initiate_conversation.reload.assigned_entity).to eq(agent_bot)
+    end
+
+    context 'when the contact messaged within the last 24 hours' do
+      before { create(:message, account: account, inbox: inbox, conversation: initiate_conversation, message_type: :incoming) }
+
+      it 'sends a permission request and records the wamid when Meta returns NoCallPermission' do
+        allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+        allow(provider_service).to receive(:send_call_permission_request).and_return({ 'messages' => [{ 'id' => 'wamid.req_xyz' }] })
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        # Controller deliberately returns 422 so clients can't mistake the permission-request path for a successful dial.
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['status']).to eq('permission_requested')
+        attrs = initiate_conversation.reload.additional_attributes
+        expect(attrs['call_permission_requested_at']).to be_present
+        expect(attrs['call_permission_request_message_id']).to eq('wamid.req_xyz')
+      end
+
+      it 'sends a call permission request to the exact conversation BSUID' do
+        contact.update!(phone_number: nil)
+        contact_inbox.update!(source_id: 'IN.2081978709342942')
+        allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+        expect(provider_service).to receive(:send_call_permission_request)
+          .with('IN.2081978709342942')
+          .and_return({ 'messages' => [{ 'id' => 'wamid.req_bsuid' }] })
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['status']).to eq('permission_requested')
+      end
+
+      it 'sends a contact-level request when the recent message is on a resolved thread' do
+        initiate_conversation.update!(status: :resolved)
+        allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+        allow(provider_service).to receive(:send_call_permission_request).and_return({ 'messages' => [{ 'id' => 'wamid.req_resolved' }] })
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { contact_id: contact.id, inbox_id: inbox.id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['status']).to eq('permission_requested')
+      end
+
+      it 'sends a contact-level request when an older open thread has no recent message' do
+        initiate_conversation.update!(status: :resolved)
+        create(:conversation, account: account, inbox: inbox, contact: contact, contact_inbox: contact_inbox, status: :open)
+        allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+        allow(provider_service).to receive(:send_call_permission_request).and_return({ 'messages' => [{ 'id' => 'wamid.req_open' }] })
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { contact_id: contact.id, inbox_id: inbox.id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['status']).to eq('permission_requested')
+      end
+
+      it 'sends a request from a thread with no recent message when another thread for the recipient has one' do
+        other_conversation = create(:conversation, account: account, inbox: inbox, contact: contact, contact_inbox: contact_inbox)
+        allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+        allow(provider_service).to receive(:send_call_permission_request).and_return({ 'messages' => [{ 'id' => 'wamid.req_other' }] })
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { conversation_id: other_conversation.display_id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['status']).to eq('permission_requested')
+      end
+
+      it 'returns permission_request_failed when send_call_permission_request raises a transport error' do
+        allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+        allow(provider_service).to receive(:send_call_permission_request).and_raise(Faraday::TimeoutError)
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.permission_request_failed'))
+      end
+    end
+
+    it 'sends a permission request when the contact answered an outbound call within the last 24 hours' do
+      create(:call, conversation: initiate_conversation, provider: :whatsapp, direction: :outgoing, status: 'completed',
+                    started_at: 2.hours.ago)
+      allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission)
+      allow(provider_service).to receive(:send_call_permission_request).and_return({ 'messages' => [{ 'id' => 'wamid.req_call' }] })
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(response.parsed_body['status']).to eq('permission_requested')
+    end
+
+    context 'when the contact has not messaged within the last 24 hours' do
+      before { allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::NoCallPermission) }
+
+      it 'refuses the permission request without sending anything' do
+        create(:message, account: account, inbox: inbox, conversation: initiate_conversation, message_type: :incoming,
+                         created_at: 25.hours.ago)
+        expect(provider_service).not_to receive(:send_call_permission_request)
+
+        expect do
+          post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+               params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+               headers: agent.create_new_auth_token
+        end.not_to have_enqueued_job(Conversations::ActivityMessageJob)
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.permission_window_closed'))
+        expect(initiate_conversation.reload.additional_attributes).not_to have_key('call_permission_request_message_id')
+      end
+
+      it 'refuses the permission request when a recent outbound call went unanswered' do
+        create(:call, conversation: initiate_conversation, provider: :whatsapp, direction: :outgoing, status: 'no_answer')
+        expect(provider_service).not_to receive(:send_call_permission_request)
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.permission_window_closed'))
+      end
+
+      it 'refuses a contact-level request when only a BSUID thread has recent messages' do
+        contact_inbox.update!(source_id: 'IN.2081978709342942')
+        create(:message, account: account, inbox: inbox, conversation: initiate_conversation, message_type: :incoming)
+        expect(provider_service).to receive(:initiate_call).with('15551234567', 'sdp_offer')
+        expect(provider_service).not_to receive(:send_call_permission_request)
+
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+             params: { contact_id: contact.id, inbox_id: inbox.id, sdp_offer: 'sdp_offer' },
+             headers: agent.create_new_auth_token
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.permission_window_closed'))
+      end
+
+      it 'does not create a conversation for a contact-level call with no thread' do
+        expect(provider_service).not_to receive(:send_call_permission_request)
+
+        expect do
+          post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+               params: { contact_id: contact.id, inbox_id: inbox.id, sdp_offer: 'sdp_offer' },
+               headers: agent.create_new_auth_token
+        end.not_to change(Conversation, :count)
+
+        expect(response).to have_http_status(:unprocessable_entity)
+        expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.permission_window_closed'))
+      end
+    end
+
+    it 'returns 422 when sdp_offer is missing' do
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:unprocessable_entity)
+    end
+
+    it 'returns 422 when Meta raises CallFailed for non-permission errors' do
+      allow(provider_service).to receive(:initiate_call).and_raise(Voice::CallErrors::CallFailed, 'Meta error')
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: initiate_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(response.parsed_body['error']).to eq('Meta error')
+    end
+
+    it 'returns 422 when a contact-level request has no phone number' do
+      contact.update!(phone_number: nil)
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { contact_id: contact.id, inbox_id: inbox.id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.contact_phone_required'))
+    end
+
+    it 'returns 422 when the conversation belongs to a non-WhatsApp inbox' do
+      twilio_channel = create(:channel_twilio_sms, :with_voice, account: account, phone_number: '+15551239998')
+      create(:inbox_member, user: agent, inbox: twilio_channel.inbox)
+      twilio_conversation = create(:conversation, account: account, inbox: twilio_channel.inbox)
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/initiate",
+           params: { conversation_id: twilio_conversation.display_id, sdp_offer: 'sdp_offer' },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(response.parsed_body['error']).to eq(I18n.t('errors.whatsapp.calls.not_enabled'))
+    end
+  end
+
+  describe 'POST /api/v1/accounts/:account_id/whatsapp_calls/:id/upload_recording' do
+    before do
+      message = create(:message, conversation: conversation, account: account, inbox: inbox,
+                                 content_type: 'voice_call', message_type: 'incoming')
+      call.update!(message_id: message.id)
+    end
+
+    it 'stores the recording on the call and queues its transcription' do
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/upload_recording",
+           params: { recording: fixture_file_upload(Rails.root.join('spec/assets/sample.ogg'), 'audio/ogg') },
+           headers: agent.create_new_auth_token
+
+      expect(response).to have_http_status(:ok)
+      expect(response.parsed_body['status']).to eq('uploaded')
+      expect(call.reload.recording).to be_attached
+      expect(call.message.attachments).to be_empty
+      expect(Voice::CallTranscriptionJob).to have_been_enqueued.with(call.id)
+    end
+
+    it 'is idempotent: returns already_uploaded if the call already has a recording' do
+      call.recording.attach(io: Rails.root.join('spec/assets/sample.ogg').open, filename: 'call-recording.ogg', content_type: 'audio/ogg')
+
+      post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/upload_recording",
+           params: { recording: fixture_file_upload(Rails.root.join('spec/assets/sample.ogg'), 'audio/ogg') },
+           headers: agent.create_new_auth_token
+
+      expect(response.parsed_body['status']).to eq('already_uploaded')
+      expect(Voice::CallTranscriptionJob).not_to have_been_enqueued
+    end
+
+    # The browser gate ships in JS, so a stale tab could still post audio for a call that decided not to record.
+    it 'refuses to store audio for a call created with recording off' do
+      call.update!(recording_enabled: false)
+
+      expect do
+        post "/api/v1/accounts/#{account.id}/whatsapp_calls/#{call.id}/upload_recording",
+             params: { recording: fixture_file_upload(Rails.root.join('spec/assets/sample.mp3'), 'audio/mpeg') },
+             headers: agent.create_new_auth_token
+      end.not_to have_enqueued_job(Voice::CallTranscriptionJob)
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(call.reload.recording).not_to be_attached
+    end
+  end
+end
