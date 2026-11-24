@@ -1,0 +1,1797 @@
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
+
+// BYOK API-key bridges, built once instead of hand-listed per key. Sandboxed
+// preloads can't require local modules, so the {base, get, save} tuples are
+// inlined here; keep them in sync with the BYOK_API_KEYS manifest in
+// src/config/secretKeys.js (the main process derives its plumbing from that).
+const BYOK_KEY_BRIDGES = [
+  { base: "openai", get: "getOpenAIKey", save: "saveOpenAIKey" },
+  { base: "anthropic", get: "getAnthropicKey", save: "saveAnthropicKey" },
+  { base: "gemini", get: "getGeminiKey", save: "saveGeminiKey" },
+  { base: "groq", get: "getGroqKey", save: "saveGroqKey" },
+  { base: "xai", get: "getXaiKey", save: "saveXaiKey" },
+  { base: "mistral", get: "getMistralKey", save: "saveMistralKey" },
+  { base: "openrouter", get: "getOpenrouterKey", save: "saveOpenrouterKey" },
+  { base: "tinfoil", get: "getTinfoilKey", save: "saveTinfoilKey" },
+  { base: "corti", get: "getCortiKey", save: "saveCortiKey" },
+  { base: "deepgram", get: "getDeepgramKey", save: "saveDeepgramKey" },
+  { base: "assemblyai", get: "getAssemblyAIKey", save: "saveAssemblyAIKey" },
+  { base: "elevenlabs", get: "getElevenlabsKey", save: "saveElevenlabsKey" },
+  {
+    base: "note-formatting-custom",
+    get: "getNoteFormattingCustomKey",
+    save: "saveNoteFormattingCustomKey",
+  },
+  { base: "translation-custom", get: "getTranslationCustomKey", save: "saveTranslationCustomKey" },
+  {
+    base: "dictation-agent-custom",
+    get: "getDictationAgentCustomKey",
+    save: "saveDictationAgentCustomKey",
+  },
+  {
+    base: "dictation-agent-vision-custom",
+    get: "getDictationAgentVisionCustomKey",
+    save: "saveDictationAgentVisionCustomKey",
+  },
+  { base: "chat-agent-custom", get: "getChatAgentCustomKey", save: "saveChatAgentCustomKey" },
+];
+const secretKeyApi = {};
+for (const k of BYOK_KEY_BRIDGES) {
+  secretKeyApi[k.get] = () => ipcRenderer.invoke(`get-${k.base}-key`);
+  secretKeyApi[k.save] = (key) => ipcRenderer.invoke(`save-${k.base}-key`, key);
+}
+
+/**
+ * Helper to register an IPC listener and return a cleanup function.
+ * Ensures renderer code can easily remove listeners to avoid leaks.
+ */
+const registerListener = (channel, handlerFactory) => {
+  return (callback) => {
+    if (typeof callback !== "function") {
+      return () => {};
+    }
+
+    const listener =
+      typeof handlerFactory === "function"
+        ? handlerFactory(callback)
+        : (event, ...args) => callback(event, ...args);
+
+    ipcRenderer.on(channel, listener);
+    return () => {
+      ipcRenderer.removeListener(channel, listener);
+    };
+  };
+};
+
+contextBridge.exposeInMainWorld("electronAPI", {
+  initialModelRegistrySnapshot: ipcRenderer.sendSync?.("model-registry-initial"),
+  getModelRegistry: () => ipcRenderer.invoke("get-model-registry"),
+  onModelRegistryUpdated: registerListener(
+    "model-registry-updated",
+    (callback) => (_event, snapshot) => callback(snapshot)
+  ),
+  setOnboardingWindowMode: (mode) => ipcRenderer.invoke("onboarding-set-window-mode", mode),
+  setOnboardingActive: (active) => ipcRenderer.invoke("onboarding-set-active", active),
+  openPermissionGuide: (state) => ipcRenderer.invoke("permission-guide-open", state),
+  closePermissionGuide: () => ipcRenderer.invoke("permission-guide-close"),
+  getPermissionGuideState: () => ipcRenderer.invoke("permission-guide-state"),
+  permissionGuideAction: (action) => ipcRenderer.send("permission-guide-action", action),
+  startPermissionGuideDrag: (target) => ipcRenderer.send("permission-guide-drag", target),
+  onPermissionGuideState: registerListener(
+    "permission-guide-state-changed",
+    (callback) => (_event, state) => callback(state)
+  ),
+  onPermissionGuideAction: registerListener(
+    "permission-guide-action",
+    (callback) => (_event, action) => callback(action)
+  ),
+  // The agent window (`?agent=true`) and the dictation window's ways into it.
+  agentWindowReady: () => ipcRenderer.send("agent-window-ready"),
+  agentWindowSetLayout: (request) => ipcRenderer.invoke("agent-window-set-layout", request),
+  agentWindowHide: () => ipcRenderer.invoke("agent-window-hide"),
+  agentWindowSetDragging: (dragging) => ipcRenderer.send("agent-window-drag", dragging),
+  agentWindowSetVoiceState: (state, attempt) =>
+    ipcRenderer.invoke("agent-window-voice-state", state, attempt),
+  openAgentWindow: () => ipcRenderer.invoke("open-agent-window"),
+  submitAgentCommand: (command) => ipcRenderer.invoke("agent-window-submit-command", command),
+  onAgentWindowHotkey: registerListener(
+    "agent-window-hotkey",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  onAgentWindowOpen: registerListener(
+    "agent-window-open",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  onAgentWindowCommand: registerListener(
+    "agent-window-command",
+    (callback) => (_event, command) => callback(command)
+  ),
+  onAgentWindowDismiss: registerListener("agent-window-dismiss", (callback) => () => callback()),
+  onAgentRecordingChanged: registerListener(
+    "agent-recording-changed",
+    (callback) => (_event, recording) => callback(recording)
+  ),
+  markMacAccessibilityFeaturesReady: (expectedAccountScope) =>
+    expectedAccountScope
+      ? ipcRenderer.send("mac-accessibility-features-ready", expectedAccountScope)
+      : ipcRenderer.send("mac-accessibility-features-ready"),
+  beginOnboardingDemo: (session) => ipcRenderer.invoke("onboarding-demo-begin", session),
+  endOnboardingDemo: (id) => ipcRenderer.invoke("onboarding-demo-end", id),
+  stopOnboardingDemo: (id) => ipcRenderer.invoke("onboarding-demo-stop", id),
+  publishOnboardingDemoEvent: (event) => ipcRenderer.invoke("onboarding-demo-publish", event),
+  onOnboardingDemoEvent: registerListener(
+    "onboarding-demo-event",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  testProviderConnection: (config) => ipcRenderer.invoke("test-provider-connection", config),
+  pasteText: (text, options) => ipcRenderer.invoke("paste-text", text, options),
+  captureSelectedText: (options) => ipcRenderer.invoke("capture-selected-text", options),
+  cancelSelectionEdit: (sessionId) => ipcRenderer.invoke("cancel-selection-edit", sessionId),
+  replaceSelectedText: (sessionId, text, options) =>
+    ipcRenderer.invoke("replace-selected-text", sessionId, text, options),
+  pasteAtCapturedTarget: (sessionId, text) =>
+    ipcRenderer.invoke("paste-at-captured-target", sessionId, text),
+  hideWindow: () => ipcRenderer.invoke("hide-window"),
+  showDictationPanel: () => ipcRenderer.invoke("show-dictation-panel"),
+  openSettingsSection: (section) => ipcRenderer.invoke("open-settings-section", section),
+  captureDictationTarget: () => ipcRenderer.invoke("capture-dictation-target"),
+  captureDictationAppCategory: () => ipcRenderer.invoke("capture-dictation-app-category"),
+  onToggleDictation: registerListener("toggle-dictation", (callback) => () => callback()),
+  onToggleVoiceAgent: registerListener("toggle-voice-agent", (callback) => () => callback()),
+  onToggleTranslation: registerListener("toggle-translation", (callback) => () => callback()),
+  onMeetingStartRefused: registerListener(
+    "meeting-start-refused",
+    (callback) => (_event, code) => callback(code)
+  ),
+  onStartDictation: registerListener("start-dictation", (callback) => () => callback()),
+  onStopDictation: registerListener("stop-dictation", (callback) => () => callback()),
+  onPrepareDictation: registerListener("prepare-dictation", (callback) => () => callback()),
+  onCancelDictationPreparation: registerListener(
+    "cancel-dictation-preparation",
+    (callback) => () => callback()
+  ),
+  onDictationForceStopped: registerListener(
+    "dictation-force-stopped",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  micWarmHoldChanged: (active) => ipcRenderer.send("mic-warm-hold-changed", active),
+  dictationLifecycleStateChanged: (state, attempt, voiceAgentRequested = false) =>
+    ipcRenderer.invoke("dictation-lifecycle-state-changed", state, attempt, voiceAgentRequested),
+
+  // Database functions
+  saveTranscription: (text, rawText, options) =>
+    ipcRenderer.invoke("db-save-transcription", text, rawText, options),
+  getTranscriptions: (limit, options) =>
+    ipcRenderer.invoke("db-get-transcriptions", limit, options),
+  recordAnalyticsEvent: (input) => ipcRenderer.invoke("analytics-record-event", input),
+  closeActivationStream: () => ipcRenderer.invoke("activation-close"),
+  beginActivationCapture: () => ipcRenderer.invoke("activation-begin"),
+  stopActivationCapture: (id) => ipcRenderer.invoke("activation-stop", id),
+  finishActivationCapture: (id, words) => ipcRenderer.invoke("activation-finish", id, words),
+  cancelActivationCapture: (id) => ipcRenderer.invoke("activation-cancel", id),
+  getAnalyticsSummary: () => ipcRenderer.invoke("analytics-get-summary"),
+  getPendingAnalyticsEvents: (limit, context) =>
+    ipcRenderer.invoke("analytics-get-pending", limit, context),
+  markAnalyticsEventsSynced: (eventIds, context) =>
+    ipcRenderer.invoke("analytics-mark-synced", eventIds, context),
+  getPendingAnalyticsDeletes: (limit, context) =>
+    ipcRenderer.invoke("analytics-get-pending-deletes", limit, context),
+  hardDeleteAnalyticsEvents: (eventIds, context) =>
+    ipcRenderer.invoke("analytics-hard-delete", eventIds, context),
+  getPendingAnalyticsClear: (context) => ipcRenderer.invoke("analytics-get-pending-clear", context),
+  completeAnalyticsClear: (clearedThrough, context) =>
+    ipcRenderer.invoke("analytics-complete-clear", clearedThrough, context),
+  countUnclaimedAnalyticsEvents: (context) =>
+    ipcRenderer.invoke("analytics-count-unclaimed", context),
+  countAnalyticsEventsAwaitingUpload: (context) =>
+    ipcRenderer.invoke("analytics-count-awaiting-upload", context),
+  claimAnonymousAnalyticsEvents: (accountId, expectedAuthGeneration) =>
+    ipcRenderer.invoke("analytics-claim-anonymous", accountId, expectedAuthGeneration),
+  clearTranscriptions: () => ipcRenderer.invoke("db-clear-transcriptions"),
+  deleteTranscription: (id) => ipcRenderer.invoke("db-delete-transcription", id),
+
+  // Audio storage functions
+  saveTranscriptionAudio: (id, audioBuffer, metadata) =>
+    ipcRenderer.invoke("save-transcription-audio", id, audioBuffer, metadata),
+  mergeAudioSegments: (segments) => ipcRenderer.invoke("merge-audio-segments", segments),
+  getAudioPath: (id) => ipcRenderer.invoke("get-audio-path", id),
+  showAudioInFolder: (id) => ipcRenderer.invoke("show-audio-in-folder", id),
+  getAudioBuffer: (id) => ipcRenderer.invoke("get-audio-buffer", id),
+  deleteTranscriptionAudio: (id) => ipcRenderer.invoke("delete-transcription-audio", id),
+  getAudioStorageUsage: () => ipcRenderer.invoke("get-audio-storage-usage"),
+  deleteAllAudio: () => ipcRenderer.invoke("delete-all-audio"),
+  syncRetentionSettings: (settings) => ipcRenderer.send("retention-settings-changed", settings),
+  retryTranscription: (id, settings) => ipcRenderer.invoke("retry-transcription", id, settings),
+  updateTranscriptionText: (id, text, rawText) =>
+    ipcRenderer.invoke("update-transcription-text", id, text, rawText),
+  getTranscriptionById: (id) => ipcRenderer.invoke("get-transcription-by-id", id),
+
+  // Dictionary functions
+  getDictionary: () => ipcRenderer.invoke("db-get-dictionary"),
+  setDictionary: (words, listsAccountId) =>
+    ipcRenderer.invoke("db-set-dictionary", words, listsAccountId),
+  seedDictionary: (words) => ipcRenderer.invoke("db-seed-dictionary", words),
+  applyDictionaryChanges: (changes, listsAccountId) =>
+    ipcRenderer.invoke("db-apply-dictionary-changes", changes, listsAccountId),
+  onDictionaryUpdated: (callback) => {
+    const listener = (_event, words) => callback?.(words);
+    ipcRenderer.on("dictionary-updated", listener);
+    return () => ipcRenderer.removeListener("dictionary-updated", listener);
+  },
+  getSnippets: () => ipcRenderer.invoke("db-get-snippets"),
+  setSnippets: (snippets, listsAccountId) =>
+    ipcRenderer.invoke("db-set-snippets", snippets, listsAccountId),
+  seedSnippets: (snippets) => ipcRenderer.invoke("db-seed-snippets", snippets),
+  onSnippetsUpdated: (callback) => {
+    const listener = (_event, snippets) => callback?.(snippets);
+    ipcRenderer.on("snippets-updated", listener);
+    return () => ipcRenderer.removeListener("snippets-updated", listener);
+  },
+  skillsList: () => ipcRenderer.invoke("skills-list"),
+  skillsGet: (name) => ipcRenderer.invoke("skills-get", name),
+  skillsReadFile: (name, path) => ipcRenderer.invoke("skills-read-file", name, path),
+  skillsSetEnabled: (name, enabled) => ipcRenderer.invoke("skills-set-enabled", name, enabled),
+  skillsUninstall: (name) => ipcRenderer.invoke("skills-uninstall", name),
+  skillsReveal: (name) => ipcRenderer.invoke("skills-reveal", name),
+  skillsPreviewUpload: (items) => ipcRenderer.invoke("skills-preview-upload", items),
+  skillsCommitUpload: (request) => ipcRenderer.invoke("skills-commit-upload", request),
+  skillsDiscardUploads: (tokens) => ipcRenderer.invoke("skills-discard-uploads", tokens),
+  skillsCreate: (input) => ipcRenderer.invoke("skills-create", input),
+  skillsAddRecommended: (id, copy) => ipcRenderer.invoke("skills-add-recommended", id, copy),
+  skillsReadForModel: (ref) => ipcRenderer.invoke("skills-read-for-model", ref),
+  skillsCheckProposal: (request) => ipcRenderer.invoke("skills-check-proposal", request),
+  skillsSaveProposal: (proposal) => ipcRenderer.invoke("skills-save-proposal", proposal),
+  skillsApplyUpdate: (update) => ipcRenderer.invoke("skills-apply-update", update),
+  skillsMarkUsed: (name) => ipcRenderer.invoke("skills-mark-used", name),
+  skillsUndo: (name, versionId) => ipcRenderer.invoke("skills-undo", name, versionId),
+  getPendingSkills: () => ipcRenderer.invoke("skills-get-pending"),
+  getPendingSkillDeletes: () => ipcRenderer.invoke("skills-get-pending-deletes"),
+  exportSkillForCloud: (name) => ipcRenderer.invoke("skills-export-for-cloud", name),
+  getSkillForCloudMerge: (cloudEntry) =>
+    ipcRenderer.invoke("skills-get-for-cloud-merge", cloudEntry),
+  applySkillFromCloud: (cloudEntry, expectedLocal) =>
+    ipcRenderer.invoke("skills-apply-from-cloud", cloudEntry, expectedLocal),
+  markSkillSynced: (name, cloudId, serverUpdatedAt, expectedHash, expectedEnabled) =>
+    ipcRenderer.invoke(
+      "skills-mark-synced",
+      name,
+      cloudId,
+      serverUpdatedAt,
+      expectedHash,
+      expectedEnabled
+    ),
+  hardDeleteSkill: (name) => ipcRenderer.invoke("skills-hard-delete", name),
+  queueSkillCloudDelete: (name, cloudId) =>
+    ipcRenderer.invoke("skills-queue-cloud-delete", name, cloudId),
+  clearSkillCloudId: (name) => ipcRenderer.invoke("skills-clear-cloud-id", name),
+  broadcastSkillsUpdated: () => ipcRenderer.invoke("skills-broadcast-updated"),
+  onSkillsChanged: (callback) => {
+    const listener = () => callback?.();
+    ipcRenderer.on("skills-changed", listener);
+    return () => ipcRenderer.removeListener("skills-changed", listener);
+  },
+  setAutoLearnEnabled: (enabled) => ipcRenderer.send("auto-learn-changed", enabled),
+  onCorrectionsLearned: (callback) => {
+    const listener = (_event, words) => callback?.(words);
+    ipcRenderer.on("corrections-learned", listener);
+    return () => ipcRenderer.removeListener("corrections-learned", listener);
+  },
+  undoLearnedCorrections: (words) => ipcRenderer.invoke("undo-learned-corrections", words),
+
+  // Note functions
+  saveNote: (
+    title,
+    content,
+    noteType,
+    sourceFile,
+    audioDuration,
+    folderId,
+    spaceId,
+    transcript,
+    writeGuard
+  ) =>
+    ipcRenderer.invoke(
+      "db-save-note",
+      title,
+      content,
+      noteType,
+      sourceFile,
+      audioDuration,
+      folderId,
+      spaceId,
+      transcript,
+      writeGuard
+    ),
+  getNote: (id) => ipcRenderer.invoke("db-get-note", id),
+  getNotes: (noteType, limit, folderId, spaceId, spaceIds) =>
+    ipcRenderer.invoke("db-get-notes", noteType, limit, folderId, spaceId, spaceIds),
+  getSpaceNotes: (spaceId, limit) => ipcRenderer.invoke("db-get-space-notes", spaceId, limit),
+  updateNote: (id, updates, options) => ipcRenderer.invoke("db-update-note", id, updates, options),
+  getNoteUndos: () => ipcRenderer.invoke("db-get-note-undos"),
+  claimNoteUndo: (token) => ipcRenderer.invoke("db-claim-note-undo", token),
+  undoNoteUpdate: (token) => ipcRenderer.invoke("db-undo-note-update", token),
+  discardNoteUndo: (id, token) => ipcRenderer.invoke("db-discard-note-undo", id, token),
+  deleteNote: (id) => ipcRenderer.invoke("db-delete-note", id),
+  exportNote: (noteId, format) => ipcRenderer.invoke("export-note", noteId, format),
+  exportTranscript: (noteId, format, options) =>
+    ipcRenderer.invoke("export-transcript", noteId, format, options),
+  exportDictionary: (words) => ipcRenderer.invoke("export-dictionary", words),
+  searchNotes: (query, limit, spaceId, folderId, spaceIds) =>
+    ipcRenderer.invoke("db-search-notes", query, limit, spaceId, folderId, spaceIds),
+  semanticSearchNotes: (query, limit, spaceId, folderId, spaceIds) =>
+    ipcRenderer.invoke("db-semantic-search-notes", query, limit, spaceId, folderId, spaceIds),
+  updateNoteCloudId: (id, cloudId) => ipcRenderer.invoke("db-update-note-cloud-id", id, cloudId),
+  updateNoteShareState: (id, state) => ipcRenderer.invoke("db-update-note-share-state", id, state),
+
+  // Folder functions
+  getFolders: (spaceId) => ipcRenderer.invoke("db-get-folders", spaceId),
+  getDeviceNotes: () => ipcRenderer.invoke("db-get-device-notes"),
+  getDeviceNote: (id) => ipcRenderer.invoke("db-get-device-note", id),
+  moveDeviceNotes: (request) => ipcRenderer.invoke("db-move-device-notes", request),
+  getStandInOwnershipCandidates: () => ipcRenderer.invoke("db-get-stand-in-ownership-candidates"),
+  resolveStandInOwnership: (request) =>
+    ipcRenderer.invoke("db-resolve-stand-in-ownership", request),
+  createFolder: (name, spaceId, writeGuard, parentFolderId) =>
+    ipcRenderer.invoke("db-create-folder", name, spaceId, writeGuard, parentFolderId),
+  deleteFolder: (id) => ipcRenderer.invoke("db-delete-folder", id),
+  renameFolder: (id, name) => ipcRenderer.invoke("db-rename-folder", id, name),
+  moveFolderToSpace: (id, spaceId) => ipcRenderer.invoke("db-move-folder-to-space", id, spaceId),
+  setFolderParent: (id, parentFolderId, writeGuard) =>
+    ipcRenderer.invoke("db-set-folder-parent", id, parentFolderId, writeGuard),
+  getFolderNoteCounts: () => ipcRenderer.invoke("db-get-folder-note-counts"),
+
+  // Space functions
+  getSpaces: () => ipcRenderer.invoke("db-get-spaces"),
+  hasOtherAccountRows: () => ipcRenderer.invoke("db-has-other-account-rows"),
+  accountChangedSince: (occurredAt) => ipcRenderer.invoke("db-account-changed-since", occurredAt),
+  hasUnclaimedLegacyRows: () => ipcRenderer.invoke("db-has-unclaimed-legacy-rows"),
+  setActiveWorkspaceScope: (scope) => ipcRenderer.invoke("set-active-workspace-scope", scope),
+  getPrivateSpaceId: (workspaceId, authGeneration) =>
+    ipcRenderer.invoke("get-private-space-id", workspaceId, authGeneration),
+  getDefaultPrivateSpaceId: (authGeneration) =>
+    ipcRenderer.invoke("get-default-private-space-id", authGeneration),
+  bindDefaultPrivateSpace: (defaultWorkspaceId, accountId) =>
+    ipcRenderer.invoke("bind-default-private-space", defaultWorkspaceId, accountId),
+  copyNoteToSpace: (noteId, targetSpaceId, folderId) =>
+    ipcRenderer.invoke("copy-note-to-space", noteId, targetSpaceId, folderId),
+  relocatePrivateSpace: (fromWorkspaceId, toWorkspaceId, accountId) =>
+    ipcRenderer.invoke("relocate-private-space", fromWorkspaceId, toWorkspaceId, accountId),
+  setActiveAccountScope: (accountId, expectedAuthGeneration) =>
+    ipcRenderer.invoke("set-active-account-scope", accountId, expectedAuthGeneration),
+  getActiveAccountScope: () => ipcRenderer.invoke("get-active-account-scope"),
+  recordProductEventAppSession: (context) =>
+    ipcRenderer.invoke("product-events-record-app-session", context),
+  recordOnboardingCompleted: (completion) =>
+    ipcRenderer.invoke("product-events-record-onboarding-completed", completion),
+  recordDictationCompleted: (dictation) =>
+    ipcRenderer.invoke("product-events-record-dictation", dictation),
+  getNoteWriteGuard: () => ipcRenderer.invoke("get-note-write-guard"),
+  getDatabaseAccountScope: () => ipcRenderer.invoke("get-database-account-scope"),
+  onDatabaseAccountScopeChanged: registerListener(
+    "database-account-scope-changed",
+    (callback) => (_event, scope) => callback(scope)
+  ),
+  onDeviceNotesChanged: registerListener("device-notes-changed", (callback) => () => callback()),
+  onActiveAccountScopeChanged: registerListener(
+    "active-account-scope-changed",
+    (callback) => (_event, scope) => callback(scope)
+  ),
+  deleteAccountData: (accountId, expectedAuthGeneration, options) =>
+    ipcRenderer.invoke("delete-account-data", accountId, expectedAuthGeneration, options),
+  updateSpace: (id, updates) => ipcRenderer.invoke("db-update-space", id, updates),
+  purgeSpace: (id, options) => ipcRenderer.invoke("db-purge-space", id, options),
+  upsertSpaceFromCloud: (space) => ipcRenderer.invoke("db-upsert-space-from-cloud", space),
+  setSpaceSyncStatus: (id, status) => ipcRenderer.invoke("db-set-space-sync-status", id, status),
+  onSpacePurged: (callback) => {
+    const listener = (_event, payload) => callback?.(payload);
+    ipcRenderer.on("space-purged", listener);
+    return () => ipcRenderer.removeListener("space-purged", listener);
+  },
+  onSpaceSynced: (callback) => {
+    const listener = (_event, space) => callback?.(space);
+    ipcRenderer.on("space-synced", listener);
+    return () => ipcRenderer.removeListener("space-synced", listener);
+  },
+
+  // Note files (markdown mirror) functions
+  noteFilesSetEnabled: (enabled, customPath, options) =>
+    ipcRenderer.invoke("note-files-set-enabled", enabled, customPath, options),
+  noteFilesSetPath: (path) => ipcRenderer.invoke("note-files-set-path", path),
+  noteFilesRebuild: () => ipcRenderer.invoke("note-files-rebuild"),
+  noteFilesSetWorkspaceNames: (workspaces) =>
+    ipcRenderer.invoke("note-files-set-workspace-names", workspaces),
+  noteFilesGetDefaultPath: () => ipcRenderer.invoke("note-files-get-default-path"),
+  noteFilesPickFolder: () => ipcRenderer.invoke("note-files-pick-folder"),
+  granolaImportPickAndPreview: () => ipcRenderer.invoke("granola-import-pick-and-preview"),
+  granolaImportRun: () => ipcRenderer.invoke("granola-import-run"),
+  dragonImportPickFile: () => ipcRenderer.invoke("dragon-import-pick-file"),
+  showNoteFile: (noteId) => ipcRenderer.invoke("show-note-file", noteId),
+  showFolderInExplorer: (folderId) => ipcRenderer.invoke("show-folder-in-explorer", folderId),
+
+  // Action functions
+  getActions: () => ipcRenderer.invoke("db-get-actions"),
+  getAction: (id) => ipcRenderer.invoke("db-get-action", id),
+  createAction: (name, description, prompt, icon, fields) =>
+    ipcRenderer.invoke("db-create-action", name, description, prompt, icon, fields),
+  updateAction: (id, updates) => ipcRenderer.invoke("db-update-action", id, updates),
+  deleteAction: (id) => ipcRenderer.invoke("db-delete-action", id),
+
+  // Audio file operations
+  selectAudioFile: (options) => ipcRenderer.invoke("select-audio-file", options),
+  getFileSize: (filePath) => ipcRenderer.invoke("get-file-size", filePath),
+  transcribeAudioFile: (filePath, options) =>
+    ipcRenderer.invoke("transcribe-audio-file", filePath, options),
+  getPathForFile: (file) => {
+    const filePath = webUtils.getPathForFile(file);
+    // Register real dropped-file paths so the main-process audio allowlist accepts them.
+    if (filePath) ipcRenderer.send("approve-audio-path", filePath);
+    return filePath;
+  },
+
+  // URL audio download
+  downloadUrlAudio: (url, downloadId) => ipcRenderer.invoke("download-url-audio", url, downloadId),
+  cancelUrlDownload: (downloadId) => ipcRenderer.invoke("cancel-url-download", downloadId),
+  deleteTempFile: (filePath) => ipcRenderer.invoke("delete-temp-file", filePath),
+  onUrlDownloadProgress: registerListener(
+    "url-download-progress",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  onNoteAdded: (callback) => {
+    const listener = (_event, note) => callback?.(note);
+    ipcRenderer.on("note-added", listener);
+    return () => ipcRenderer.removeListener("note-added", listener);
+  },
+  onNoteUpdated: (callback) => {
+    const listener = (_event, note) => callback?.(note);
+    ipcRenderer.on("note-updated", listener);
+    return () => ipcRenderer.removeListener("note-updated", listener);
+  },
+  onNoteDeleted: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("note-deleted", listener);
+    return () => ipcRenderer.removeListener("note-deleted", listener);
+  },
+  onNoteSynced: (callback) => {
+    const listener = (_event, note) => callback?.(note);
+    ipcRenderer.on("note-synced", listener);
+    return () => ipcRenderer.removeListener("note-synced", listener);
+  },
+  onFolderSynced: (callback) => {
+    const listener = (_event, folder) => callback?.(folder);
+    ipcRenderer.on("folder-synced", listener);
+    return () => ipcRenderer.removeListener("folder-synced", listener);
+  },
+  onFolderDeleted: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("folder-deleted", listener);
+    return () => ipcRenderer.removeListener("folder-deleted", listener);
+  },
+  emitSyncEvent: (name, payload) => ipcRenderer.invoke("broadcast-sync-event", name, payload),
+  onSyncEvent: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("sync-event", listener);
+    return () => ipcRenderer.removeListener("sync-event", listener);
+  },
+
+  onActionCreated: (callback) => {
+    const listener = (_event, action) => callback?.(action);
+    ipcRenderer.on("action-created", listener);
+    return () => ipcRenderer.removeListener("action-created", listener);
+  },
+  onActionUpdated: (callback) => {
+    const listener = (_event, action) => callback?.(action);
+    ipcRenderer.on("action-updated", listener);
+    return () => ipcRenderer.removeListener("action-updated", listener);
+  },
+  onActionDeleted: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("action-deleted", listener);
+    return () => ipcRenderer.removeListener("action-deleted", listener);
+  },
+
+  onTranscriptionAdded: (callback) => {
+    const listener = (_event, transcription) => callback?.(transcription);
+    ipcRenderer.on("transcription-added", listener);
+    return () => ipcRenderer.removeListener("transcription-added", listener);
+  },
+  onTranscriptionDeleted: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("transcription-deleted", listener);
+    return () => ipcRenderer.removeListener("transcription-deleted", listener);
+  },
+  onTranscriptionsCleared: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("transcriptions-cleared", listener);
+    return () => ipcRenderer.removeListener("transcriptions-cleared", listener);
+  },
+  onTranscriptionUpdated: (callback) => {
+    const listener = (_event, transcription) => callback?.(transcription);
+    ipcRenderer.on("transcription-updated", listener);
+    return () => ipcRenderer.removeListener("transcription-updated", listener);
+  },
+  onAnalyticsChanged: (callback) => {
+    const listener = () => callback?.();
+    ipcRenderer.on("analytics-changed", listener);
+    return () => ipcRenderer.removeListener("analytics-changed", listener);
+  },
+
+  // BYOK API keys (get/save for every provider in the secretKeys manifest)
+  ...secretKeyApi,
+
+  // Clipboard functions
+  checkAccessibilityPermission: (silent) =>
+    ipcRenderer.invoke("check-accessibility-permission", silent),
+  promptAccessibilityPermission: () => ipcRenderer.invoke("prompt-accessibility-permission"),
+  readClipboard: () => ipcRenderer.invoke("read-clipboard"),
+  writeClipboard: (text) => ipcRenderer.invoke("write-clipboard", text),
+  copyLeaderboardImage: (dataUrl) => ipcRenderer.invoke("leaderboard-copy-image", dataUrl),
+  saveLeaderboardImage: (dataUrl, suggestedName) =>
+    ipcRenderer.invoke("leaderboard-save-image", dataUrl, suggestedName),
+  checkPasteTools: () => ipcRenderer.invoke("check-paste-tools"),
+
+  // Voice drafts (chat input recordings)
+  saveTempAudio: (buffer) => ipcRenderer.invoke("save-temp-audio", buffer),
+  deleteTempAudio: (tempPath) => ipcRenderer.invoke("delete-temp-audio", tempPath),
+
+  // Local Whisper functions (whisper.cpp)
+  transcribeLocalWhisper: (audioBlob, options) =>
+    ipcRenderer.invoke("transcribe-local-whisper", audioBlob, options),
+  checkWhisperInstallation: () => ipcRenderer.invoke("check-whisper-installation"),
+  downloadWhisperModel: (modelName) => ipcRenderer.invoke("download-whisper-model", modelName),
+  onWhisperDownloadProgress: registerListener("whisper-download-progress"),
+  checkModelStatus: (modelName) => ipcRenderer.invoke("check-model-status", modelName),
+  listWhisperModels: () => ipcRenderer.invoke("list-whisper-models"),
+  deleteWhisperModel: (modelName) => ipcRenderer.invoke("delete-whisper-model", modelName),
+  deleteAllWhisperModels: () => ipcRenderer.invoke("delete-all-whisper-models"),
+  cancelWhisperDownload: () => ipcRenderer.invoke("cancel-whisper-download"),
+  checkFFmpegAvailability: () => ipcRenderer.invoke("check-ffmpeg-availability"),
+  getAudioDiagnostics: () => ipcRenderer.invoke("get-audio-diagnostics"),
+
+  // Whisper server functions (faster repeated transcriptions)
+  whisperServerStart: (modelName) => ipcRenderer.invoke("whisper-server-start", modelName),
+  whisperServerStop: () => ipcRenderer.invoke("whisper-server-stop"),
+  whisperServerStatus: () => ipcRenderer.invoke("whisper-server-status"),
+  whisperGpuRetry: () => ipcRenderer.invoke("whisper-gpu-retry"),
+
+  // CUDA GPU acceleration
+  listGpus: () => ipcRenderer.invoke("list-gpus"),
+  setGpuDeviceIndex: (purpose, uuid) => ipcRenderer.invoke("set-gpu-device-index", purpose, uuid),
+  getGpuDeviceIndex: (purpose) => ipcRenderer.invoke("get-gpu-device-index", purpose),
+  detectGpu: () => ipcRenderer.invoke("detect-gpu"),
+  getCudaWhisperStatus: () => ipcRenderer.invoke("get-cuda-whisper-status"),
+  downloadCudaWhisperBinary: () => ipcRenderer.invoke("download-cuda-whisper-binary"),
+  cancelCudaWhisperDownload: () => ipcRenderer.invoke("cancel-cuda-whisper-download"),
+  deleteCudaWhisperBinary: () => ipcRenderer.invoke("delete-cuda-whisper-binary"),
+  onCudaDownloadProgress: registerListener(
+    "cuda-download-progress",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onCudaFallbackNotification: registerListener(
+    "cuda-fallback-notification",
+    (callback) => () => callback()
+  ),
+
+  // Vulkan GPU acceleration (whisper on AMD/Intel GPUs)
+  getVulkanWhisperStatus: () => ipcRenderer.invoke("get-vulkan-whisper-status"),
+  downloadVulkanWhisperBinary: () => ipcRenderer.invoke("download-vulkan-whisper-binary"),
+  cancelVulkanWhisperDownload: () => ipcRenderer.invoke("cancel-vulkan-whisper-download"),
+  deleteVulkanWhisperBinary: () => ipcRenderer.invoke("delete-vulkan-whisper-binary"),
+  onVulkanWhisperDownloadProgress: registerListener(
+    "vulkan-whisper-download-progress",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onGpuFallbackNotification: registerListener(
+    "gpu-fallback-notification",
+    (callback) => () => callback()
+  ),
+  // Main changed the installed packs or the remembered GPU failure (#1736)
+  onWhisperGpuStatusChanged: registerListener(
+    "whisper-gpu-status-changed",
+    (callback) => () => callback()
+  ),
+
+  // One-time "GPU pack needs re-downloading" notice
+  takeGpuPackMigrationNotice: () => ipcRenderer.invoke("take-gpu-pack-migration-notice"),
+  onGpuPackMigrationNoticeReady: registerListener(
+    "gpu-pack-migration-notice-ready",
+    (callback) => () => callback()
+  ),
+
+  // Local Parakeet (NVIDIA) functions
+  transcribeLocalParakeet: (audioBlob, options) =>
+    ipcRenderer.invoke("transcribe-local-parakeet", audioBlob, options),
+  checkParakeetInstallation: () => ipcRenderer.invoke("check-parakeet-installation"),
+  downloadParakeetModel: (modelName) => ipcRenderer.invoke("download-parakeet-model", modelName),
+  onParakeetDownloadProgress: registerListener("parakeet-download-progress"),
+  checkParakeetModelStatus: (modelName) =>
+    ipcRenderer.invoke("check-parakeet-model-status", modelName),
+  listParakeetModels: () => ipcRenderer.invoke("list-parakeet-models"),
+  deleteParakeetModel: (modelName) => ipcRenderer.invoke("delete-parakeet-model", modelName),
+  deleteAllParakeetModels: () => ipcRenderer.invoke("delete-all-parakeet-models"),
+  cancelParakeetDownload: () => ipcRenderer.invoke("cancel-parakeet-download"),
+  getParakeetDiagnostics: () => ipcRenderer.invoke("get-parakeet-diagnostics"),
+
+  // Parakeet server functions (faster repeated transcriptions)
+  parakeetServerStart: (modelName) => ipcRenderer.invoke("parakeet-server-start", modelName),
+  parakeetServerStop: () => ipcRenderer.invoke("parakeet-server-stop"),
+  parakeetServerStatus: () => ipcRenderer.invoke("parakeet-server-status"),
+
+  // Diarization (speaker identification) functions
+  downloadDiarizationModels: () => ipcRenderer.invoke("download-diarization-models"),
+  getDiarizationModelStatus: () => ipcRenderer.invoke("get-diarization-model-status"),
+  deleteDiarizationModels: () => ipcRenderer.invoke("delete-diarization-models"),
+  cancelDiarizationDownload: () => ipcRenderer.invoke("cancel-diarization-download"),
+  diarizeAudioFile: (filePath, options) =>
+    ipcRenderer.invoke("diarize-audio-file", filePath, options),
+  mergeSpeakerText: (segments, text, duration) =>
+    ipcRenderer.invoke("merge-speaker-text", { segments, text, duration }),
+  onDiarizationDownloadProgress: registerListener(
+    "diarization-download-progress",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingDiarizationComplete: registerListener(
+    "meeting-diarization-complete",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Speaker name mapping
+  getSpeakerMappings: (noteId) => ipcRenderer.invoke("get-speaker-mappings", noteId),
+  setSpeakerMapping: (noteId, speakerId, displayName, email, profileId) =>
+    ipcRenderer.invoke("set-speaker-mapping", noteId, speakerId, displayName, email, profileId),
+  removeSpeakerMapping: (noteId, speakerId) =>
+    ipcRenderer.invoke("remove-speaker-mapping", noteId, speakerId),
+  getSpeakerProfiles: () => ipcRenderer.invoke("get-speaker-profiles"),
+  attachSpeakerEmail: (profileId, email) =>
+    ipcRenderer.invoke("attach-speaker-email", profileId, email),
+  saveNoteSpeakerEmbeddings: (noteId, embeddings) =>
+    ipcRenderer.invoke("save-note-speaker-embeddings", noteId, embeddings),
+
+  // Window control functions
+  windowMinimize: () => ipcRenderer.invoke("window-minimize"),
+  windowMaximize: () => ipcRenderer.invoke("window-maximize"),
+  windowClose: () => ipcRenderer.invoke("window-close"),
+  windowIsMaximized: () => ipcRenderer.invoke("window-is-maximized"),
+  snapToMeetingMode: () => ipcRenderer.invoke("snap-to-meeting-mode"),
+  restoreFromMeetingMode: () => ipcRenderer.invoke("restore-from-meeting-mode"),
+  meetingNoteOpenedWithoutRecording: (id) =>
+    ipcRenderer.invoke("meeting-note-opened-without-recording", id),
+  meetingNoteClosed: (id) => ipcRenderer.invoke("meeting-note-closed", id),
+  getPlatform: () => process.platform,
+
+  // Cleanup function
+  cleanupApp: () => ipcRenderer.invoke("cleanup-app"),
+  relaunchApp: () => ipcRenderer.invoke("relaunch-app"),
+  updateHotkey: (hotkey) => ipcRenderer.invoke("update-hotkey", hotkey),
+  setHotkeyListeningMode: (enabled) => ipcRenderer.invoke("set-hotkey-listening-mode", enabled),
+  getHotkeyModeInfo: (hotkey) => ipcRenderer.invoke("get-hotkey-mode-info", hotkey),
+  getHyprlandConfigStatus: () => ipcRenderer.invoke("get-hyprland-config-status"),
+  startWindowDrag: () => ipcRenderer.invoke("start-window-drag"),
+  stopWindowDrag: () => ipcRenderer.invoke("stop-window-drag"),
+  startControlPanelDrag: () => ipcRenderer.invoke("start-control-panel-drag"),
+  stopControlPanelDrag: () => ipcRenderer.invoke("stop-control-panel-drag"),
+  getMainWindowHorizontalDirection: () =>
+    ipcRenderer.invoke("get-main-window-horizontal-direction"),
+  onMainWindowHorizontalDirectionChanged: registerListener(
+    "main-window-horizontal-direction-changed",
+    (callback) => (_event, direction) => callback(direction)
+  ),
+  onMainWindowWillResize: registerListener(
+    "main-window-will-resize",
+    (callback) => (_event, resize) => callback(resize)
+  ),
+  ackMainWindowResizeMask: (token) => ipcRenderer.send("main-window-resize-mask-ready", token),
+  setMainWindowInteractivity: (interactive) =>
+    ipcRenderer.invoke("set-main-window-interactivity", interactive),
+  setMainWindowInputRegion: (region) => ipcRenderer.invoke("set-main-window-input-region", region),
+  onMainWindowVisibilityChanged: registerListener(
+    "main-window-visibility-changed",
+    (callback) => (_event, visible) => callback(visible)
+  ),
+  setNotificationInteractivity: (interactive) =>
+    ipcRenderer.invoke("set-notification-interactivity", interactive),
+  resizeMainWindow: (sizeKey) => ipcRenderer.invoke("resize-main-window", sizeKey),
+  resizeAssistantWindowToContent: (surfaceHeight) =>
+    ipcRenderer.invoke("resize-assistant-window-to-content", surfaceHeight),
+  resizeDictationErrorWindowToContent: (surfaceHeight) =>
+    ipcRenderer.invoke("resize-dictation-error-window-to-content", surfaceHeight),
+
+  // Update functions
+  checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
+  downloadUpdate: () => ipcRenderer.invoke("download-update"),
+  installUpdate: () => ipcRenderer.invoke("install-update"),
+  getAppVersion: () => ipcRenderer.invoke("get-app-version"),
+  getPostMigrationState: () => ipcRenderer.invoke("get-post-migration-state"),
+  getOAuthProtocolRegistered: () => ipcRenderer.invoke("get-oauth-protocol-registered"),
+  getOAuthProtocol: () => ipcRenderer.invoke("get-oauth-protocol"),
+  markBundleMigrated: () => ipcRenderer.invoke("mark-bundle-migrated"),
+  markBundleMigrationDismissed: () => ipcRenderer.invoke("mark-bundle-migration-dismissed"),
+  getUpdateStatus: () => ipcRenderer.invoke("get-update-status"),
+  getUpdateInfo: () => ipcRenderer.invoke("get-update-info"),
+  setAutoUpdatesEnabled: (enabled) => ipcRenderer.invoke("set-auto-updates-enabled", enabled),
+
+  // Update event listeners
+  onUpdateStatusChanged: registerListener(
+    "update-status-changed",
+    (callback) => (_event, status) => callback(status)
+  ),
+  onUpdateAvailable: registerListener("update-available"),
+  onUpdateNotAvailable: registerListener("update-not-available"),
+  onUpdateDownloaded: registerListener("update-downloaded"),
+  onUpdateDownloadProgress: registerListener("update-download-progress"),
+  onUpdateError: registerListener("update-error"),
+
+  // Audio event listeners
+  onCancelHotkeyPressed: registerListener("cancel-hotkey-pressed", (cb) => () => cb()),
+  registerCancelHotkey: (key) => ipcRenderer.invoke("register-cancel-hotkey", key),
+  unregisterCancelHotkey: () => ipcRenderer.invoke("unregister-cancel-hotkey"),
+
+  // External link opener
+  openExternal: (url) => ipcRenderer.invoke("open-external", url),
+
+  // Model management functions
+  modelGetAll: () => ipcRenderer.invoke("model-get-all"),
+  modelGetActiveDownloads: () => ipcRenderer.invoke("model-get-active-downloads"),
+  modelCheck: (modelId) => ipcRenderer.invoke("model-check", modelId),
+  modelDownload: (modelId) => ipcRenderer.invoke("model-download", modelId),
+  listRetiredLocalModels: (inUse) => ipcRenderer.invoke("list-retired-local-models", inUse),
+  deleteRetiredLocalModels: (inUse) => ipcRenderer.invoke("delete-retired-local-models", inUse),
+  modelDelete: (modelId) => ipcRenderer.invoke("model-delete", modelId),
+  modelDeleteAll: () => ipcRenderer.invoke("model-delete-all"),
+  modelCheckRuntime: () => ipcRenderer.invoke("model-check-runtime"),
+  modelCancelDownload: (modelId) => ipcRenderer.invoke("model-cancel-download", modelId),
+  onModelDownloadProgress: registerListener("model-download-progress"),
+
+  getUiLanguage: () => ipcRenderer.invoke("get-ui-language"),
+  saveUiLanguage: (language) => ipcRenderer.invoke("save-ui-language", language),
+  setUiLanguage: (language) => ipcRenderer.invoke("set-ui-language", language),
+
+  // xAI / AssemblyAI / Mistral transcription proxies (keys handled by the manifest bridge)
+  proxyXaiTranscription: (data) => ipcRenderer.invoke("proxy-xai-transcription", data),
+  proxyAssemblyAiTranscription: (data) =>
+    ipcRenderer.invoke("proxy-assemblyai-transcription", data),
+  proxyMistralTranscription: (data) => ipcRenderer.invoke("proxy-mistral-transcription", data),
+  proxyGeminiTranscription: (data) => ipcRenderer.invoke("proxy-gemini-transcription", data),
+  proxyElevenlabsTranscription: (data) =>
+    ipcRenderer.invoke("proxy-elevenlabs-transcription", data),
+
+  // Corti API
+  getCortiClientId: () => ipcRenderer.invoke("get-corti-client-id"),
+  saveCortiClientId: (key) => ipcRenderer.invoke("save-corti-client-id", key),
+  getCortiClientSecret: () => ipcRenderer.invoke("get-corti-client-secret"),
+  saveCortiClientSecret: (key) => ipcRenderer.invoke("save-corti-client-secret", key),
+  proxyCortiTranscription: (data) => ipcRenderer.invoke("proxy-corti-transcription", data),
+  getTinfoilChatModels: () => ipcRenderer.invoke("get-tinfoil-chat-models"),
+  proxyTinfoilTranscription: (data) => ipcRenderer.invoke("proxy-tinfoil-transcription", data),
+
+  // Custom endpoint API keys
+  getSelfHostedSttHeaders: () => ipcRenderer.invoke("get-self-hosted-stt-headers"),
+  saveSelfHostedSttHeaders: (value) => ipcRenderer.invoke("save-self-hosted-stt-headers", value),
+  getCustomTranscriptionKey: () => ipcRenderer.invoke("get-custom-transcription-key"),
+  saveCustomTranscriptionKey: (key) => ipcRenderer.invoke("save-custom-transcription-key", key),
+  getCleanupCustomKey: () => ipcRenderer.invoke("get-cleanup-custom-key"),
+  saveCleanupCustomKey: (key) => ipcRenderer.invoke("save-cleanup-custom-key", key),
+
+  // Enterprise provider key management
+  getBedrockRegion: () => ipcRenderer.invoke("get-bedrock-region"),
+  saveBedrockRegion: (value) => ipcRenderer.invoke("save-bedrock-region", value),
+  getBedrockProfile: () => ipcRenderer.invoke("get-bedrock-profile"),
+  saveBedrockProfile: (value) => ipcRenderer.invoke("save-bedrock-profile", value),
+  getBedrockAccessKeyId: () => ipcRenderer.invoke("get-bedrock-access-key-id"),
+  saveBedrockAccessKeyId: (key) => ipcRenderer.invoke("save-bedrock-access-key-id", key),
+  getBedrockSecretAccessKey: () => ipcRenderer.invoke("get-bedrock-secret-access-key"),
+  saveBedrockSecretAccessKey: (key) => ipcRenderer.invoke("save-bedrock-secret-access-key", key),
+  getBedrockSessionToken: () => ipcRenderer.invoke("get-bedrock-session-token"),
+  saveBedrockSessionToken: (key) => ipcRenderer.invoke("save-bedrock-session-token", key),
+  getAzureEndpoint: () => ipcRenderer.invoke("get-azure-endpoint"),
+  saveAzureEndpoint: (value) => ipcRenderer.invoke("save-azure-endpoint", value),
+  getAzureApiKey: () => ipcRenderer.invoke("get-azure-api-key"),
+  saveAzureApiKey: (key) => ipcRenderer.invoke("save-azure-api-key", key),
+  getAzureDeployment: () => ipcRenderer.invoke("get-azure-deployment"),
+  saveAzureDeployment: (value) => ipcRenderer.invoke("save-azure-deployment", value),
+  getAzureApiVersion: () => ipcRenderer.invoke("get-azure-api-version"),
+  saveAzureApiVersion: (value) => ipcRenderer.invoke("save-azure-api-version", value),
+  getVertexProject: () => ipcRenderer.invoke("get-vertex-project"),
+  saveVertexProject: (value) => ipcRenderer.invoke("save-vertex-project", value),
+  getVertexLocation: () => ipcRenderer.invoke("get-vertex-location"),
+  saveVertexLocation: (value) => ipcRenderer.invoke("save-vertex-location", value),
+  getVertexApiKey: () => ipcRenderer.invoke("get-vertex-api-key"),
+  saveVertexApiKey: (key) => ipcRenderer.invoke("save-vertex-api-key", key),
+  testEnterpriseConnection: (provider, config) =>
+    ipcRenderer.invoke("test-enterprise-connection", provider, config),
+
+  // Dictation key persistence (file-based for reliable startup)
+  getDictationKey: () => ipcRenderer.invoke("get-dictation-key"),
+  getActiveDictationKey: () => ipcRenderer.invoke("get-active-dictation-key"),
+  getEffectiveDefaultHotkey: () => ipcRenderer.invoke("get-effective-default-hotkey"),
+  saveDictationKey: (key) => ipcRenderer.invoke("save-dictation-key", key),
+
+  // Activation mode persistence (file-based for reliable startup)
+  getActivationMode: () => ipcRenderer.invoke("get-activation-mode"),
+  saveActivationMode: (mode) => ipcRenderer.invoke("save-activation-mode", mode),
+
+  saveAllKeysToEnv: () => ipcRenderer.invoke("save-all-keys-to-env"),
+  syncStartupPreferences: (prefs) => ipcRenderer.invoke("sync-startup-preferences", prefs),
+
+  // Local reasoning
+  processLocalReasoning: (text, modelId, agentName, config) =>
+    ipcRenderer.invoke("process-local-reasoning", text, modelId, agentName, config),
+  checkLocalReasoningAvailable: () => ipcRenderer.invoke("check-local-reasoning-available"),
+  getLocalContextBudget: (modelId) => ipcRenderer.invoke("get-local-context-budget", modelId),
+  cancelLocalReasoning: (requestId) => ipcRenderer.invoke("cancel-local-reasoning", requestId),
+
+  // Anthropic reasoning
+  processAnthropicReasoning: (text, modelId, agentName, config) =>
+    ipcRenderer.invoke("process-anthropic-reasoning", text, modelId, agentName, config),
+
+  // Enterprise reasoning (Bedrock, Azure, Vertex) — runs in main process so
+  // Node-only SDKs (AWS/Azure/Google credential providers) can resolve.
+  processEnterpriseReasoning: (text, modelId, agentName, config) =>
+    ipcRenderer.invoke("process-enterprise-reasoning", text, modelId, agentName, config),
+  cancelEnterpriseReasoning: () => ipcRenderer.send("enterprise-reasoning-cancel"),
+  enterpriseStreamStart: (payload) => ipcRenderer.invoke("enterprise-stream-start", payload),
+  enterpriseStreamCancel: (streamId) => ipcRenderer.invoke("enterprise-stream-cancel", streamId),
+  onEnterpriseStreamPart: registerListener(
+    "enterprise-stream-part",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  listBedrockModels: (config) => ipcRenderer.invoke("bedrock-list-models", config),
+  getManagedEnterpriseConfig: (accountId, workspaceId, expectedAuthGeneration, forceRefresh) =>
+    ipcRenderer.invoke(
+      "get-managed-enterprise-config",
+      accountId,
+      workspaceId,
+      expectedAuthGeneration,
+      forceRefresh
+    ),
+  onManagedEnterpriseConfigChanged: registerListener(
+    "managed-enterprise-config-changed",
+    (callback) => (_event, snapshot) => callback(snapshot)
+  ),
+  clearManagedEnterpriseIdentity: (options) =>
+    ipcRenderer.invoke("clear-managed-enterprise-identity", options),
+  managedTranscribe: (data) => ipcRenderer.invoke("managed-transcribe", data),
+  getPendingEnterpriseAudioTest: (consume = false) =>
+    ipcRenderer.invoke("get-pending-enterprise-audio-test", consume),
+  claimEnterpriseAudioTest: () => ipcRenderer.invoke("claim-enterprise-audio-test"),
+  onEnterpriseAudioTestRequested: registerListener(
+    "enterprise-audio-test-requested",
+    (callback) => () => callback()
+  ),
+  enterpriseAudioImportBootstrap: (data) =>
+    ipcRenderer.invoke("enterprise-audio-import-bootstrap", data),
+  enterpriseAudioStatus: (data) => ipcRenderer.invoke("enterprise-audio-status", data),
+  enterpriseAudioSaveCredential: (data) =>
+    ipcRenderer.invoke("enterprise-audio-save-credential", data),
+  enterpriseAudioTest: (data) => ipcRenderer.invoke("enterprise-audio-test", data),
+
+  // llama.cpp
+  llamaCppCheck: () => ipcRenderer.invoke("llama-cpp-check"),
+  llamaCppInstall: () => ipcRenderer.invoke("llama-cpp-install"),
+  llamaCppUninstall: () => ipcRenderer.invoke("llama-cpp-uninstall"),
+
+  // llama-server
+  llamaServerStart: (modelId, requestId) =>
+    ipcRenderer.invoke("llama-server-start", modelId, requestId),
+  llamaServerCancelStart: (requestId) => ipcRenderer.invoke("llama-server-cancel-start", requestId),
+  llamaServerStatus: () => ipcRenderer.invoke("llama-server-status"),
+  llamaGpuReset: () => ipcRenderer.invoke("llama-gpu-reset"),
+
+  // Vulkan GPU acceleration
+  detectVulkanGpu: () => ipcRenderer.invoke("detect-vulkan-gpu"),
+  getComputerProfile: () => ipcRenderer.invoke("get-computer-profile"),
+  getLocalSetupSpace: () => ipcRenderer.invoke("get-local-setup-space"),
+  getLlamaVulkanStatus: () => ipcRenderer.invoke("get-llama-vulkan-status"),
+  downloadLlamaVulkanBinary: () => ipcRenderer.invoke("download-llama-vulkan-binary"),
+  cancelLlamaVulkanDownload: () => ipcRenderer.invoke("cancel-llama-vulkan-download"),
+  deleteLlamaVulkanBinary: () => ipcRenderer.invoke("delete-llama-vulkan-binary"),
+  onLlamaVulkanDownloadProgress: registerListener(
+    "llama-vulkan-download-progress",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  getLogLevel: () => ipcRenderer.invoke("get-log-level"),
+  onLogLevelChanged: registerListener("log-level-changed", (callback) => () => callback()),
+  log: (entry) => ipcRenderer.invoke("app-log", entry),
+
+  // ydotool status check
+  getYdotoolStatus: () => ipcRenderer.invoke("get-ydotool-status"),
+
+  // Debug logging management
+  getDebugState: () => ipcRenderer.invoke("get-debug-state"),
+  setDebugLogging: (enabled) => ipcRenderer.invoke("set-debug-logging", enabled),
+  getModelRegistryUpdates: () => ipcRenderer.invoke("get-model-registry-updates"),
+  setModelRegistryUpdates: (enabled) => ipcRenderer.invoke("set-model-registry-updates", enabled),
+  openLogsFolder: () => ipcRenderer.invoke("open-logs-folder"),
+
+  // System settings helpers for microphone/audio permissions
+  requestMicrophoneAccess: () => ipcRenderer.invoke("request-microphone-access"),
+  checkMicrophoneAccess: () => ipcRenderer.invoke("check-microphone-access"),
+  getSystemDefaultMicrophone: (options) =>
+    ipcRenderer.invoke("get-system-default-microphone", options),
+  checkSystemAudioAccess: () => ipcRenderer.invoke("check-system-audio-access"),
+  verifySystemAudioAccess: () => ipcRenderer.invoke("permission-guide-verify-system-audio"),
+  requestSystemAudioAccess: () => ipcRenderer.invoke("request-system-audio-access"),
+  openMicrophoneSettings: () => ipcRenderer.invoke("open-microphone-settings"),
+  openSoundInputSettings: () => ipcRenderer.invoke("open-sound-input-settings"),
+  openAccessibilitySettings: () => ipcRenderer.invoke("open-accessibility-settings"),
+  openSystemAudioSettings: () => ipcRenderer.invoke("open-system-audio-settings"),
+  openScreenRecordingSettings: () => ipcRenderer.invoke("open-screen-recording-settings"),
+  openLoginItemsSettings: () => ipcRenderer.invoke("open-login-items-settings"),
+  checkScreenRecordingAccess: () => ipcRenderer.invoke("check-screen-recording-access"),
+  requestScreenRecordingAccess: () => ipcRenderer.invoke("request-screen-recording-access"),
+  captureScreenContext: () => ipcRenderer.invoke("capture-screen-context"),
+  setScreenContextEnabled: (enabled) => ipcRenderer.invoke("screen-context-set-enabled", enabled),
+  toggleMediaPlayback: () => ipcRenderer.invoke("toggle-media-playback"),
+  pauseMediaPlayback: () => ipcRenderer.invoke("pause-media-playback"),
+  resumeMediaPlayback: () => ipcRenderer.invoke("resume-media-playback"),
+  getModelCacheRoot: () => ipcRenderer.invoke("get-model-cache-root"),
+  openWhisperModelsFolder: () => ipcRenderer.invoke("open-whisper-models-folder"),
+  authClearSession: () => ipcRenderer.invoke("auth-clear-session"),
+  authGetToken: () => ipcRenderer.invoke("auth-get-token"),
+  authGetTokenState: () => ipcRenderer.invoke("auth-get-token-state"),
+  authSetToken: (token, expectedGeneration) =>
+    ipcRenderer.invoke("auth-set-token", token, expectedGeneration),
+  onAuthTokenStateChanged: registerListener(
+    "auth-token-state-changed",
+    (callback) => (_event, state) => callback(state)
+  ),
+
+  // OpenWhispr Cloud API
+  cloudHealthCheck: () => ipcRenderer.invoke("cloud-health-check"),
+  cloudTranscribe: (audioBuffer, opts) => ipcRenderer.invoke("cloud-transcribe", audioBuffer, opts),
+  cancelCloudTranscription: () => ipcRenderer.send("cloud-transcribe-cancel"),
+  cloudReason: (text, opts) => ipcRenderer.invoke("cloud-reason", text, opts),
+  cancelCloudReason: () => ipcRenderer.send("cloud-reason-cancel"),
+  cloudStreamingUsage: (text, audioDurationSeconds, opts) =>
+    ipcRenderer.invoke("cloud-streaming-usage", text, audioDurationSeconds, opts),
+  cloudUsage: () => ipcRenderer.invoke("cloud-usage"),
+  cloudCheckout: (opts, generation) => ipcRenderer.invoke("cloud-checkout", opts, generation),
+  cloudBillingPortal: (generation) => ipcRenderer.invoke("cloud-billing-portal", generation),
+  cloudSwitchPlan: (opts) => ipcRenderer.invoke("cloud-switch-plan", opts),
+  cloudPreviewSwitch: (opts) => ipcRenderer.invoke("cloud-preview-switch", opts),
+  cloudApiRequest: (opts) => ipcRenderer.invoke("cloud-api-request", opts),
+  getAffiliateCandidate: () => ipcRenderer.invoke("affiliate-get-candidate"),
+  saveAffiliateCandidate: (input) => ipcRenderer.invoke("affiliate-save-candidate", input),
+  resolveAffiliateLink: (link, generation) =>
+    ipcRenderer.invoke("affiliate-resolve-link", link, generation),
+  onAffiliateLink: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on("affiliate-link", handler);
+    return () => ipcRenderer.removeListener("affiliate-link", handler);
+  },
+  getSttConfig: () => ipcRenderer.invoke("get-stt-config"),
+  getEffectivePolicy: (options) => ipcRenderer.invoke("get-effective-policy", options),
+  onEffectivePolicyChanged: registerListener(
+    "effective-policy-changed",
+    (callback) => (_event, snapshot) => callback(snapshot)
+  ),
+  getNoteRecordingConfig: () => ipcRenderer.invoke("get-note-recording-config"),
+
+  // Cloud audio file transcription
+  transcribeAudioFileCloud: (filePath, options) =>
+    ipcRenderer.invoke("transcribe-audio-file-cloud", filePath, options),
+  cancelUploadTranscription: (requestId) =>
+    ipcRenderer.invoke("cancel-upload-transcription", requestId),
+  transcribeAudioFileByok: (options) => ipcRenderer.invoke("transcribe-audio-file-byok", options),
+  onUploadTranscriptionProgress: registerListener(
+    "upload-transcription-progress",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Referral stats
+  getReferralStats: () => ipcRenderer.invoke("get-referral-stats"),
+  sendReferralInvite: (email) => ipcRenderer.invoke("send-referral-invite", email),
+  getReferralInvites: () => ipcRenderer.invoke("get-referral-invites"),
+
+  // Assembly AI Streaming
+  assemblyAiStreamingWarmup: (options) =>
+    ipcRenderer.invoke("assemblyai-streaming-warmup", options),
+  assemblyAiStreamingStart: (options) => ipcRenderer.invoke("assemblyai-streaming-start", options),
+  assemblyAiStreamingSend: (audioBuffer) =>
+    ipcRenderer.send("assemblyai-streaming-send", audioBuffer),
+  assemblyAiStreamingForceEndpoint: () => ipcRenderer.send("assemblyai-streaming-force-endpoint"),
+  assemblyAiStreamingStop: () => ipcRenderer.invoke("assemblyai-streaming-stop"),
+  assemblyAiStreamingStatus: () => ipcRenderer.invoke("assemblyai-streaming-status"),
+  onAssemblyAiPartialTranscript: registerListener(
+    "assemblyai-partial-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onAssemblyAiFinalTranscript: registerListener(
+    "assemblyai-final-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onAssemblyAiError: registerListener(
+    "assemblyai-error",
+    (callback) => (_event, error) => callback(error)
+  ),
+  onAssemblyAiSessionEnd: registerListener(
+    "assemblyai-session-end",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Deepgram Streaming
+  deepgramStreamingWarmup: (options) => ipcRenderer.invoke("deepgram-streaming-warmup", options),
+  deepgramStreamingStart: (options) => ipcRenderer.invoke("deepgram-streaming-start", options),
+  deepgramStreamingSend: (audioBuffer) => ipcRenderer.send("deepgram-streaming-send", audioBuffer),
+  deepgramStreamingFinalize: () => ipcRenderer.send("deepgram-streaming-finalize"),
+  deepgramStreamingStop: () => ipcRenderer.invoke("deepgram-streaming-stop"),
+  deepgramStreamingStatus: () => ipcRenderer.invoke("deepgram-streaming-status"),
+  onDeepgramPartialTranscript: registerListener(
+    "deepgram-partial-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onDeepgramFinalTranscript: registerListener(
+    "deepgram-final-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onDeepgramError: registerListener(
+    "deepgram-error",
+    (callback) => (_event, error) => callback(error)
+  ),
+  onDeepgramSessionEnd: registerListener(
+    "deepgram-session-end",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Gemini Live Streaming
+  geminiStreamingWarmup: (options) => ipcRenderer.invoke("gemini-streaming-warmup", options),
+  geminiStreamingStart: (options) => ipcRenderer.invoke("gemini-streaming-start", options),
+  geminiStreamingSend: (audioBuffer) => ipcRenderer.send("gemini-streaming-send", audioBuffer),
+  geminiStreamingFinalize: () => ipcRenderer.send("gemini-streaming-finalize"),
+  geminiStreamingStop: () => ipcRenderer.invoke("gemini-streaming-stop"),
+  geminiStreamingStatus: () => ipcRenderer.invoke("gemini-streaming-status"),
+  onGeminiPartialTranscript: registerListener(
+    "gemini-partial-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onGeminiFinalTranscript: registerListener(
+    "gemini-final-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onGeminiError: registerListener("gemini-error", (callback) => (_event, error) => callback(error)),
+  onGeminiSessionEnd: registerListener(
+    "gemini-session-end",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Corti streaming (BYOK)
+  cortiStreamingWarmup: (options) => ipcRenderer.invoke("corti-streaming-warmup", options),
+  cortiStreamingStart: (options) => ipcRenderer.invoke("corti-streaming-start", options),
+  cortiStreamingSend: (audioBuffer) => ipcRenderer.send("corti-streaming-send", audioBuffer),
+  cortiStreamingFinalize: () => ipcRenderer.send("corti-streaming-finalize"),
+  cortiStreamingStop: () => ipcRenderer.invoke("corti-streaming-stop"),
+  cortiStreamingStatus: () => ipcRenderer.invoke("corti-streaming-status"),
+  onCortiPartialTranscript: registerListener(
+    "corti-partial-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onCortiFinalTranscript: registerListener(
+    "corti-final-transcript",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onCortiError: registerListener("corti-error", (callback) => (_event, error) => callback(error)),
+  onCortiSessionEnd: registerListener(
+    "corti-session-end",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Meeting transcription (streaming, dual-channel)
+  meetingTranscriptionPrepare: (options) =>
+    ipcRenderer.invoke("meeting-transcription-prepare", options),
+  meetingTranscriptionStart: (options) =>
+    ipcRenderer.invoke("meeting-transcription-start", options),
+  checkMeetingRecordingStart: (options) =>
+    ipcRenderer.invoke("check-meeting-recording-start", options),
+  releaseMeetingRecordingStart: (sessionId) =>
+    ipcRenderer.send("release-meeting-recording-start", sessionId),
+  onMeetingRecordingAdmissionRevoked: registerListener(
+    "meeting-recording-admission-revoked",
+    (callback) => (_event, data) => callback(data)
+  ),
+  isMeetingRecordingDisabled: () => ipcRenderer.invoke("is-meeting-recording-disabled"),
+  meetingRecordingRefused: (details) => ipcRenderer.invoke("meeting-recording-refused", details),
+  meetingTranscriptionSend: (buffer, source, capturedAt) =>
+    ipcRenderer.send("meeting-transcription-send", buffer, source, capturedAt),
+  meetingTranscriptionSetSystemAudioAvailable: (sessionId, available) =>
+    ipcRenderer.invoke("meeting-transcription-set-system-audio-available", sessionId, available),
+  meetingTranscriptionSetMicMuted: (sessionId, muted) =>
+    ipcRenderer.invoke("meeting-transcription-set-mic-muted", sessionId, muted),
+  meetingTranscriptionStop: (expectedSessionId, reason) =>
+    ipcRenderer.invoke("meeting-transcription-stop", expectedSessionId, reason),
+  meetingTranscriptionCancel: () => ipcRenderer.invoke("meeting-transcription-cancel"),
+  onMeetingTranscriptionSegment: registerListener(
+    "meeting-transcription-segment",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingSpeakerIdentified: registerListener(
+    "meeting-speaker-identified",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingSpeakersMerged: registerListener(
+    "meeting-speakers-merged",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingSessionSpeakerConfigUpdated: registerListener(
+    "meeting-session-speaker-config-updated",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingTranscriptionError: registerListener(
+    "meeting-transcription-error",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingTranscriptionFatalError: registerListener(
+    "meeting-transcription-fatal-error",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingSystemAudioSilent: registerListener(
+    "meeting-system-audio-silent",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingSystemAudioDegraded: registerListener(
+    "meeting-system-audio-degraded",
+    (callback) => () => callback()
+  ),
+  onMeetingSystemAudioInterrupted: registerListener(
+    "meeting-system-audio-interrupted",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingSystemAudioResumed: registerListener(
+    "meeting-system-audio-resumed",
+    (callback) => () => callback()
+  ),
+
+  // Dictation realtime streaming
+  dictationRealtimeWarmup: (options) => ipcRenderer.invoke("dictation-realtime-warmup", options),
+  dictationRealtimeStart: (options) => ipcRenderer.invoke("dictation-realtime-start", options),
+  dictationRealtimeSend: (buffer) => ipcRenderer.send("dictation-realtime-send", buffer),
+  dictationRealtimeFinalize: () => ipcRenderer.invoke("dictation-realtime-finalize"),
+  dictationRealtimeStop: () => ipcRenderer.invoke("dictation-realtime-stop"),
+  onDictationRealtimePartial: registerListener(
+    "dictation-realtime-partial",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onDictationRealtimeFinal: registerListener(
+    "dictation-realtime-final",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onDictationRealtimeLanguage: registerListener(
+    "dictation-realtime-language",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onDictationRealtimeError: registerListener(
+    "dictation-realtime-error",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onDictationRealtimeSessionEnd: registerListener(
+    "dictation-realtime-session-end",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Usage limit events (for showing UpgradePrompt in ControlPanel)
+  notifyLimitReached: (data) => ipcRenderer.send("limit-reached", data),
+  onLimitReached: registerListener("limit-reached", (callback) => (_event, data) => callback(data)),
+
+  // Workspace invitation deep link
+  onWorkspaceInvitationToken: registerListener(
+    "workspace-invitation-token",
+    (callback) => (_event, token) => callback(token)
+  ),
+  getPendingInvitationToken: () => ipcRenderer.invoke("get-pending-invitation-token"),
+
+  // Globe key listener for hotkey capture (macOS only)
+  onGlobeKeyPressed: (callback) => {
+    const listener = () => callback?.();
+    ipcRenderer.on("globe-key-pressed", listener);
+    return () => ipcRenderer.removeListener("globe-key-pressed", listener);
+  },
+  onGlobeKeyReleased: (callback) => {
+    const listener = () => callback?.();
+    ipcRenderer.on("globe-key-released", listener);
+    return () => ipcRenderer.removeListener("globe-key-released", listener);
+  },
+
+  // Hotkey registration events (for notifying user when hotkey fails)
+  onHotkeyFallbackUsed: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("hotkey-fallback-used", listener);
+    return () => ipcRenderer.removeListener("hotkey-fallback-used", listener);
+  },
+  onHotkeyRegistrationFailed: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("hotkey-registration-failed", listener);
+    return () => ipcRenderer.removeListener("hotkey-registration-failed", listener);
+  },
+  onApiKeyUpdated: registerListener(
+    "api-key-updated",
+    (callback) => (_event, storeKey) => callback(storeKey)
+  ),
+  onSettingUpdated: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on("setting-updated", listener);
+    return () => ipcRenderer.removeListener("setting-updated", listener);
+  },
+  onDictationKeyActive: (callback) => {
+    const listener = (_event, key) => callback?.(key);
+    ipcRenderer.on("dictation-key-active", listener);
+    return () => ipcRenderer.removeListener("dictation-key-active", listener);
+  },
+  onWindowsPushToTalkUnavailable: registerListener("windows-ptt-unavailable"),
+  onLinuxPttPermissionDenied: registerListener(
+    "linux-ptt-permission-denied",
+    (callback) => () => callback()
+  ),
+
+  // Settings shortcut (Cmd+, / Ctrl+,)
+  onShowSettings: registerListener("show-settings", (callback) => () => callback()),
+  getPendingSettingsSection: () => ipcRenderer.invoke("get-pending-settings-section"),
+
+  // Accessibility permission events (macOS)
+  onAccessibilityMissing: (callback) => {
+    const listener = () => callback?.();
+    ipcRenderer.on("accessibility-missing", listener);
+    return () => ipcRenderer.removeListener("accessibility-missing", listener);
+  },
+  checkAccessibilityTrusted: () => ipcRenderer.invoke("check-accessibility-trusted"),
+
+  // Notify main process of activation mode changes (for Windows Push-to-Talk)
+  notifyActivationModeChanged: (mode) => ipcRenderer.send("activation-mode-changed", mode),
+  notifyHotkeyChanged: (hotkey) => ipcRenderer.send("hotkey-changed", hotkey),
+  registerMeetingHotkey: (hotkey) => ipcRenderer.invoke("register-meeting-hotkey", hotkey),
+
+  // Floating icon auto-hide
+  notifyFloatingIconAutoHideChanged: (enabled) =>
+    ipcRenderer.send("floating-icon-auto-hide-changed", enabled),
+  onFloatingIconAutoHideChanged: registerListener(
+    "floating-icon-auto-hide-changed",
+    (callback) => (_event, enabled) => callback(enabled)
+  ),
+
+  // Panel start position
+  notifyPanelStartPositionChanged: (position) =>
+    ipcRenderer.send("panel-start-position-changed", position),
+
+  // Start minimized
+  notifyStartMinimizedChanged: (enabled) => ipcRenderer.send("start-minimized-changed", enabled),
+
+  // Auto-start management
+  getAutoStartEnabled: () => ipcRenderer.invoke("get-auto-start-enabled"),
+  setAutoStartEnabled: (enabled) => ipcRenderer.invoke("set-auto-start-enabled", enabled),
+
+  // Agent mode
+  updateVoiceAgentHotkey: (hotkey) => ipcRenderer.invoke("update-voice-agent-hotkey", hotkey),
+  getVoiceAgentKey: () => ipcRenderer.invoke("get-voice-agent-key"),
+  updateTranslationHotkey: (hotkey) => ipcRenderer.invoke("update-translation-hotkey", hotkey),
+  getTranslationKey: () => ipcRenderer.invoke("get-translation-key"),
+  onPreviewText: registerListener("preview-text", (callback) => (_event, text) => callback(text)),
+  onPreviewAppend: registerListener(
+    "preview-append",
+    (callback) => (_event, text) => callback(text)
+  ),
+  onPreviewHold: registerListener(
+    "preview-hold",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  onPreviewResult: registerListener(
+    "preview-result",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  onPreviewHide: registerListener("preview-hide", (callback) => () => callback()),
+  startDictationPreview: (opts) => ipcRenderer.invoke("start-dictation-preview", opts),
+  stopDictationPreview: (opts) => ipcRenderer.invoke("stop-dictation-preview", opts),
+  dismissDictationPreview: () => ipcRenderer.invoke("dismiss-dictation-preview"),
+  updateDictationPreview: (text) => ipcRenderer.invoke("update-dictation-preview", text),
+  completeDictationPreview: (payload) => ipcRenderer.invoke("complete-dictation-preview", payload),
+  hideDictationPreview: () => ipcRenderer.invoke("hide-dictation-preview"),
+  sendDictationPreviewAudio: (data) => ipcRenderer.send("dictation-preview-audio", data),
+
+  // Agent cloud streaming (event-based for real-time chunks)
+  startAgentStream: (requestId, messages, opts) =>
+    ipcRenderer.send("cloud-agent-stream-start", requestId, messages, opts),
+  cancelAgentStream: (requestId) => ipcRenderer.send("cloud-agent-stream-cancel", requestId),
+  onAgentStreamChunk: registerListener(
+    "cloud-agent-stream-chunk",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  onAgentStreamError: registerListener(
+    "cloud-agent-stream-error",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  onAgentStreamEnd: registerListener(
+    "cloud-agent-stream-end",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+
+  // Agent cloud tools
+  productHelp: (id, input) => ipcRenderer.invoke("product-help", id, input),
+  cancelProductHelp: (id) => ipcRenderer.send("product-help-cancel", id),
+  productHelpBasics: () => ipcRenderer.invoke("product-help-basics"),
+  agentWebSearch: (query, numResults) => ipcRenderer.invoke("agent-web-search", query, numResults),
+  agentOpenNote: (noteId) => ipcRenderer.invoke("agent-open-note", noteId),
+
+  // Agent conversation persistence
+  claimAgentConversation: (id, ownerId) =>
+    ipcRenderer.invoke("claim-agent-conversation", id, ownerId),
+  releaseAgentConversation: (id, ownerId) =>
+    ipcRenderer.invoke("release-agent-conversation", id, ownerId),
+  onAgentConversationReleased: registerListener(
+    "agent-conversation-released",
+    (callback) => (_event, payload) => callback(payload)
+  ),
+  createAgentConversation: (title, noteId, spaceId, folderId) =>
+    ipcRenderer.invoke("db-create-agent-conversation", title, noteId, spaceId, folderId),
+  getAgentConversations: (limit) => ipcRenderer.invoke("db-get-agent-conversations", limit),
+  protectConversation: (id, notes, deviceOnly, expectedAccountId) =>
+    ipcRenderer.invoke("db-protect-conversation", id, notes, deviceOnly, expectedAccountId),
+  getAgentConversation: (id) => ipcRenderer.invoke("db-get-agent-conversation", id),
+  deleteAgentConversation: (id) => ipcRenderer.invoke("db-delete-agent-conversation", id),
+  updateAgentConversationTitle: (id, title) =>
+    ipcRenderer.invoke("db-update-agent-conversation-title", id, title),
+  addAgentMessage: (conversationId, role, content, metadata) =>
+    ipcRenderer.invoke("db-add-agent-message", conversationId, role, content, metadata),
+  updateAgentMessage: (id, content, metadata) =>
+    ipcRenderer.invoke("db-update-agent-message", id, content, metadata),
+  forkAgentConversation: (conversationId, throughMessageId, forkContext) =>
+    ipcRenderer.invoke("db-fork-agent-conversation", conversationId, throughMessageId, forkContext),
+  getAgentMessages: (conversationId) => ipcRenderer.invoke("db-get-agent-messages", conversationId),
+  getAgentConversationsWithPreview: (limit, offset, includeArchived, spaceIds) =>
+    ipcRenderer.invoke(
+      "db-get-agent-conversations-with-preview",
+      limit,
+      offset,
+      includeArchived,
+      spaceIds
+    ),
+  searchAgentConversations: (query, limit, spaceIds) =>
+    ipcRenderer.invoke("db-search-agent-conversations", query, limit, spaceIds),
+  getConversationsForNote: (noteId, limit) =>
+    ipcRenderer.invoke("db-get-conversations-for-note", noteId, limit),
+  getConversationsForContainer: (spaceId, folderId, limit) =>
+    ipcRenderer.invoke("db-get-conversations-for-container", spaceId, folderId, limit),
+  archiveAgentConversation: (id) => ipcRenderer.invoke("db-archive-agent-conversation", id),
+  unarchiveAgentConversation: (id) => ipcRenderer.invoke("db-unarchive-agent-conversation", id),
+  updateAgentConversationCloudId: (id, cloudId) =>
+    ipcRenderer.invoke("db-update-agent-conversation-cloud-id", id, cloudId),
+  semanticSearchConversations: (query, limit, spaceIds) =>
+    ipcRenderer.invoke("db-semantic-search-conversations", query, limit, spaceIds),
+
+  // Sync operations
+  getPendingNotes: (spaceKind) => ipcRenderer.invoke("db-get-pending-notes", spaceKind),
+  getPendingNoteDeletes: () => ipcRenderer.invoke("db-get-pending-note-deletes"),
+  getNoteByClientId: (clientNoteId) => ipcRenderer.invoke("db-get-note-by-client-id", clientNoteId),
+  getNoteForCloudRow: (clientNoteId, cloudId) =>
+    ipcRenderer.invoke("db-get-note-for-cloud-row", clientNoteId, cloudId),
+  upsertNoteFromCloud: (cloudNote, localFolderId, localSpaceId, expectedAuthGeneration, options) =>
+    ipcRenderer.invoke(
+      "db-upsert-note-from-cloud",
+      cloudNote,
+      localFolderId,
+      localSpaceId,
+      expectedAuthGeneration,
+      options
+    ),
+  markNoteCreatesAttempted: (clientNoteIds, authGeneration) =>
+    ipcRenderer.invoke("db-mark-note-creates-attempted", clientNoteIds, authGeneration),
+  renewNoteCloudIdentity: (id, clientNoteId, cloudId, spaceId, authGeneration) =>
+    ipcRenderer.invoke(
+      "db-renew-note-cloud-identity",
+      id,
+      clientNoteId,
+      cloudId,
+      spaceId,
+      authGeneration
+    ),
+  getPrivatePlacementBackupCandidates: (authGeneration) =>
+    ipcRenderer.invoke("db-get-private-placement-backup-candidates", authGeneration),
+  getPrivatePlacementBackupRows: (authGeneration, candidates) =>
+    ipcRenderer.invoke("db-get-private-placement-backup-rows", authGeneration, candidates),
+  queueUnlinkedPrivateFolders: (authGeneration) =>
+    ipcRenderer.invoke("db-queue-unlinked-private-folders", authGeneration),
+  acknowledgeNoteCreate: (id, snapshot, cloudId, cloudUpdatedAt, ownerUserId, options) =>
+    ipcRenderer.invoke(
+      "db-acknowledge-note-create",
+      id,
+      snapshot,
+      cloudId,
+      cloudUpdatedAt,
+      ownerUserId,
+      options
+    ),
+  markNoteSyncedIfUnchanged: (
+    id,
+    snapshot,
+    expectedCloudId,
+    cloudUpdatedAt,
+    ownerUserId,
+    cloudRevision,
+    cloudNote,
+    authGeneration
+  ) =>
+    ipcRenderer.invoke(
+      "db-mark-note-synced-if-unchanged",
+      id,
+      snapshot,
+      expectedCloudId,
+      cloudUpdatedAt,
+      ownerUserId,
+      cloudRevision,
+      cloudNote,
+      authGeneration
+    ),
+  setNoteCloudBase: (id, cloudUpdatedAt, cloudRevision, options) =>
+    ipcRenderer.invoke("db-set-note-cloud-base", id, cloudUpdatedAt, cloudRevision, options),
+  setNoteOwnerFromCloud: (id, ownerUserId) =>
+    ipcRenderer.invoke("db-set-note-owner-from-cloud", id, ownerUserId),
+  countTeamNotesMissingOwner: () => ipcRenderer.invoke("db-count-team-notes-missing-owner"),
+  countNotesMissingRevision: (spaceKind) =>
+    ipcRenderer.invoke("db-count-notes-missing-revision", spaceKind),
+  markNoteSyncError: (id) => ipcRenderer.invoke("db-mark-note-sync-error", id),
+  keepDeletedNoteTranscript: (id, transcript, writeGuard) =>
+    ipcRenderer.invoke("db-keep-deleted-note-transcript", id, transcript, writeGuard),
+  restoreNoteAfterDeniedDelete: (id) =>
+    ipcRenderer.invoke("db-restore-note-after-denied-delete", id),
+  hardDeleteNote: (id, authGeneration, options) =>
+    ipcRenderer.invoke("db-hard-delete-note", id, authGeneration, options),
+
+  getPendingFolders: (spaceKind) => ipcRenderer.invoke("db-get-pending-folders", spaceKind),
+  getFolderByClientId: (clientFolderId) =>
+    ipcRenderer.invoke("db-get-folder-by-client-id", clientFolderId),
+  getFolderByCloudId: (cloudId) => ipcRenderer.invoke("db-get-folder-by-cloud-id", cloudId),
+  upsertFolderFromCloud: (cloudFolder, localSpaceId, expectedAuthGeneration, options) =>
+    ipcRenderer.invoke(
+      "db-upsert-folder-from-cloud",
+      cloudFolder,
+      localSpaceId,
+      expectedAuthGeneration,
+      options
+    ),
+  acknowledgeFolderCreate: (
+    id,
+    snapshot,
+    expectedCloudId,
+    responseClientFolderId,
+    cloudId,
+    cloudUpdatedAt,
+    expectedAuthGeneration
+  ) =>
+    ipcRenderer.invoke(
+      "db-acknowledge-folder-create",
+      id,
+      snapshot,
+      expectedCloudId,
+      responseClientFolderId,
+      cloudId,
+      cloudUpdatedAt,
+      expectedAuthGeneration
+    ),
+  markFolderSyncedIfUnchanged: (id, snapshot, expectedCloudId, authGeneration) =>
+    ipcRenderer.invoke(
+      "db-mark-folder-synced-if-unchanged",
+      id,
+      snapshot,
+      expectedCloudId,
+      authGeneration
+    ),
+  ensureAccountDefaultFolders: (foreignCloudIds, expectedScope) =>
+    ipcRenderer.invoke("db-ensure-account-default-folders", foreignCloudIds, expectedScope),
+  getFolderIdMap: () => ipcRenderer.invoke("db-get-folder-id-map"),
+  applyCloudFolderParents: (links, authGeneration) =>
+    ipcRenderer.invoke("db-apply-cloud-folder-parents", links, authGeneration),
+  getPendingFolderDeletes: () => ipcRenderer.invoke("db-get-pending-folder-deletes"),
+  restoreFolderAfterDeniedDelete: (id) =>
+    ipcRenderer.invoke("db-restore-folder-after-denied-delete", id),
+  hardDeleteFolder: (id, authGeneration, options) =>
+    ipcRenderer.invoke("db-hard-delete-folder", id, authGeneration, options),
+  relocateRevokedFolder: (id, privateSpaceId, preserveFolder) =>
+    ipcRenderer.invoke("db-relocate-revoked-folder", id, privateSpaceId, preserveFolder),
+  forkFolderIdentity: (id) => ipcRenderer.invoke("db-fork-folder-identity", id),
+
+  getPendingConversations: () => ipcRenderer.invoke("db-get-pending-conversations"),
+  getPendingConversationDeletes: () => ipcRenderer.invoke("db-get-pending-conversation-deletes"),
+  getConversationByClientId: (clientId) =>
+    ipcRenderer.invoke("db-get-conversation-by-client-id", clientId),
+  claimConversationFromCloud: (cloudConv, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-claim-conversation-from-cloud", cloudConv, expectedAuthGeneration),
+  upsertConversationFromCloud: (cloudConv, messages, snapshot, expectedAuthGeneration) =>
+    ipcRenderer.invoke(
+      "db-upsert-conversation-from-cloud",
+      cloudConv,
+      messages,
+      snapshot,
+      expectedAuthGeneration
+    ),
+  markConversationCreateAttempted: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-mark-conversation-create-attempted", id, expectedAuthGeneration),
+  markConversationPending: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-mark-conversation-pending", id, expectedAuthGeneration),
+  getSyncedLinkedConversations: (expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-get-synced-linked-conversations", expectedAuthGeneration),
+  clearConversationCreateAttempted: (id) =>
+    ipcRenderer.invoke("db-clear-conversation-create-attempted", id),
+  acknowledgeConversationCreate: (id, snapshot, cloudId, accountId, authGeneration) =>
+    ipcRenderer.invoke(
+      "db-acknowledge-conversation-create",
+      id,
+      snapshot,
+      cloudId,
+      accountId,
+      authGeneration
+    ),
+  markConversationSynced: (id, cloudId, snapshot, cloudUpdatedAt, accountId, authGeneration) =>
+    ipcRenderer.invoke(
+      "db-mark-conversation-synced",
+      id,
+      cloudId,
+      snapshot,
+      cloudUpdatedAt,
+      accountId,
+      authGeneration
+    ),
+  replaceConversationClientId: (id, expectedClientId, accountId, authGeneration) =>
+    ipcRenderer.invoke(
+      "db-replace-conversation-client-id",
+      id,
+      expectedClientId,
+      accountId,
+      authGeneration
+    ),
+  hardDeleteConversation: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-hard-delete-conversation", id, expectedAuthGeneration),
+
+  getPendingTranscriptions: () => ipcRenderer.invoke("db-get-pending-transcriptions"),
+  getTranscriptionByClientId: (clientId) =>
+    ipcRenderer.invoke("db-get-transcription-by-client-id", clientId),
+  upsertTranscriptionFromCloud: (cloudTranscription, expectedAuthGeneration) =>
+    ipcRenderer.invoke(
+      "db-upsert-transcription-from-cloud",
+      cloudTranscription,
+      expectedAuthGeneration
+    ),
+  markTranscriptionSynced: (id, cloudId, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-mark-transcription-synced", id, cloudId, expectedAuthGeneration),
+  getPendingTranscriptionDeletes: () => ipcRenderer.invoke("db-get-pending-transcription-deletes"),
+  hardDeleteTranscription: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-hard-delete-transcription", id, expectedAuthGeneration),
+
+  getPendingDictionary: () => ipcRenderer.invoke("db-get-pending-dictionary"),
+  getPendingDictionaryDeletes: () => ipcRenderer.invoke("db-get-pending-dictionary-deletes"),
+  getDictionaryByClientId: (clientDictId) =>
+    ipcRenderer.invoke("db-get-dictionary-by-client-id", clientDictId),
+  upsertDictionaryFromCloud: (cloudEntry, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-upsert-dictionary-from-cloud", cloudEntry, expectedAuthGeneration),
+  markDictionarySynced: (
+    id,
+    cloudId,
+    serverUpdatedAt,
+    expectedWord,
+    expectedSource,
+    serverSource,
+    pushed,
+    expectedAuthGeneration
+  ) =>
+    ipcRenderer.invoke(
+      "db-mark-dictionary-synced",
+      id,
+      cloudId,
+      serverUpdatedAt,
+      expectedWord,
+      expectedSource,
+      serverSource,
+      pushed,
+      expectedAuthGeneration
+    ),
+  hardDeleteDictionary: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-hard-delete-dictionary", id, expectedAuthGeneration),
+  clearDictionaryCloudId: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-clear-dictionary-cloud-id", id, expectedAuthGeneration),
+  keepNewerDictionaryEdit: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-keep-newer-dictionary-edit", id, expectedAuthGeneration),
+  broadcastDictionaryUpdated: () => ipcRenderer.invoke("db-broadcast-dictionary-updated"),
+  getDictionaryEntriesByWords: (words) =>
+    ipcRenderer.invoke("db-get-dictionary-entries-by-words", words),
+  markDictionaryWordsShared: (words, sharedAt, options) =>
+    ipcRenderer.invoke("db-mark-dictionary-words-shared", words, sharedAt, options),
+  getMovedDictionaryWords: () => ipcRenderer.invoke("db-get-moved-dictionary-words"),
+  retireMovedDictionaryWords: (words, options) =>
+    ipcRenderer.invoke("db-retire-moved-dictionary-words", words, options),
+  reviveRetiredDictionaryWords: (words, options) =>
+    ipcRenderer.invoke("db-revive-retired-dictionary-words", words, options),
+
+  getSharedDictionary: (workspaceId) => ipcRenderer.invoke("db-shared-dictionary-get", workspaceId),
+  applySharedDictionaryPull: (workspaceId, change) =>
+    ipcRenderer.invoke("db-shared-dictionary-apply-pull", workspaceId, change),
+  replaceSharedDictionary: (workspaceId, full) =>
+    ipcRenderer.invoke("db-shared-dictionary-replace", workspaceId, full),
+  applySharedDictionaryHides: (workspaceId, change) =>
+    ipcRenderer.invoke("db-shared-dictionary-apply-hides", workspaceId, change),
+  replaceSharedDictionaryHides: (workspaceId, hidden) =>
+    ipcRenderer.invoke("db-shared-dictionary-replace-hides", workspaceId, hidden),
+  clearSharedDictionary: (workspaceId) =>
+    ipcRenderer.invoke("db-shared-dictionary-clear", workspaceId),
+  pruneSharedDictionary: (keepWorkspaceIds) =>
+    ipcRenderer.invoke("db-shared-dictionary-prune", keepWorkspaceIds),
+  setSharedDictionaryHints: (promptHints, hotwordHints) =>
+    ipcRenderer.invoke("dictionary-set-shared-hints", promptHints, hotwordHints),
+
+  getPendingSnippets: () => ipcRenderer.invoke("db-get-pending-snippets"),
+  getPendingSnippetDeletes: () => ipcRenderer.invoke("db-get-pending-snippet-deletes"),
+  getSnippetForCloudMerge: (cloudEntry, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-get-snippet-for-cloud-merge", cloudEntry, expectedAuthGeneration),
+  upsertSnippetFromCloud: (cloudEntry, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-upsert-snippet-from-cloud", cloudEntry, expectedAuthGeneration),
+  markSnippetSynced: (
+    id,
+    cloudId,
+    serverUpdatedAt,
+    expectedTrigger,
+    expectedReplacement,
+    expectedAuthGeneration
+  ) =>
+    ipcRenderer.invoke(
+      "db-mark-snippet-synced",
+      id,
+      cloudId,
+      serverUpdatedAt,
+      expectedTrigger,
+      expectedReplacement,
+      expectedAuthGeneration
+    ),
+  hardDeleteSnippet: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-hard-delete-snippet", id, expectedAuthGeneration),
+  clearSnippetCloudId: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-clear-snippet-cloud-id", id, expectedAuthGeneration),
+  keepNewerSnippetEdit: (id, expectedAuthGeneration) =>
+    ipcRenderer.invoke("db-keep-newer-snippet-edit", id, expectedAuthGeneration),
+  broadcastSnippetsUpdated: () => ipcRenderer.invoke("db-broadcast-snippets-updated"),
+
+  // Google Calendar
+  gcalStartOAuth: (requestId) => ipcRenderer.invoke("gcal-start-oauth", requestId),
+  calendarCancelConnect: (requestId) => ipcRenderer.invoke("calendar-cancel-connect", requestId),
+  gcalDisconnect: (email) => ipcRenderer.invoke("gcal-disconnect", email),
+  gcalGetConnectionStatus: () => ipcRenderer.invoke("gcal-get-connection-status"),
+  gcalGetCalendars: () => ipcRenderer.invoke("gcal-get-calendars"),
+  gcalSetCalendarSelection: (calendarId, isSelected) =>
+    ipcRenderer.invoke("gcal-set-calendar-selection", calendarId, isSelected),
+  gcalSetPrimaryOnly: (value) => ipcRenderer.invoke("gcal-set-primary-only", value),
+  gcalSyncEvents: () => ipcRenderer.invoke("gcal-sync-events"),
+  gcalGetUpcomingEvents: (windowMinutes, options) =>
+    ipcRenderer.invoke("gcal-get-upcoming-events", windowMinutes, options),
+  connectorStatus: () => ipcRenderer.invoke("connector-status"),
+  connectorPrepare: (connectorId, action, args) =>
+    ipcRenderer.invoke("connector-prepare", connectorId, action, args),
+  connectorQuery: (connectorId, action, args) =>
+    ipcRenderer.invoke("connector-query", connectorId, action, args),
+  connectorCommit: (actionId, edits) => ipcRenderer.invoke("connector-commit", actionId, edits),
+  connectorCancel: (actionId, reason) => ipcRenderer.invoke("connector-cancel", actionId, reason),
+  connectorRunDirect: (connectorId, action, args, runId) =>
+    ipcRenderer.invoke("connector-run-direct", connectorId, action, args, runId),
+  connectorRecentActions: (connectorId, limit) =>
+    ipcRenderer.invoke("connector-recent-actions", connectorId, limit),
+  connectorFindContacts: (query) => ipcRenderer.invoke("connector-find-contacts", query),
+  connectorNoteAttendees: (request) => ipcRenderer.invoke("connector-note-attendees", request),
+  connectorConnect: (connectorId, options) =>
+    ipcRenderer.invoke("connector-connect", connectorId, options),
+  connectorCancelConnect: (connectorId) =>
+    ipcRenderer.invoke("connector-cancel-connect", connectorId),
+  connectorDisconnect: (connectorId) => ipcRenderer.invoke("connector-disconnect", connectorId),
+  onConnectorStatusChanged: (callback) => {
+    const listener = (_event, statuses) => callback(statuses);
+    ipcRenderer.on("connector-status-changed", listener);
+    return () => ipcRenderer.removeListener("connector-status-changed", listener);
+  },
+  // A connect's progress, such as the code GitHub's device flow shows.
+  onConnectorConnectProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("connector-connect-progress", listener);
+    return () => ipcRenderer.removeListener("connector-connect-progress", listener);
+  },
+  calendarGetAvailability: (request) => ipcRenderer.invoke("calendar-get-availability", request),
+  gcalGetEvent: (eventId) => ipcRenderer.invoke("gcal-get-event", eventId),
+  calendarGetLinkableEvents: () => ipcRenderer.invoke("calendar-get-linkable-events"),
+
+  // Microsoft Calendar
+  mcalStartOAuth: (requestId) => ipcRenderer.invoke("mcal-start-oauth", requestId),
+  mcalDisconnect: (email) => ipcRenderer.invoke("mcal-disconnect", email),
+  mcalGetConnectionStatus: () => ipcRenderer.invoke("mcal-get-connection-status"),
+  mcalSetPrimaryOnly: (value) => ipcRenderer.invoke("mcal-set-primary-only", value),
+
+  // Apple Calendar (macOS EventKit)
+  acalConnect: (requestId) => ipcRenderer.invoke("acal-connect", requestId),
+  acalDisconnect: () => ipcRenderer.invoke("acal-disconnect"),
+  acalGetConnectionStatus: () => ipcRenderer.invoke("acal-get-connection-status"),
+  openCalendarPrivacySettings: () => ipcRenderer.invoke("open-calendar-privacy-settings"),
+
+  // Contacts
+  searchContacts: (query) => ipcRenderer.invoke("search-contacts", query),
+  searchInviteContacts: (query, exclude) =>
+    ipcRenderer.invoke("search-invite-contacts", query, exclude),
+  upsertContact: (contact) => ipcRenderer.invoke("upsert-contact", contact),
+  getMD5Hash: (text) => ipcRenderer.invoke("get-md5-hash", text),
+
+  // Google Calendar event listeners
+  onGcalConnectionChanged: registerListener(
+    "gcal-connection-changed",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onGcalEventsSynced: registerListener(
+    "gcal-events-synced",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Microsoft Calendar event listeners
+  onMcalConnectionChanged: registerListener(
+    "mcal-connection-changed",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMcalEventsSynced: registerListener(
+    "mcal-events-synced",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Apple Calendar event listeners
+  onAcalConnectionChanged: registerListener(
+    "acal-connection-changed",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onAcalEventsSynced: registerListener(
+    "acal-events-synced",
+    (callback) => (_event, data) => callback(data)
+  ),
+
+  // Meeting detection
+  syncNotificationPreferences: (prefs) =>
+    ipcRenderer.invoke("sync-notification-preferences", prefs),
+  setSpeakerDiarizationEnabled: (enabled) =>
+    ipcRenderer.invoke("meeting-set-speaker-diarization-enabled", { enabled }),
+  setMeetingSessionSpeakerConfig: (config) =>
+    ipcRenderer.invoke("meeting-set-session-speaker-config", config),
+  getWhisperVadConfig: () => ipcRenderer.invoke("whisper-vad-get-config"),
+  setWhisperVadConfig: (config) => ipcRenderer.invoke("whisper-vad-set-config", config),
+  onMeetingNotificationData: registerListener(
+    "meeting-notification-data",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingAutoEndRequested: registerListener(
+    "meeting-auto-end-requested",
+    (callback) => (_event, data) => callback(data)
+  ),
+  getMeetingNotificationDestination: () =>
+    ipcRenderer.invoke("get-meeting-notification-destination"),
+  selectMeetingNotificationFolder: (folder) =>
+    ipcRenderer.invoke("select-meeting-notification-folder", folder),
+  createMeetingNotificationFolder: (request) =>
+    ipcRenderer.invoke("create-meeting-notification-folder", request),
+  onMeetingNotificationFolderCreated: registerListener(
+    "meeting-notification-folder-created",
+    (callback) => (_event, data) => callback(data)
+  ),
+  setMeetingNotificationSurface: (state) =>
+    ipcRenderer.invoke("set-meeting-notification-surface", state),
+  onMeetingNotificationSurfaceClosed: registerListener(
+    "meeting-notification-surface-closed",
+    (callback) => (_event, data) => callback(data)
+  ),
+  onMeetingNotificationSurfaceResized: registerListener(
+    "meeting-notification-surface-resized",
+    (callback) => (_event, data) => callback(data)
+  ),
+  getMeetingNotificationData: () => ipcRenderer.invoke("get-meeting-notification-data"),
+  meetingNotificationReady: () => ipcRenderer.invoke("meeting-notification-ready"),
+  meetingNotificationRespond: (detectionId, action, options) =>
+    ipcRenderer.invoke("meeting-notification-respond", detectionId, action, options),
+  confirmMeetingNoteNavigation: (navigationId, status) =>
+    ipcRenderer.invoke("confirm-meeting-note-navigation", navigationId, status),
+  joinCalendarMeeting: (eventId, notesOnly) =>
+    ipcRenderer.invoke("join-calendar-meeting", eventId, notesOnly),
+  startManualMeeting: () => ipcRenderer.invoke("start-manual-meeting"),
+  getPendingMeetingNoteNavigation: () => ipcRenderer.invoke("get-pending-meeting-note-navigation"),
+  onMeetingNoteNavigationPending: registerListener(
+    "meeting-note-navigation-pending",
+    (callback) => () => callback()
+  ),
+  getPendingNoteNavigation: () => ipcRenderer.invoke("get-pending-note-navigation"),
+  onNoteNavigationPending: registerListener(
+    "note-navigation-pending",
+    (callback) => () => callback()
+  ),
+});

@@ -1,0 +1,17288 @@
+const { parseSelfHostedSttHeaders, selfHostedSttRequest } = require("./selfHostedSttHeaders.js");
+const {
+  registryData: modelRegistryData,
+  getRunnableSpeechModel,
+  listRunnableLocalModels,
+} = require("../models/registryData.js");
+const { isLocalModelPolicyRefusal } = require("./localModelPolicyGate");
+const { OrukeetStreaming, MANAGED_STREAM_OPTIONS } = require("./orukeetStreaming");
+const { connectManagedOrukeet } = require("./orukeetCloudSession");
+const {
+  ipcMain,
+  app,
+  shell,
+  BrowserWindow,
+  systemPreferences,
+  net,
+  session,
+  powerMonitor,
+} = require("electron");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const { isRestorablePasteTarget } = require("./windowsPasteTarget");
+const crypto = require("crypto");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const debugLogger = require("./debugLogger");
+const { ANALYTICS_HISTORY_BACKFILL_VERSION } = require("./analytics");
+const { PARAKEET_UNSUPPORTED_OS_CODE } = require("./parakeetCapability");
+const { getModelType, isSherpaLocalProvider } = require("./parakeetModelInfo");
+const { broadcastToWindows } = require("./windowBroadcast");
+const { isFromWindow } = require("./ipcSender");
+const { openExternalUrl } = require("./externalUrlOpener");
+const { PRIVACY_SETTINGS_URL, usesAppControlPicker } = require("./macAppControl");
+const { resolveFailedGpuBackends } = require("./whisper");
+const { WHISPER_GPU_FAILURE_REASON_KEYS } = require("./whisperGpuFailureReason");
+const { BYOK_API_KEYS } = require("../config/secretKeys");
+const { dictionaryWordKey } = require("../utils/dictionaryWordKey");
+const tokenStore = require("./tokenStore");
+const accountScopeBinding = require("./accountScopeBinding");
+const affiliateLinks = require("./affiliateLinks");
+const { createNoteFilesSync } = require("./noteFilesSync");
+const { registerProductHelpIpc, remoteHelpPolicyState } = require("./productHelp");
+const { captureAuthFence, createCloudApiRequestHandler } = require("./cloudApiRequest");
+const { MetaActivation } = require("./metaActivation");
+const { ProductEvents, createFileStore: createProductEventsStore } = require("./productEvents");
+const { decodeLeaderboardPngDataUrl, leaderboardImageFilename } = require("./leaderboardImage");
+const { withPolicyRequestHeaders } = require("./policyRequestHeaders");
+const {
+  createWorkspacePolicyManager,
+  isScreenContextBlocked,
+} = require("./workspacePolicyManager");
+const {
+  createEnterpriseIdentityManager,
+  CONFIG_REFRESH_MS,
+} = require("./enterpriseIdentityManager");
+const { createMeetingRecordingAdmission } = require("./meetingRecordingAdmission");
+const { createEffectivePolicyManager } = require("./effectivePolicyManager");
+const { devicePolicyNetworkAllowed } = require("./devicePolicyNetwork");
+const {
+  policyRefusalKey,
+  productOperationAllowed,
+  productPolicyState,
+  realtimeSelection,
+  runningOperationAllowed,
+} = require("./productPolicy");
+const { createCloudConfigRequestHandler } = require("./cloudConfigRequest");
+const { extractAnthropicText, describeMissingAnthropicText } = require("./anthropicResponse");
+const {
+  createPolicyResponseError,
+  readPolicyResponseError,
+  toPolicyFailure,
+} = require("./policyResponseError");
+const { classifyAndLog } = require("./networkErrors");
+const { resolveSystemDefaultMicrophone } = require("./systemDefaultMicrophone");
+const { ipcErrorFields } = require("./ipcErrorFields");
+const {
+  PROVIDER_ERROR_CODES,
+  isProviderSettingsTarget,
+  providerHttpError,
+  providerError,
+  asProviderError,
+  redactProviderBody,
+} = require("./providerHttpErrors");
+const { getLlmRequestTimeoutSeconds, llmRequestTimeoutError } = require("./llmRequestTimeout");
+const { isSettingsTarget, isPlansBillingTarget } = require("./settingsTargets");
+const {
+  registerConnectorIpc,
+  createConnectorPolicyResolver,
+  createConnectorAuthLookup,
+  POLICY_TIMEOUT_MS,
+} = require("./connectors/connectorIpc");
+const { createNoteAttendeesLookup, searchContacts } = require("./connectors/contactSearch");
+// The renderer's ModelRegistry is not main-loadable; the route resolver only
+// needs {id, baseUrl} per provider.
+const transcriptionProviderBaseUrls = () => modelRegistryData.transcriptionProviders;
+// Classified errors show the provider's display name; routes only carry its id.
+const transcriptionProviderName = (id) =>
+  modelRegistryData.transcriptionProviders.find((p) => p.id === id)?.name || id;
+// ipcMain.handle keeps only the message when a promise rejects, dropping custom
+// props — proxy handlers return the classified fields so the renderer can
+// rebuild the error.
+const serializeIpcError =
+  (fn) =>
+  async (...args) => {
+    try {
+      return await fn(...args);
+    } catch (error) {
+      return ipcErrorFields(error);
+    }
+  };
+
+// Analytics uploads cross two asynchronous boundaries: renderer -> main and
+// main -> cloud. Pin every local queue operation to the same authenticated
+// account generation so a delayed pass cannot adopt a replacement session.
+function assertAnalyticsSyncContext(context) {
+  if (context == null) return null;
+  const state = tokenStore.getState();
+  if (
+    typeof context !== "object" ||
+    typeof context.accountId !== "string" ||
+    context.accountId.length === 0 ||
+    !Number.isInteger(context.authGeneration) ||
+    !state.token ||
+    state.generation !== context.authGeneration
+  ) {
+    throw Object.assign(new Error("Authentication context changed during analytics sync"), {
+      code: "AUTH_CONTEXT_CHANGED",
+    });
+  }
+  return context.accountId;
+}
+const STALE_SYNC_ACK = { success: false, changes: 0, stale: true };
+// The account each sign-in (token generation) was scoped to. A chat ack names
+// the account it was sent as, and main accepts that only when it is the one
+// the push's sign-in was scoped to, so a window left over from another sign-in
+// can't move a row. A renderer can only name an account it has scoped to.
+const scopedAccountByGeneration = new Map();
+function syncSenderAccount(accountId, authGeneration) {
+  return typeof accountId === "string" &&
+    accountId &&
+    scopedAccountByGeneration.get(authGeneration) === accountId
+    ? accountId
+    : null;
+}
+// A workspace id from the renderer: a non-empty string, or null for none.
+// The note queues a sync pass reads (DatabaseManager.getPendingNotes).
+const SYNC_NOTE_QUEUES = new Set([null, undefined, "private", "team", "syncable"]);
+
+function isWorkspaceIdArgument(value) {
+  return value === null || (typeof value === "string" && value.trim().length > 0);
+}
+// A local row id from the renderer.
+function isRowIdArgument(value) {
+  return Number.isInteger(value) && value > 0;
+}
+// The spaces a search may read: null when the caller names none, and nothing
+// when it names them in any other shape than a list of row ids.
+function spaceIdsArgument(value) {
+  if (value == null) return null;
+  return Array.isArray(value) && value.every(isRowIdArgument) ? value : [];
+}
+// Workspace calls may name the account they were made for. One that arrives
+// after another account signed in is refused rather than applied to it.
+function isForOtherAccount(accountId, activeAccountId) {
+  return accountId !== undefined && accountId !== activeAccountId;
+}
+const INVALID_DEVICE_NOTES_REQUEST = {
+  success: false,
+  code: "invalid_request",
+  error: "The request is malformed",
+};
+const ACCOUNT_CHANGED_RESULT = {
+  success: false,
+  code: "ACCOUNT_CHANGED",
+  error: "The account changed before the workspace call arrived",
+};
+// Local engines resolve a failed decode instead of throwing. Retry turns that
+// into a coded error so the toast says what went wrong rather than blaming a
+// missing engine.
+function localTranscriptionFailure(result) {
+  const error = new Error(result.message || result.error || "Local transcription failed");
+  if (result.code === "NO_SPEECH_DETECTED" || result.message === "No audio detected") {
+    error.code = "NO_SPEECH_DETECTED";
+  } else if (result.error === "invalid_response") {
+    error.code = "INVALID_RESPONSE";
+    error.messageKey = "controlPanel.history.retryErrors.invalidResponse";
+  }
+  return error;
+}
+// The answer product work gets when the policy refuses or retires it.
+const policyBlockedMessage = (snapshot) => i18nMain.t(policyRefusalKey(snapshot));
+const policyBlockedFailure = (snapshot) => ({
+  success: false,
+  code: "DEVICE_POLICY_BLOCKED",
+  error: policyBlockedMessage(snapshot),
+});
+// Which diarization dialect a resolved endpoint speaks, for Custom endpoints
+// that front a known provider. Null when the host offers no known dialect.
+const diarizationHost = (endpoint) => {
+  try {
+    const host = new URL(endpoint).hostname;
+    if (host === "mistral.ai" || host.endsWith(".mistral.ai")) return "mistral";
+    if (host === "openai.com" || host.endsWith(".openai.com")) return "openai";
+  } catch {}
+  return null;
+};
+const { createLocalCleanupPrewarm } = require("./localCleanupPrewarm");
+const { resolveLocalServerNeeds, shouldStopLocalServer } = require("./localServerPolicy");
+const autoStart = require("./autoStart");
+const { getRelaunchOptions, getRelaunchWaiter } = require("./autoStartPolicy");
+const HyprlandShortcutManager = require("./hyprlandShortcut");
+const AssemblyAiStreaming = require("./assemblyAiStreaming");
+const { i18nMain, changeLanguage } = require("./i18nMain");
+const DeepgramStreaming = require("./deepgramStreaming");
+const {
+  GeminiLiveStreaming,
+  GEMINI_LIVE_MODEL,
+  resolveGeminiLiveModel,
+} = require("./geminiLiveStreaming");
+const CortiStreaming = require("./cortiStreaming");
+const OpenAIRealtimeStreaming = require("./openaiRealtimeStreaming");
+const { getCortiToken } = require("./cortiAuth");
+const { ONBOARDING_DEMO_KINDS, ONBOARDING_DEMO_STATUSES } = require("./onboardingInputPolicy");
+const { focusWindowsHotkeyCaptureWindow } = require("./hotkeyCaptureFocus");
+const { createTinfoilRealtimeSocket } = require("./tinfoilSecureClient");
+const { TINFOIL_REALTIME_MODEL } = require("./tinfoilRealtimeStreaming");
+const { getTinfoilChatModels } = require("./tinfoilCatalog");
+const { transcribeWithTinfoil } = require("./tinfoilTranscription");
+const { transcribeWithGemini } = require("./geminiTranscription");
+const { transcribeAssemblyAiRecording } = require("./assemblyAiDictation");
+const { transcribeWithElevenLabs } = require("./elevenLabsTranscription");
+const AudioStorageManager = require("./audioStorage");
+const { SkillLibrary } = require("./skills/skillLibrary");
+const { registerSkillsIpc } = require("./skills/skillsIpc");
+const LocalModelDownloadStatus = require("./localModelDownloadStatus");
+const { readLocalSetupSpace } = require("./localSetupSpace");
+const AgentStreamRequestRegistry = require("./agentStreamRequestRegistry");
+const createMeetingTranscriptionLifecycle = require("./meetingTranscriptionLifecycle");
+const liveSpeakerIdentifier = require("./liveSpeakerIdentifier");
+const { supportsLiveSpeakerIdentification } = require("./liveSpeakerIdPolicy");
+const MeetingEchoLeakDetector = require("./meetingEchoLeakDetector");
+const createMeetingSystemAudioWatchdog = require("./meetingSystemAudioWatchdog");
+const createMeetingSystemAudioHandover = require("./meetingSystemAudioHandover");
+const {
+  partitionPendingMicFinals,
+  isRiskyMicDuplicateProfile,
+  isDuplicateMicSegment,
+  selectRacingMicEntryIndices,
+  partitionOverlappingPendingMicFinals,
+} = require("./meetingMicHoldback");
+const { fragmentFilterLanguages, isWrongScriptFragment } = require("./meetingFragmentFilter");
+const {
+  computeChunkStats,
+  resolveMicChunkAction,
+  MEETING_MIC_SILENCE_RMS,
+  MEETING_MIC_SILENCE_PEAK,
+} = require("./meetingMicGate");
+const { deriveDetectorPreferences } = require("./meetingDetectionPreferencePolicy");
+const { resolveDiarizationInput } = require("./meetingDiarizationInput");
+const { applySmartSpacing } = require("./smartSpacing");
+const { applyAutoLearnSetting } = require("./autoLearnSetting");
+const {
+  DEFAULT_RETENTION_SETTINGS,
+  createRetentionSettingsHandler,
+} = require("./retentionSettings");
+const {
+  transcriptsOverlap,
+  transcriptsLooselyOverlap,
+  buildMergedCandidates,
+} = require("./transcriptText");
+const {
+  applyConfirmedSpeaker,
+  applySuggestedSpeaker,
+  canAutoRelabelSpeaker,
+} = require("./speakerAssignmentPolicy");
+const { normalizeStoredSpeakerCount } = require("./speakerCount");
+const {
+  buildSpeakerRenumber,
+  normalizeSpeakerIndexBase,
+  resolveSpeakerIndexBase,
+} = require("./speakerIndexBase");
+const { downsample24kTo16k, pcm16ToWav } = require("../utils/audioUtils");
+const postMigrationDetector = require("./postMigrationDetector");
+const screenContextCapture = require("./screenContextCapture");
+const { classifyToneAppCategory } = require("./toneAppCategories");
+const {
+  DEFAULT_EXPECTED_SPEAKER_COUNT,
+  EMBEDDING_VERSION,
+  MAX_SPEAKER_COUNT,
+} = require("../constants/speakerDetection.json");
+const { UPLOAD_AUDIO_EXTENSIONS } = require("../constants/uploadAudioFormats.json");
+const { providerContentType, prepareProviderUpload } = require("./providerUploadAudio");
+const {
+  DEFAULT_WHISPER_VAD_CONFIG,
+  sanitizeWhisperVadConfig,
+  resolveContextSileroEnabled,
+} = require("./whisperVadConfig");
+
+const {
+  ALLOWED_MEETING_PROVIDERS,
+  getMeetingStreamingClient,
+  getMeetingConnectionKey,
+} = require("./meetingStreamingProviders");
+const {
+  createServerTokenPoster,
+  fetchRealtimeTokenForProvider,
+  isSignInRefusal,
+} = require("./realtimeTokenProviders");
+const { getCalendarAvailability } = require("./calendarAvailabilityService");
+const { CALENDAR_LOOKBACK_MS } = require("./calendarCacheWindow");
+
+// Meeting capture runs at 24 kHz (see meetingRecordingStore AudioContext); cloud
+// streaming providers must be told the true PCM rate or they misread the audio.
+const MEETING_STREAM_SAMPLE_RATE = 24000;
+const MEETING_RECONNECT_BUFFER_MAX_BYTES = MEETING_STREAM_SAMPLE_RATE * 2 * 30;
+// The realtime clients default to a 0.6 server-VAD threshold, raised in #630 to
+// keep mic ambient noise from opening turns. The system loopback channel's noise
+// floor is digital silence, so it keeps the original, more sensitive threshold —
+// at 0.6 quiet remote speech may never trip the VAD and the whole channel
+// transcribes to nothing.
+const MEETING_SYSTEM_VAD_THRESHOLD = 0.3;
+
+const MISTRAL_TRANSCRIPTION_URL = "https://api.mistral.ai/v1/audio/transcriptions";
+
+const XAI_STT_URL = "https://api.x.ai/v1/stt";
+
+// Debounce delay: wait for user to stop typing before processing corrections
+const AUTO_LEARN_DEBOUNCE_MS = 1500;
+// Suggestions the invite dialog shows under its field.
+const INVITE_SUGGESTION_LIMIT = 5;
+
+// Route caps vary by provider (Gemini's inline-base64 limit is the lowest), so
+// the message reports the cap that actually applied.
+const byokSizeCapError = (sizeCapBytes) =>
+  `File too large. Maximum size for bring-your-own-key is ${Math.floor(sizeCapBytes / (1024 * 1024))} MB.`;
+
+const CLOUD_INLINE_LIMIT = 4 * 1024 * 1024;
+// The enterprise "Test Connection" probe only needs one word back, but the
+// Azure Responses API rejects max_output_tokens below 16.
+const CONNECTION_TEST_MAX_OUTPUT_TOKENS = 16;
+const CLOUD_CHUNK_SEGMENT_SECONDS = 240;
+
+const { createAbortError } = require("./abortError");
+const { describeCortiTokenFailure, testProviderConnection } = require("./providerConnectionTest");
+const { createConnectionCheckCache } = require("./connectionCheckCache");
+const { PAID_KEY_CHECKS_FILE, createPaidKeyCheck } = require("./paidKeyCheck");
+const productEventsFile = () => path.join(app.getPath("userData"), "product-events.json");
+const {
+  ENTERPRISE_AUDIO_DEVICE_ID_FILE,
+  registerEnterpriseAudioSetup,
+} = require("./enterpriseAudioSetup");
+const { createUploadCancelRegistry } = require("./uploadCancelRegistry");
+const { applyOpenWhisprOriginHeader } = require("./sessionHeaders");
+const {
+  CLOUD_UPLOAD_TIMEOUT_MS,
+  CLOUD_CHUNK_MAX_ATTEMPTS,
+  CLOUD_CHUNK_GLOBAL_CONCURRENCY,
+  CLOUD_CHUNK_MAX_TEARDOWN_REFUNDS,
+  CLOUD_CHUNK_MAX_LOSS_RATIO,
+  SILENT_CHUNK,
+  FATAL_CHUNK_CODES,
+  isTransientChunkError,
+  isNetworkLevelFailure,
+  isConnectionPoisoningFailure,
+  isTeardownCollateral,
+  summarizeChunkResults,
+  assembleChunkTranscript,
+  chunkRetryDelayMs,
+  abortableSleep,
+  createTeardownGate,
+  createUploadSlots,
+  withoutChunkAnalytics,
+} = require("./cloudChunkPolicy");
+const { transcribeOpenRouterChunks } = require("./openRouterChunkedUpload");
+const { isAudioPolicyRefusal } = require("./audioPolicyRefusals");
+
+// Chunk retries need their own connection pool: recovering a wedged chunk pool
+// must not abort an unrelated inline upload that has no collateral retry path.
+const CLOUD_CHUNK_UPLOAD_SESSION_PARTITION = "ow-cloud-chunk-uploads";
+const CLOUD_INLINE_UPLOAD_SESSION_PARTITION = "ow-cloud-uploads";
+const cloudUploadSlots = createUploadSlots(CLOUD_CHUNK_GLOBAL_CONCURRENCY);
+const shouldDropUploadPool = createTeardownGate();
+const cloudUploadSessions = new Map();
+
+function getCloudUploadSession(partition) {
+  if (!cloudUploadSessions.has(partition)) {
+    const uploadSession = session.fromPartition(partition);
+    applyOpenWhisprOriginHeader(uploadSession);
+    cloudUploadSessions.set(partition, uploadSession);
+  }
+  return cloudUploadSessions.get(partition);
+}
+
+function getChunkCloudUploadSession() {
+  return getCloudUploadSession(CLOUD_CHUNK_UPLOAD_SESSION_PARTITION);
+}
+
+function getInlineCloudUploadSession() {
+  return getCloudUploadSession(CLOUD_INLINE_UPLOAD_SESSION_PARTITION);
+}
+
+// Counts initiated pool drops so a chunk can tell whether its failure was
+// collateral from a teardown that happened while its body was on the wire.
+let uploadPoolTeardowns = 0;
+
+async function dropUploadConnections(force = false) {
+  if (!shouldDropUploadPool(force)) return;
+  uploadPoolTeardowns++;
+  try {
+    await getChunkCloudUploadSession().closeAllConnections();
+  } catch {
+    // pool teardown is best-effort
+  }
+}
+
+const {
+  formatTimestamp: formatDiarTime,
+  mergeSpeakersWithText,
+  formatSpeakerTranscript,
+} = require("./speakerMerge");
+const { dropNoSpeechSegments } = require("./noSpeechSegments");
+const {
+  supportsWhisperSegments,
+  timestampRequestFields,
+  mapVerboseSegments,
+} = require("./uploadTimestamps");
+const { listLocalTranscriptionModels } = require("./localTranscriptionModels");
+
+// Canonicalize allowed dirs so realpath'd inputs match on macOS (/var -> /private/var).
+// Deliberately narrow: user-picked paths anywhere else are approved individually via
+// approvedAudioPaths, so a compromised renderer can't read arbitrary files.
+function getCanonicalAllowedAudioDirs() {
+  const os = require("os");
+  const { getSafeTempDir } = require("./safeTempDir");
+  const dirs = [os.tmpdir(), getSafeTempDir(), app.getPath("userData")];
+  return dirs.map((d) => {
+    try {
+      return fs.realpathSync(d);
+    } catch {
+      return d;
+    }
+  });
+}
+
+// User-picked paths (OS file dialog, real drag-dropped files) may live outside the
+// static dirs (external volumes, /mnt, D:\) and are approved individually.
+const approvedAudioPaths = new Set();
+
+function approveAudioPath(filePath) {
+  if (typeof filePath !== "string" || !filePath) return;
+  try {
+    approvedAudioPaths.add(fs.realpathSync(path.resolve(filePath)));
+  } catch {
+    // File vanished or unreadable; nothing to approve.
+  }
+}
+
+// __Secure-openwhispr.session_token in production, and the names older builds used.
+const SESSION_COOKIE_PATTERN = /(?:^|;\s*)[^=;]*session_token=/;
+
+// Recordings save-temp-audio wrote for the chat voice draft, until deleted.
+const voiceDraftAudioPaths = new Set();
+
+// The audio controls exempt dictation, so only a voice draft main itself saved
+// counts as one; any other file the renderer names is an upload.
+function audioFilePurpose(filePath, requestedPurpose) {
+  return requestedPurpose === "dictation" &&
+    typeof filePath === "string" &&
+    voiceDraftAudioPaths.has(path.resolve(filePath))
+    ? "dictation"
+    : "upload";
+}
+
+// Returns the realpath'd file path if it lives under an allowed dir, else null.
+function resolveAllowedAudioPath(filePath) {
+  const real = fs.realpathSync(path.resolve(filePath));
+  if (approvedAudioPaths.has(real)) {
+    return real;
+  }
+  const allowed = getCanonicalAllowedAudioDirs();
+  if (allowed.some((dir) => real === dir || real.startsWith(dir + path.sep))) {
+    return real;
+  }
+  return null;
+}
+
+function buildMultipartBody(fileBuffer, fileName, contentType, fields = {}) {
+  const boundary = `----OpenWhispr${Date.now()}`;
+  const parts = [];
+
+  parts.push(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n` +
+      `Content-Type: ${contentType}\r\n\r\n`
+  );
+  parts.push(fileBuffer);
+  parts.push("\r\n");
+
+  for (const [name, value] of Object.entries(fields)) {
+    if (value != null) {
+      parts.push(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="${name}"\r\n\r\n` +
+          `${value}\r\n`
+      );
+    }
+  }
+
+  parts.push(`--${boundary}--\r\n`);
+
+  const bodyParts = parts.map((p) => (typeof p === "string" ? Buffer.from(p) : p));
+  return { body: Buffer.concat(bodyParts), boundary };
+}
+
+async function postMultipart(
+  url,
+  body,
+  boundary,
+  headers = {},
+  { signal, session: fetchSession, redirect } = {}
+) {
+  const response = await (fetchSession ?? net).fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      ...headers,
+    },
+    body,
+    useSessionCookies: false,
+    signal,
+    redirect,
+  });
+  const text = await response.text();
+  try {
+    return { statusCode: response.status, data: JSON.parse(text) };
+  } catch {
+    // Vercel platform errors (413 payload cap, 504 timeout) return non-JSON bodies.
+    throw Object.assign(new Error(`Server error ${response.status}: ${text.slice(0, 120)}`), {
+      code: "SERVER_ERROR",
+      statusCode: response.status,
+    });
+  }
+}
+
+async function transcribeElevenLabsSpeech(options) {
+  const result = await transcribeWithElevenLabs(options);
+  if (!result.text) {
+    throw Object.assign(new Error("No speech detected in audio"), { code: "NO_SPEECH_DETECTED" });
+  }
+  return result;
+}
+
+function interpretTranscribeResponse(data) {
+  if (data.statusCode === 401) {
+    throw Object.assign(new Error("Session expired"), { code: "AUTH_EXPIRED" });
+  }
+  if (data.statusCode === 503) {
+    throw Object.assign(new Error("Request timed out"), { code: "SERVER_ERROR" });
+  }
+  if (data.statusCode === 429) {
+    throw Object.assign(new Error("Weekly Cloud word limit reached"), {
+      code: "LIMIT_REACHED",
+      ...data.data,
+    });
+  }
+  if (data.statusCode === 422 && data.data?.code === "NO_SPEECH_DETECTED") {
+    throw Object.assign(new Error(data.data.error || "No speech detected in audio"), {
+      code: "NO_SPEECH_DETECTED",
+    });
+  }
+  if (data.statusCode !== 200) {
+    throw createPolicyResponseError(data.statusCode, data.data, `API error: ${data.statusCode}`);
+  }
+  return data.data;
+}
+
+async function chunkedCloudTranscribe({
+  buffer = null,
+  filePath = null,
+  apiUrl,
+  policyHeaders,
+  multipartFields = {},
+  onProgress,
+  signal,
+  segmentDuration = CLOUD_CHUNK_SEGMENT_SECONDS,
+}) {
+  const { splitAudioFile } = require("./ffmpegUtils");
+
+  // Aborted by the caller cancelling or by the first fatal chunk error, so a
+  // doomed job stops uploading its remaining chunks immediately.
+  const jobController = new AbortController();
+  const { signal: jobSignal } = jobController;
+  const abortJob = () => jobController.abort();
+  signal?.addEventListener("abort", abortJob, { once: true });
+  if (signal?.aborted) abortJob();
+
+  const jobId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const chunkDir = path.join(os.tmpdir(), `ow-chunks-${jobId}`);
+  let tmpInputPath = null;
+
+  let inputPath = filePath;
+  if (!inputPath && buffer) {
+    tmpInputPath = path.join(os.tmpdir(), `ow-audio-${jobId}.webm`);
+    fs.writeFileSync(tmpInputPath, buffer);
+    inputPath = tmpInputPath;
+  }
+
+  fs.mkdirSync(chunkDir, { recursive: true });
+
+  try {
+    onProgress?.({ stage: "splitting", chunksTotal: 0, chunksCompleted: 0 });
+
+    const { chunkPaths, durationSeconds } = await splitAudioFile(inputPath, chunkDir, {
+      segmentDuration,
+      signal: jobSignal,
+    });
+    const totalChunks = chunkPaths.length;
+
+    onProgress?.({ stage: "transcribing", chunksTotal: totalChunks, chunksCompleted: 0 });
+
+    const url = new URL(`${apiUrl}/api/transcribe`);
+    const results = new Array(totalChunks).fill(null);
+    let fatalError = null;
+    let completedCount = 0;
+
+    const transcribeChunk = async (index) => {
+      let attempt = 1;
+      let teardownRefunds = CLOUD_CHUNK_MAX_TEARDOWN_REFUNDS;
+      while (true) {
+        if (jobSignal.aborted) throw createAbortError();
+
+        // Held only while a body is on the wire, so the backoff below never
+        // occupies a slot and queue time never eats the upload timeout.
+        const releaseSlot = await cloudUploadSlots.acquire(jobSignal);
+        const timeoutSignal = AbortSignal.timeout(CLOUD_UPLOAD_TIMEOUT_MS);
+        const teardownsAtStart = uploadPoolTeardowns;
+        let failure = null;
+        let timedOut = false;
+        let collateral = false;
+        try {
+          try {
+            const { body, boundary } = buildMultipartBody(
+              fs.readFileSync(chunkPaths[index]),
+              path.basename(chunkPaths[index]),
+              "audio/mpeg",
+              withoutChunkAnalytics(multipartFields)
+            );
+            const data = await postMultipart(url, body, boundary, policyHeaders, {
+              signal: AbortSignal.any([jobSignal, timeoutSignal]),
+              session: getChunkCloudUploadSession(),
+            });
+            results[index] = interpretTranscribeResponse(data);
+          } catch (err) {
+            failure = err;
+            timedOut = timeoutSignal.aborted;
+            collateral = isTeardownCollateral(err, {
+              timedOut,
+              teardownsDuringAttempt: uploadPoolTeardowns - teardownsAtStart,
+            });
+            // Drop the pool while still holding the slot — released first, a
+            // queued sibling is admitted onto the pool microseconds before
+            // closeAllConnections() kills it and burns an attempt it never
+            // owned. A fatal TLS/protocol alert proves the pool is poisoned,
+            // so that drop is forced through the cooldown gate.
+            if (!jobSignal.aborted && !collateral) {
+              const poisoned = isConnectionPoisoningFailure(err);
+              if (poisoned || isNetworkLevelFailure(err, { timedOut })) {
+                await dropUploadConnections(poisoned);
+              }
+            }
+          }
+        } finally {
+          releaseSlot();
+        }
+        if (!failure) break;
+
+        if (failure.code === "NO_SPEECH_DETECTED") {
+          results[index] = SILENT_CHUNK;
+          break;
+        }
+
+        if (jobSignal.aborted) throw createAbortError();
+        if (collateral && teardownRefunds > 0) {
+          teardownRefunds--;
+          debugLogger.warn(`Chunk ${index} attempt ${attempt} killed by pool teardown, refunded`, {
+            error: failure.message,
+          });
+          await abortableSleep(chunkRetryDelayMs(1), jobSignal);
+          continue;
+        }
+        if (attempt >= CLOUD_CHUNK_MAX_ATTEMPTS || !(timedOut || isTransientChunkError(failure))) {
+          throw failure;
+        }
+        debugLogger.warn(`Chunk ${index} attempt ${attempt} failed, retrying`, {
+          error: failure.message,
+          timedOut,
+        });
+        await abortableSleep(chunkRetryDelayMs(attempt), jobSignal);
+        attempt++;
+      }
+
+      completedCount++;
+      onProgress?.({
+        stage: "transcribing",
+        chunksTotal: totalChunks,
+        chunksCompleted: completedCount,
+      });
+    };
+
+    await Promise.all(
+      chunkPaths.map((_, index) =>
+        transcribeChunk(index).catch((err) => {
+          // Only aborts the job itself caused, reported once below. A chunk's
+          // own upload timeout also aborts, and that is a real failure.
+          if (jobSignal.aborted && err.name === "AbortError") return;
+          if (FATAL_CHUNK_CODES.has(err.code)) {
+            fatalError ??= err;
+            abortJob();
+            return;
+          }
+          debugLogger.warn(`Chunk ${index} failed`, { error: err.message, code: err.code });
+        })
+      )
+    );
+
+    if (signal?.aborted) {
+      throw Object.assign(createAbortError("Upload cancelled"), { code: "UPLOAD_CANCELLED" });
+    }
+    if (fatalError) throw fatalError;
+
+    const { responses, failedChunks: failed, silentChunks } = summarizeChunkResults(results);
+    if (responses.length === 0) {
+      if (silentChunks === totalChunks) {
+        throw Object.assign(new Error("No speech detected in audio"), {
+          code: "NO_SPEECH_DETECTED",
+        });
+      }
+      throw new Error("All chunks failed to transcribe");
+    }
+
+    if (failed / totalChunks > CLOUD_CHUNK_MAX_LOSS_RATIO) {
+      throw Object.assign(new Error(`${failed} of ${totalChunks} audio segments were lost`), {
+        code: "CHUNK_LOSS_EXCEEDED",
+      });
+    }
+
+    const text = assembleChunkTranscript(results, segmentDuration, durationSeconds);
+    return {
+      text,
+      responses,
+      lastResponse: responses[responses.length - 1],
+      ...(failed > 0
+        ? {
+            warning: `${failed} of ${totalChunks} chunks failed`,
+            failedChunks: failed,
+            totalChunks,
+          }
+        : {}),
+    };
+  } finally {
+    signal?.removeEventListener("abort", abortJob);
+    if (tmpInputPath) {
+      try {
+        fs.unlinkSync(tmpInputPath);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      fs.rmSync(chunkDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      debugLogger.warn("Failed to cleanup chunk dir", { error: cleanupErr.message });
+    }
+  }
+}
+
+// Cleanup toast wording for replies the main-process providers reject; mirror
+// TRUNCATED_/EMPTY_OUTPUT_MESSAGE_KEY in services/ai/chatRequestBody.ts (#2091).
+const CLEANUP_TRUNCATED_MESSAGE_KEY = "hooks.audioRecording.errorDescriptions.cleanupTruncated";
+const CLEANUP_EMPTY_REPLY_MESSAGE_KEY = "hooks.audioRecording.errorDescriptions.cleanupEmptyReply";
+
+const {
+  isMeetingFolderRef,
+  resolveMeetingDestination,
+  rememberMeetingDestination,
+  meetingDestinationContext,
+} = require("./meetingNotificationDestination");
+
+// A replaced or revoked session must go quiet and drop what it holds: a commit
+// would send its audio on, and a late final or socket error would land in the
+// renderer as if it came from the live session.
+function retireStreaming(streaming) {
+  if (!streaming) return;
+  streaming.onPartialTranscript = null;
+  streaming.onFinalTranscript = null;
+  streaming.onError = null;
+  streaming.onSessionEnd = null;
+  if (streaming.cleanupAll) streaming.cleanupAll();
+  else streaming.cleanupWarmConnection?.();
+  streaming.disconnect({ commit: false }).catch(() => {});
+}
+
+// The dictation's renderer hears of the revocation at once and falls back,
+// rather than streaming into a closed session behind a frozen preview.
+function retireProductStream(handlers, property) {
+  handlers[property]?.onError?.(new Error(i18nMain.t("common.policyTranscriptionRestricted")));
+  retireStreaming(handlers[property]);
+  handlers[property] = null;
+  handlers._remoteStreamPolicies.delete(property);
+}
+
+function cancelWindowRequests(registry) {
+  for (const win of BrowserWindow.getAllWindows()) registry.cancelSender(win.webContents.id);
+}
+
+// What both policy retirements end: a disallowed preview, product request or
+// cloud request. `remoteStopped` also ends every request that leaves the device.
+function abortDisallowedRequests(handlers, snapshot, remoteStopped = false) {
+  const allowed = (channel, args, accountId = snapshot.accountId) =>
+    runningOperationAllowed(snapshot, accountId, app.getVersion(), channel, args);
+  if (!allowed("start-dictation-preview")) handlers._stopLocalDictationPreview?.();
+  for (const [controller, operation] of handlers._productRequests ?? []) {
+    if (
+      (remoteStopped && operation.remote) ||
+      !allowed(operation.channel, operation.args, operation.accountId)
+    )
+      controller.abort();
+  }
+  for (const [channel, registry] of [
+    ["cloud-agent-stream-start", handlers._agentStreamRequests],
+    ["cloud-reason", handlers._cloudReasonRequests],
+    ["cloud-transcribe", handlers._cloudTranscriptionRequests],
+  ]) {
+    if (remoteStopped || !allowed(channel)) cancelWindowRequests(registry);
+  }
+}
+
+class IPCHandlers {
+  constructor(managers) {
+    this.environmentManager = managers.environmentManager;
+    this.databaseManager = managers.databaseManager;
+    this.clipboardManager = managers.clipboardManager;
+    this.whisperManager = managers.whisperManager;
+    this.parakeetManager = managers.parakeetManager;
+    const localModelManager = require("./modelManagerBridge").default;
+    this._initLocalModelPolicy(localModelManager);
+    this.dictationCleanupPrewarm = createLocalCleanupPrewarm(localModelManager);
+
+    this.diarizationManager = managers.diarizationManager;
+    this.windowManager = managers.windowManager;
+    this.updateManager = managers.updateManager;
+    this.windowsKeyManager = managers.windowsKeyManager;
+    this.linuxKeyManager = managers.linuxKeyManager;
+    this.textEditMonitor = managers.textEditMonitor;
+    this.selectionManager = managers.selectionManager;
+    this.getTrayManager = managers.getTrayManager;
+    this.whisperCudaManager = managers.whisperCudaManager;
+    this.whisperVulkanManager = managers.whisperVulkanManager;
+    this.googleCalendarManager = managers.googleCalendarManager;
+    this.connectorManager = managers.connectorManager;
+    this.microsoftCalendarManager = managers.microsoftCalendarManager;
+    this.appleCalendarManager = managers.appleCalendarManager;
+    this.meetingDetectionEngine = managers.meetingDetectionEngine;
+    this.managedMeetingPolicy = managers.managedMeetingPolicy;
+    this.managedDevicePolicy = managers.managedDevicePolicy;
+    this.meetingAuditLog = managers.meetingAuditLog;
+    this._remoteProductRetirement = new AbortController();
+    this.audioTapManager = managers.audioTapManager;
+    this.linuxPortalAudioManager = managers.linuxPortalAudioManager;
+    this.windowsLoopbackAudioManager = managers.windowsLoopbackAudioManager;
+    this.meetingAecManager = managers.meetingAecManager;
+    this.getSemanticSearch = managers.getSemanticSearch;
+    this.oauthProtocolRegistered = managers.oauthProtocolRegistered === true;
+    this.oauthProtocol = managers.oauthProtocol || "openwhispr";
+    this.sessionId = crypto.randomUUID();
+    // requestId -> AbortControllers for in-flight audio-upload work (cloud
+    // upload, bring-your-own-key upload, or local transcription + diarization
+    // sharing one id), so a cancel can abort the exact job.
+    this._uploadCancelRegistry = createUploadCancelRegistry();
+    this._agentStreamRequests = new AgentStreamRequestRegistry();
+    this._cloudReasonRequests = new AgentStreamRequestRegistry();
+    this._cloudTranscriptionRequests = new AgentStreamRequestRegistry();
+    this._enterpriseReasoningRequests = new AgentStreamRequestRegistry();
+    this._calendarAuthorizationRequests = new AgentStreamRequestRegistry();
+    // webContents id -> its release listener, for renderers holding the mic open.
+    this._micHoldSenders = new Map();
+    this.assemblyAiStreaming = null;
+    this.deepgramStreaming = null;
+    this.geminiStreaming = null;
+    this.cortiStreaming = null;
+    this._dictationStreaming = null;
+    this._dictationConnectPromise = null;
+    this._dictationIdleTimer = null;
+    this._dictationPreviewEnabled = false;
+    this._meetingMicStreaming = null;
+    this._meetingSystemStreaming = null;
+    this._hotkeyCaptureMode = false;
+    this._autoLearnEnabled = true; // Default on, synced from renderer
+    this._autoLearnDebounceTimer = null;
+    this._autoLearnLatestData = null;
+    this._sharedDictionaryHints = { space: [], workspace: [] };
+    this._dictionaryHotwordHints = null;
+    this.parakeetManager.setDictionaryProvider(() => this._getDictionaryHotwords());
+    this._textEditHandler = null;
+    this._onboardingDemoSession = null;
+    this.audioStorageManager = new AudioStorageManager();
+    this.skillLibrary = new SkillLibrary({
+      userDataDir: app.getPath("userData"),
+      database: this.databaseManager,
+      recommendedDir: path.join(__dirname, "skills", "recommended"),
+    });
+    this.localModelDownloadStatus = new LocalModelDownloadStatus();
+    this._retentionCleanupInterval = null;
+    this._retentionSettings = { ...DEFAULT_RETENTION_SETTINGS }; // Synced from renderer
+    this._retentionSettingsSynced = false;
+    this._granolaImportPending = null;
+    this._analyticsHistoryBackfillPromise = null;
+    this.speakerDiarizationEnabled = true;
+    // Default for the saved process-detection toggle. The engine keeps both detectors
+    // off until the renderer syncs (see meetingDetectionPreferencePolicy.js).
+    this.meetingProcessDetection = true;
+    this.activeMeetingSpeakerConfig = null;
+    // Diarization session id → { noteId, ceiling }: speaker ids a stopped session's
+    // diarization may still write to its note (see _resolveMeetingSpeakerIndexBase).
+    this._diarizationSpeakerReservations = new Map();
+    this.whisperVadSettings = {
+      dictationSileroEnabled: false,
+      noteRecordingSileroEnabled: true,
+      meetingSileroEnabled: true,
+      ...DEFAULT_WHISPER_VAD_CONFIG,
+    };
+    liveSpeakerIdentifier.setDiarizationManager(this.diarizationManager);
+    this._setupTextEditMonitor();
+    this._setupRetentionCleanup();
+    this._logDetectedGpus();
+    // Warm the OS default mic answer before the first hotkey press (~2s on Windows).
+    resolveSystemDefaultMicrophone();
+    this.setupHandlers();
+    // Lives for the app's lifetime; IPCHandlers has no teardown path.
+    tokenStore.subscribe((state) => this._handleAuthTokenChange(state));
+
+    if (this.whisperManager?.serverManager) {
+      this._attachWhisperServerListeners(this.whisperManager.serverManager);
+    }
+  }
+
+  createFolderWithEffects(name, spaceId, parentFolderId) {
+    const result = this.databaseManager.createFolder(name, spaceId, parentFolderId);
+    if (result?.success && result?.folder) {
+      setImmediate(() => {
+        broadcastToWindows("folder-created", result.folder);
+        this.noteFiles.ensureFolder(result.folder.id);
+      });
+    }
+    return result;
+  }
+
+  getMeetingNotificationDestination(owner) {
+    if (!this.windowManager.isMeetingNotificationOwner(owner))
+      return { success: false, code: "STALE_NOTIFICATION" };
+    try {
+      const context = meetingDestinationContext(
+        this.databaseManager,
+        owner,
+        this.windowManager.meetingRecentDestinations
+      );
+      this.windowManager.meetingRecentDestinations = context.recentDestinations;
+      return { success: true, value: context };
+    } catch (error) {
+      return {
+        success: false,
+        code: error.code === "NOTE_UNAVAILABLE" ? error.code : "FOLDERS_UNAVAILABLE",
+      };
+    }
+  }
+
+  selectMeetingNotificationFolder(owner, ref) {
+    const result = this.getMeetingNotificationDestination(owner);
+    if (!result.success) return result;
+    if (result.value.existingNote)
+      return { success: false, code: "LINKED_NOTE_CHANGED", context: result.value };
+    if (!isMeetingFolderRef(ref)) return { success: false, code: "INVALID_REQUEST" };
+    const folder = result.value.folders.find(
+      (f) => f.id === ref.folderId && f.space_id === ref.spaceId
+    );
+    if (!folder) return { success: false, code: "FOLDER_UNAVAILABLE" };
+    owner.selectedDestination = { folderId: folder.id, spaceId: folder.space_id };
+    this.windowManager.meetingRecentDestinations = rememberMeetingDestination(
+      this.windowManager.meetingRecentDestinations,
+      owner.selectedDestination
+    );
+    return {
+      success: true,
+      value: {
+        ...result.value,
+        selectedDestination: owner.selectedDestination,
+        recentDestinations: this.windowManager.meetingRecentDestinations,
+      },
+    };
+  }
+
+  createMeetingNotificationFolder(owner, request) {
+    if (!this.windowManager.isMeetingNotificationOwner(owner))
+      return { success: false, code: "STALE_NOTIFICATION" };
+    if (
+      !request ||
+      typeof request.requestId !== "string" ||
+      !request.requestId.trim() ||
+      request.requestId.length > 128 ||
+      typeof request.name !== "string" ||
+      !Number.isSafeInteger(request.spaceId) ||
+      request.spaceId <= 0
+    )
+      return { success: false, code: "INVALID_REQUEST" };
+    const name = request.name.trim();
+    if (!name) return { success: false, code: "FOLDER_NAME_REQUIRED" };
+    const cached = owner.createRequests.get(request.requestId);
+    if (cached && (cached.name !== name || cached.spaceId !== request.spaceId))
+      return { success: false, code: "INVALID_REQUEST" };
+    // Bound per-prompt retry bookkeeping. Successful IDs stay stable for the prompt's lifetime.
+    if (!cached && owner.createRequests.size >= 32)
+      return { success: false, code: "INVALID_REQUEST" };
+    const contextResult = this.getMeetingNotificationDestination(owner);
+    if (!contextResult.success) return contextResult;
+    if (contextResult.value.existingNote)
+      return { success: false, code: "LINKED_NOTE_CHANGED", context: contextResult.value };
+    if (!contextResult.value.spaces.some((space) => space.id === request.spaceId))
+      return { success: false, code: "SPACE_UNAVAILABLE" };
+    try {
+      let ref = cached?.ref;
+      if (ref) {
+        if (!resolveMeetingDestination(this.databaseManager, ref))
+          return { success: false, code: "FOLDER_UNAVAILABLE" };
+      } else {
+        const result = this.createFolderWithEffects(name, request.spaceId);
+        if (!result?.success || !result.folder)
+          return {
+            success: false,
+            code:
+              result?.error === "A folder with that name already exists"
+                ? "FOLDER_NAME_TAKEN"
+                : result?.error === "Space not found"
+                  ? "SPACE_UNAVAILABLE"
+                  : "CREATE_FAILED",
+          };
+        ref = { folderId: result.folder.id, spaceId: result.folder.space_id };
+        owner.createRequests.set(request.requestId, { name, spaceId: request.spaceId, ref });
+        this.windowManager.sendToControlPanel("meeting-notification-folder-created", {
+          folderId: ref.folderId,
+        });
+      }
+      const refreshed = this.getMeetingNotificationDestination(owner);
+      return refreshed.success
+        ? { success: true, value: { ...refreshed.value, createdFolder: ref } }
+        : refreshed;
+    } catch {
+      return { success: false, code: "CREATE_FAILED" };
+    }
+  }
+
+  // Every window caches the dictionary and snippets in its store and in
+  // localStorage, and a whole-list save writes that cache back. After an
+  // account switch the cache must hold the new account's lists, or the next
+  // save would copy the previous account's words into this one.
+  // The account the database scopes rows by, and whose rows are in view. The
+  // credential scope broadcast says neither: it stays quiet on a token rotation,
+  // and it is null on any sign-out, even when the device's only account stays
+  // in view.
+  _broadcastDatabaseAccountScope() {
+    broadcastToWindows("database-account-scope-changed", this.databaseManager.getAccountScope());
+  }
+
+  _broadcastAccountScopedSettings() {
+    try {
+      broadcastToWindows("dictionary-updated", this.databaseManager.getDictionary());
+      broadcastToWindows("snippets-updated", this.databaseManager.getSnippets());
+    } catch (error) {
+      debugLogger.error(
+        "Failed to broadcast account-scoped dictionary and snippets",
+        { error: error.message },
+        "database"
+      );
+    }
+  }
+
+  _initLocalModelPolicy(localLlmManager) {
+    this._authTokenHeld = Boolean(tokenStore.get());
+    const { createLocalModelPolicyGate } = require("./localModelPolicyGate");
+    const localServers = [
+      [
+        "transcription",
+        this.whisperManager.serverManager,
+        () =>
+          this.whisperManager.serverManager.localModelIdForPath?.(
+            this.whisperManager.serverManager.modelPath
+          ),
+      ],
+      [
+        "transcription",
+        this.parakeetManager.serverManager.wsServer,
+        () => this.parakeetManager.serverManager.wsServer.modelName,
+      ],
+      [
+        "llm",
+        localLlmManager.serverManager,
+        () =>
+          localLlmManager.serverManager.localModelIdForPath?.(
+            localLlmManager.serverManager.modelPath
+          ),
+      ],
+    ];
+    this._localModelPolicy = createLocalModelPolicyGate({
+      getPolicy: (options) =>
+        this.refreshEffectivePolicy?.(undefined, options) ?? { success: false },
+      getHeldPolicy: () =>
+        this.refreshEffectivePolicy?.(undefined, { held: true }) ?? { success: false },
+      getIdentity: () => tokenStore.getState().generation,
+      getAppVersion: () => app.getVersion(),
+      isSnapshotCurrent: (snapshot) =>
+        snapshot?.accountId === undefined ||
+        snapshot.accountId === this.databaseManager.activeAccountId,
+      onChange: () => {
+        for (const [scope, server, modelId] of localServers) {
+          if (server.isRemote || !modelId()) continue;
+          const denied = this._localModelPolicy.activeFailure(scope, modelId());
+          if (denied) {
+            void server.stop().catch((error) =>
+              debugLogger.warn("Could not stop policy-blocked local server", {
+                error: error.message,
+              })
+            );
+          }
+        }
+        if (this._activeLocalMeetingLease) {
+          try {
+            this._localModelPolicy.assertCurrent(this._activeLocalMeetingLease);
+          } catch (error) {
+            // cancelJobs' abort: its callers stop the meeting themselves, as an account change.
+            // Anything that isn't the policy's refusal is not the organization's either.
+            if (isLocalModelPolicyRefusal(error) && error.code !== "POLICY_UNRESOLVABLE")
+              this._stopMeetingForPolicy?.(error.code);
+          }
+        }
+      },
+    });
+    for (const manager of [
+      this.whisperManager,
+      this.parakeetManager,
+      this.parakeetManager.serverManager,
+      localLlmManager,
+      ...localServers.map(([, server]) => server),
+    ]) {
+      manager.localModelPolicy = this._localModelPolicy;
+    }
+    const samePath = (actual, expected) =>
+      typeof actual === "string" && path.resolve(actual) === path.resolve(expected);
+    // Retired models included: a server started before a retirement keeps serving.
+    this.whisperManager.serverManager.localModelIdForPath = (modelPath) =>
+      listRunnableLocalModels("whisperModels").find(([id]) =>
+        samePath(modelPath, this.whisperManager.getModelPath(id))
+      )?.[0];
+    this.parakeetManager.serverManager.wsServer.localModelIdForPath = (modelPath, id) =>
+      getRunnableSpeechModel("parakeetModels", id) &&
+      samePath(modelPath, this.parakeetManager.getModelPath(id))
+        ? id
+        : undefined;
+    localLlmManager.serverManager.localModelIdForPath = (modelPath) =>
+      listRunnableLocalModels("localProviders").find(
+        ([, model]) =>
+          model.fileName &&
+          samePath(modelPath, path.join(localLlmManager.getModelsDir(), model.fileName))
+      )?.[0];
+  }
+
+  // Called once a cookie session has had its bearer migration: before that, a
+  // session with no bearer would read as a proven guest.
+  loadLocalModelPolicy() {
+    void this._localModelPolicy.resolve().catch(() => {});
+  }
+
+  _handleAuthTokenChange({ generation, token }) {
+    this._meetingAdmission?.cancelPending();
+    this._cancelCalendarAuthorizations();
+    // A new bearer may belong to another account, so its policy is fetched
+    // before new work; only a sign-out ends the work already running. A real
+    // account switch is cancelled once set-active-account-scope learns it.
+    // Clearing a session that never existed changes no one's identity, so a
+    // guest's running work carries on.
+    const provenGuest =
+      this._authTokenHeld === false && typeof this.databaseManager.activeAccountId !== "string";
+    this._authTokenHeld = Boolean(token);
+    if (token) {
+      this._localModelPolicy?.invalidate();
+      this._audioFeaturePolicy?.invalidate();
+    } else {
+      if (!provenGuest) this._localModelPolicy?.cancelJobs();
+      this._audioFeaturePolicy?.invalidate();
+      if (!provenGuest) {
+        this._audioFeaturePolicy?.cancelJobs();
+        this._stopMeetingForPolicy?.("accountChanged");
+      }
+    }
+    this.windowManager.retireMeetingNotificationScope();
+    // Like the jobs above, enterprise audio outlives a token rotation; a
+    // different account or workspace retires it once it is learned.
+    if (!token) {
+      if (!provenGuest) this._retireAccountProductStreams?.(this.databaseManager.activeAccountId);
+      this._retireEnterpriseAudio?.(false, "accountChanged");
+      this._enterpriseAudioOwner = null;
+    }
+    this._enterpriseAudioBinding = null;
+    this._enterpriseAudioScope = null;
+    this._enterpriseAudioScopeRevision = (this._enterpriseAudioScopeRevision ?? 0) + 1;
+    this.enterpriseIdentityManager?.clear();
+    if (!token) {
+      const scopeChanged = this.databaseManager.activeAccountId !== null;
+      this._noteFilesSync?.flushSync();
+      this.databaseManager.setActiveAccountId(null);
+      this.databaseManager.ensureAccountDefaultFolders();
+      this._flushAccountRepairMirrors();
+      if (scopeChanged) this._noteFilesSync?.accountChanged();
+      this._clearDictionaryHotwordHints();
+      accountScopeBinding.clear();
+      broadcastToWindows("active-account-scope-changed", null);
+      this._broadcastDatabaseAccountScope();
+      if (scopeChanged) this._broadcastAccountScopedSettings();
+      // As set-active-account-scope does: a connect can't outlive its account.
+      this.connectorManager?.accountChanged();
+    }
+    this.updateManager?.invalidatePolicy();
+    const effectivePolicy = this.effectivePolicyManager?.invalidate();
+    // Signed out is a guest, whose verdict (the device's policy, if any) is known.
+    if (!token) this._localModelPolicy?.invalidate(effectivePolicy);
+    void this.updateManager?.refreshPolicy();
+    void this.refreshEffectivePolicy?.();
+    broadcastToWindows("auth-token-state-changed", {
+      generation,
+      hasToken: Boolean(token),
+    });
+    // A sign-out or another account changes whose login shows.
+    void this.connectorManager?.notifyStatusChanged();
+  }
+
+  // A failed claim leaves the notes where they were, visible signed out, and
+  // must not stop the sign-in that runs it.
+  _claimSignedOutPrivateNotes() {
+    try {
+      const claimed = this.databaseManager.claimSignedOutPrivateNotes();
+      if (claimed.notes > 0 || claimed.folders > 0) this.notifyVectorChanges();
+      if (claimed.notes > 0) {
+        this.noteFiles.notesMoved();
+        broadcastToWindows("device-notes-changed");
+      }
+      return true;
+    } catch (error) {
+      debugLogger.error(
+        "Claiming signed-out private notes at sign-in failed",
+        { error: error.message },
+        "database"
+      );
+      return false;
+    }
+  }
+
+  _cancelCalendarAuthorizations() {
+    for (const senderId of this._calendarAuthorizationRequests?.requestsBySender.keys() ?? []) {
+      this._calendarAuthorizationRequests.cancelSender(senderId);
+    }
+  }
+
+  // Reconstructing counters from the transcripts already on disk records exactly
+  // what "keep local history" turns off, so it answers to the same switch the
+  // live path checks in audioManager.saveTranscription. The main process boots
+  // with defaults rather than the user's choice, so an unsynced setting is not
+  // consent either -- the renderer's first sync is what starts this (#1370).
+  _canReconstructAnalyticsHistory() {
+    return this._retentionSettingsSynced && this._retentionSettings.dataRetentionEnabled;
+  }
+
+  /** Whether a signed-in account is bound to this install. */
+  _hasActiveAccountScope() {
+    return Boolean(accountScopeBinding.read());
+  }
+
+  // The switch alone is not enough to start: a managed workspace can force local
+  // history off, and that policy arrives over the network while this scan takes
+  // milliseconds, so the renderer reports the permissive personal default until
+  // it lands. Waiting for the real answer is only possible where there is one --
+  // signed out the policy store stays idle forever and the user's own preference
+  // is the only authority there is. Mid-scan arrival needs no separate check:
+  // a policy that resolves "always_off" flips the switch, which the loop reads.
+  _mayStartAnalyticsHistoryReconstruction() {
+    if (!this._canReconstructAnalyticsHistory()) return false;
+    if (this._retentionSettings.localHistoryPolicyResolved === true) return true;
+    return !this._hasActiveAccountScope();
+  }
+
+  // Reconciliation is best-effort. Analytics reads await it so later-eligible
+  // history shows up before the numbers are read, which means a failure here
+  // must never fail the read itself: a broken scan would otherwise blank an
+  // Insights summary that SQLite could have answered perfectly well.
+  async _ensureAnalyticsHistoryBackfilled() {
+    if (!this._mayStartAnalyticsHistoryReconstruction()) return { inserted: 0, scanned: 0 };
+    if (this._analyticsHistoryBackfillPromise) return this._analyticsHistoryBackfillPromise;
+    // The failure is absorbed inside this promise rather than around the
+    // creator's await, because callers that join an in-flight pass are handed
+    // this promise directly and would otherwise receive the raw rejection --
+    // which is every analytics read that arrives while the startup pass is
+    // still scanning.
+    const backfillPromise = (async () => {
+      let inserted = 0;
+      let scanned = 0;
+      let skipped = 0;
+      let stoppedEarly = false;
+      const state = this.databaseManager.getAnalyticsHistoryBackfillState(
+        ANALYTICS_HISTORY_BACKFILL_VERSION
+      );
+      if (state.scannedThroughId >= state.targetId) return { inserted, scanned };
+      while (true) {
+        // The database reads its persisted cursor again for every batch. An
+        // older row made eligible while this pass yields can move that cursor
+        // backward without being overwritten by stale in-memory progress.
+        const batch = this.databaseManager.backfillAnalyticsHistoryBatch({
+          throughId: state.targetId,
+          checkpointVersion: ANALYTICS_HISTORY_BACKFILL_VERSION,
+        });
+        inserted += batch.inserted;
+        scanned += batch.scanned;
+        skipped += batch.skipped;
+        if (batch.complete) break;
+        await new Promise((resolve) => setImmediate(resolve));
+        // The switch can be turned off while this pass yields -- by the user, or
+        // by a managed policy that resolved after the renderer's first sync sent
+        // the personal default. Re-reading it here stops the scan at the next
+        // batch boundary instead of mining the rest of a history the user has
+        // just opted out of.
+        if (!this._canReconstructAnalyticsHistory()) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      if (inserted > 0) broadcastToWindows("analytics-changed");
+      if (scanned > 0) {
+        debugLogger.info(
+          stoppedEarly
+            ? "Analytics history backfill stopped: local history was turned off mid-scan"
+            : "Analytics history backfill complete",
+          { inserted, skipped, scanned },
+          "analytics"
+        );
+      }
+      return { inserted, scanned };
+    })().catch((error) => {
+      debugLogger.error("Analytics history backfill failed", { error: error.message }, "analytics");
+      return { inserted: 0, scanned: 0 };
+    });
+    this._analyticsHistoryBackfillPromise = backfillPromise;
+    // Cleared after the assignment above, never inside the pass: a scan that
+    // finishes without ever awaiting would otherwise strand its own resolved
+    // promise here and every later read would join a pass that already ended.
+    void backfillPromise.then(() => {
+      if (this._analyticsHistoryBackfillPromise === backfillPromise) {
+        this._analyticsHistoryBackfillPromise = null;
+      }
+    });
+    return backfillPromise;
+  }
+
+  // The dictation slot reports its own changes from the renderer. Slots
+  // registered through IPC have to announce theirs here so macOS can re-derive
+  // which keys the native Globe listener owns.
+  _notifyHotkeyChanged(hotkey) {
+    ipcMain.emit("hotkey-changed", null, hotkey);
+  }
+
+  _releaseMicHold(sender) {
+    const release = this._micHoldSenders.get(sender.id);
+    if (!release) return;
+    this._micHoldSenders.delete(sender.id);
+    sender.off("destroyed", release);
+    sender.off("did-finish-load", release);
+    this.meetingDetectionEngine?.setMicWarmHold(this._micHoldSenders.size > 0);
+  }
+
+  _getWhisperVadSettings() {
+    const current = this.whisperVadSettings || {};
+    return {
+      dictationSileroEnabled: current.dictationSileroEnabled === true,
+      noteRecordingSileroEnabled: current.noteRecordingSileroEnabled !== false,
+      meetingSileroEnabled: current.meetingSileroEnabled !== false,
+      ...sanitizeWhisperVadConfig(current),
+    };
+  }
+
+  _updateNativeModelDownloadStatus(modelType, modelId, progressData) {
+    if (progressData.type === "complete") {
+      return this.localModelDownloadStatus.finish(modelType, modelId);
+    }
+
+    if (progressData.type === "installing" || progressData.type === "verifying") {
+      return this.localModelDownloadStatus.update(modelType, modelId, {
+        phase: progressData.type,
+        progress: progressData.percentage ?? 100,
+      });
+    }
+
+    return this.localModelDownloadStatus.update(modelType, modelId, {
+      phase: "downloading",
+      progress: progressData.percentage || 0,
+      downloadedBytes: progressData.downloaded_bytes || 0,
+      totalBytes: progressData.total_bytes || 0,
+    });
+  }
+
+  _setWhisperVadSettings(update = {}) {
+    const ALLOWED_KEYS = new Set([
+      "dictationSileroEnabled",
+      "noteRecordingSileroEnabled",
+      "meetingSileroEnabled",
+      ...Object.keys(require("../constants/whisperVad.json").DEFAULTS),
+    ]);
+    const filtered = {};
+    for (const [k, v] of Object.entries(update)) {
+      if (ALLOWED_KEYS.has(k)) filtered[k] = v;
+    }
+    this.whisperVadSettings = { ...this._getWhisperVadSettings(), ...filtered };
+    return this._getWhisperVadSettings();
+  }
+
+  // Shared by the upload IPC handler and the CLI bridge. `filePath` must
+  // already have passed resolveAllowedAudioPath (or approveAudioPath).
+  async transcribeLocalFile(filePath, options = {}) {
+    void this.refreshEffectivePolicy();
+    if (
+      !productOperationAllowed(
+        this.effectivePolicyManager.getCurrent(),
+        app.getVersion(),
+        "transcribe-audio-file"
+      )
+    )
+      return policyBlockedFailure(this.effectivePolicyManager.getCurrent());
+    const controller = new AbortController();
+    this._productRequests.set(controller, {
+      channel: "transcribe-audio-file",
+      args: [],
+      remote: false,
+    });
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, controller.signal])
+      : controller.signal;
+    try {
+      signal.throwIfAborted();
+      const audioBuffer = fs.readFileSync(filePath);
+      const result = isSherpaLocalProvider(options.provider)
+        ? await this.parakeetManager.transcribeLocalParakeet(audioBuffer, { ...options, signal })
+        : await this.whisperManager.transcribeLocalWhisper(audioBuffer, {
+            ...options,
+            ...this._resolveWhisperVadOptions("noteRecording"),
+            signal,
+          });
+      return controller.signal.aborted
+        ? policyBlockedFailure(this.effectivePolicyManager.getCurrent())
+        : result;
+    } catch (error) {
+      if (controller.signal.aborted)
+        return policyBlockedFailure(this.effectivePolicyManager.getCurrent());
+      throw error;
+    } finally {
+      this._productRequests.delete(controller);
+    }
+  }
+
+  approveAudioPath(filePath) {
+    approveAudioPath(filePath);
+  }
+
+  listLocalTranscriptionModels() {
+    return listLocalTranscriptionModels({
+      whisperManager: this.whisperManager,
+      parakeetManager: this.parakeetManager,
+    });
+  }
+
+  _resolveWhisperVadOptions(context) {
+    const settings = this._getWhisperVadSettings();
+    const {
+      dictationSileroEnabled,
+      noteRecordingSileroEnabled,
+      meetingSileroEnabled,
+      ...vadConfig
+    } = settings;
+    return {
+      vadEnabled: resolveContextSileroEnabled(settings, context),
+      vadConfig,
+    };
+  }
+
+  // Note writes are journaled by SQLite triggers (pending_vector_changes); this
+  // only wakes an active semantic index to drain them.
+  notifyVectorChanges() {
+    this.getSemanticSearch?.()?.notifyChanges();
+  }
+
+  get noteFiles() {
+    this._noteFilesSync ??= createNoteFilesSync({
+      getDatabase: () => this.databaseManager,
+      // Mirrors include inactive accounts; their speaker names need the same scope.
+      getSpeakerMappings: (noteId) =>
+        Object.fromEntries(
+          this.databaseManager.db
+            .prepare("SELECT speaker_id, display_name FROM speaker_mappings WHERE note_id = ?")
+            .all(noteId)
+            .map((mapping) => [mapping.speaker_id, mapping.display_name])
+        ),
+    });
+    return this._noteFilesSync;
+  }
+
+  _asyncMirrorWrite(note) {
+    this.noteFiles.writeNote(note);
+  }
+
+  _flushAccountRepairMirrors() {
+    if (!this.noteFiles.enabled) return;
+    for (const note of this.databaseManager.takeAccountRepairNotes()) {
+      this.noteFiles.writeNote(note);
+    }
+    this.noteFiles.containersChanged();
+  }
+
+  _captureMirrorDeletionNotes(filter) {
+    if (!this.noteFiles.enabled) return new Map();
+    const notes =
+      filter.id !== undefined
+        ? this.databaseManager.getNotesForMirror([filter.id])
+        : this.databaseManager.getNotesForMirrorDeletion(filter);
+    return new Map(
+      notes.map((note) => [
+        note.id,
+        {
+          note,
+          speakerMappings: this._buildSpeakerMappings(note.id),
+        },
+      ])
+    );
+  }
+
+  _asyncMirrorDelete(noteId, snapshots) {
+    const snapshot = snapshots?.get(noteId);
+    this.noteFiles.deleteNote(noteId, snapshot?.note, snapshot?.speakerMappings);
+  }
+
+  // A deleted folder's files go by note id, not with its directory: another
+  // account's folder can share that directory, and so can files of the user's.
+  // Other accounts' notes were released to the space root, so they're rewritten.
+  _mirrorRemovedFolder({ noteIds = [], relocatedNotes = [] }, snapshots) {
+    const removedIds = new Set(noteIds);
+    // Local folder deletes also erase tombstones omitted from the live-note result.
+    const otherIds = [...(snapshots?.keys() ?? [])].filter((noteId) => !removedIds.has(noteId));
+    if (otherIds.length > 0) {
+      const existingIds = new Set(this.databaseManager.getExistingNoteIds(otherIds));
+      for (const noteId of otherIds) if (!existingIds.has(noteId)) removedIds.add(noteId);
+    }
+    for (const noteId of removedIds) this._asyncMirrorDelete(noteId, snapshots);
+    for (const note of relocatedNotes) {
+      if (!note.deleted_at) this._asyncMirrorWrite(note);
+    }
+    this.noteFiles.containersChanged();
+  }
+
+  // Deleting a folder deletes its subfolders, and their notes, with it.
+  _captureSubfolderDeletionNotes(folderId, snapshots) {
+    if (!this.noteFiles.enabled) return;
+    for (const subfolder of this.databaseManager.getSubfolders(folderId)) {
+      const subfolderSnapshots = this._captureMirrorDeletionNotes({ folder_id: subfolder.id });
+      for (const [noteId, snapshot] of subfolderSnapshots) snapshots.set(noteId, snapshot);
+    }
+  }
+
+  _buildSpeakerMappings(noteId) {
+    const arr = this.databaseManager.getSpeakerMappings(noteId);
+    const map = {};
+    for (const m of arr) {
+      map[m.speaker_id] = m.display_name;
+    }
+    return map;
+  }
+
+  _parseNonSelfParticipants(participantsJson) {
+    if (!participantsJson) return [];
+    let participants;
+    try {
+      participants = JSON.parse(participantsJson);
+    } catch (_) {
+      return [];
+    }
+    if (!Array.isArray(participants) || participants.length === 0) return [];
+    const googleEmails = new Set(
+      this.databaseManager.getGoogleAccounts().map((a) => a.email.toLowerCase())
+    );
+    // Rooms aren't speakers; notes linked before rooms were left out may hold them.
+    return participants.filter(
+      (p) =>
+        p &&
+        p.self !== true &&
+        p.resource !== true &&
+        !googleEmails.has((p.email || "").toLowerCase())
+    );
+  }
+
+  _getNoteNonSelfParticipants(noteId) {
+    if (!noteId) return [];
+    try {
+      const note = this.databaseManager.getNote(noteId);
+      return this._parseNonSelfParticipants(note?.participants);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  _resolveOneOnOneOtherParticipant(participantsJson) {
+    const others = this._parseNonSelfParticipants(participantsJson);
+    if (others.length !== 1) return null;
+    const displayName = others[0].displayName || others[0].email;
+    if (!displayName) return null;
+    const email = (others[0].email || "").toLowerCase().trim() || null;
+    return { displayName, email };
+  }
+
+  _noteExpectedSpeakerCountOrNull(note) {
+    const stored = normalizeStoredSpeakerCount(note?.expected_speaker_count);
+    if (stored != null) {
+      return stored;
+    }
+    const others = this._parseNonSelfParticipants(note?.participants).length;
+    if (others > 0) {
+      return Math.min(others + 1, MAX_SPEAKER_COUNT);
+    }
+    return null;
+  }
+
+  _resolveNoteExpectedSpeakerCount(note) {
+    return this._noteExpectedSpeakerCountOrNull(note) ?? DEFAULT_EXPECTED_SPEAKER_COUNT;
+  }
+
+  _resolveInitialMeetingSpeakerConfig(noteId) {
+    let note = null;
+    if (noteId != null) {
+      try {
+        note = this.databaseManager.getNote(noteId);
+      } catch (_) {
+        note = null;
+      }
+    }
+    const enabled =
+      (note?.diarization_enabled == null
+        ? this.speakerDiarizationEnabled
+        : note.diarization_enabled !== 0) !== false;
+    return { enabled, expectedCount: this._resolveNoteExpectedSpeakerCount(note) };
+  }
+
+  // Participants added mid-meeting must raise the speaker cap that was derived
+  // from the note at recording start. A count the user set via the stepper
+  // (explicit) is never overridden.
+  //
+  // Raise-only: lowering the cap below the clusters already discovered would make
+  // _assignOrForceCluster fold every later voice onto an existing speaker — the
+  // exact identity collapse this refresh exists to prevent. A roster that shrinks
+  // (or empties) mid-meeting therefore leaves the cap where it is.
+  _refreshMeetingSpeakerConfigFromNote(noteId, note) {
+    const config = this.activeMeetingSpeakerConfig;
+    if (!config || config.explicit) return;
+    if (noteId == null || this._activeMeetingNoteId !== noteId) return;
+
+    const expectedCount = this._noteExpectedSpeakerCountOrNull(note);
+    if (expectedCount == null || expectedCount <= config.expectedCount) return;
+
+    this.activeMeetingSpeakerConfig = { ...config, expectedCount };
+    liveSpeakerIdentifier.setMaxSpeakers(Math.max(1, expectedCount - 1));
+    broadcastToWindows("meeting-session-speaker-config-updated", {
+      enabled: config.enabled,
+      expectedCount,
+    });
+    debugLogger.info(
+      "Meeting speaker config refreshed from participants",
+      { noteId, expectedCount },
+      "speaker"
+    );
+  }
+
+  _getPersonalDictionarySafe() {
+    try {
+      return this.databaseManager.getDictionary();
+    } catch {
+      return [];
+    }
+  }
+
+  // Auto-learn excludes the personal dictionary and shared words that already
+  // reach the prompt. A shared word cut by the prompt budget can still be learned.
+  _getDictionarySafe() {
+    const { space, workspace } = this._sharedDictionaryHints;
+    return [...this._getPersonalDictionarySafe(), ...space, ...workspace];
+  }
+
+  _getDictionaryHotwords() {
+    const personal = this._getPersonalDictionarySafe();
+    const hints = this._dictionaryHotwordHints;
+    if (!hints || hints.accountId !== this.databaseManager.activeAccountId) return personal;
+    const { space, workspace, suppressedPersonal } = hints;
+    return [
+      ...personal.filter((word) => !suppressedPersonal.has(dictionaryWordKey(word))),
+      ...space,
+      ...workspace,
+    ];
+  }
+
+  _clearDictionaryHotwordHints() {
+    this._dictionaryHotwordHints = null;
+    this.parakeetManager.refreshHotwordsSoon();
+  }
+
+  _cleanupTextEditMonitor() {
+    if (this._autoLearnDebounceTimer) {
+      clearTimeout(this._autoLearnDebounceTimer);
+      this._autoLearnDebounceTimer = null;
+    }
+    this._autoLearnLatestData = null;
+    if (this.textEditMonitor && this._textEditHandler) {
+      this.textEditMonitor.removeListener("text-edited", this._textEditHandler);
+      this._textEditHandler = null;
+    }
+  }
+
+  async _logDetectedGpus() {
+    const { listNvidiaGpus } = require("../utils/gpuDetection");
+    const gpus = await listNvidiaGpus();
+    if (gpus.length > 0) {
+      debugLogger.info(
+        "NVIDIA GPUs detected",
+        {
+          count: gpus.length,
+          devices: gpus.map((g) => `[${g.index}] ${g.name} (${g.vramMb}MB) ${g.uuid}`),
+        },
+        "gpu"
+      );
+    } else {
+      debugLogger.debug("No NVIDIA GPUs detected", {}, "gpu");
+    }
+  }
+
+  _setupRetentionCleanup() {
+    const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+    // No sweep at startup: _retentionSettings still holds the 30-day default
+    // until the renderer syncs, so sweeping here deletes audio a user set to
+    // keep for 60/90 days or forever (#1370). The first sync runs the first
+    // sweep instead.
+    this._retentionCleanupInterval = setInterval(() => {
+      if (this._retentionSettingsSynced) this._runRetentionCleanup();
+    }, SIX_HOURS_MS);
+  }
+
+  _runRetentionCleanup() {
+    const { audioRetentionDays, transcriptRetentionDays } = this._retentionSettings;
+    try {
+      if (transcriptRetentionDays > 0) {
+        const { ids, analyticsPurged } =
+          this.databaseManager.deleteTranscriptionsExpiredBefore(transcriptRetentionDays);
+        for (const id of ids) {
+          this.audioStorageManager.deleteAudio(id);
+          broadcastToWindows("transcription-deleted", { id });
+        }
+        if (analyticsPurged > 0) broadcastToWindows("analytics-changed");
+      }
+      if (audioRetentionDays > 0) {
+        this.audioStorageManager.cleanupExpiredAudio(audioRetentionDays, this.databaseManager);
+      }
+    } catch (error) {
+      debugLogger.error("Retention cleanup failed", { error: error.message }, "audio-storage");
+    }
+  }
+
+  _setupTextEditMonitor() {
+    if (!this.textEditMonitor) return;
+
+    this._textEditHandler = (data) => {
+      if (
+        !data ||
+        typeof data.originalText !== "string" ||
+        typeof data.newFieldValue !== "string"
+      ) {
+        debugLogger.debug("[AutoLearn] Invalid event payload, skipping");
+        return;
+      }
+
+      const { originalText, newFieldValue } = data;
+
+      debugLogger.debug("[AutoLearn] text-edited event", {
+        originalPreview: originalText.substring(0, 80),
+        newValuePreview: newFieldValue.substring(0, 80),
+      });
+
+      this._autoLearnLatestData = { originalText, newFieldValue };
+
+      if (this._autoLearnDebounceTimer) {
+        clearTimeout(this._autoLearnDebounceTimer);
+      }
+
+      this._autoLearnDebounceTimer = setTimeout(() => {
+        this._processCorrections();
+      }, AUTO_LEARN_DEBOUNCE_MS);
+    };
+
+    this.textEditMonitor.on("text-edited", this._textEditHandler);
+  }
+
+  _processCorrections() {
+    this._autoLearnDebounceTimer = null;
+    if (!this._autoLearnLatestData) return;
+    if (!this._autoLearnEnabled) {
+      debugLogger.debug("[AutoLearn] Disabled, skipping correction processing");
+      this._autoLearnLatestData = null;
+      return;
+    }
+
+    const { originalText, newFieldValue } = this._autoLearnLatestData;
+    this._autoLearnLatestData = null;
+
+    try {
+      const { extractCorrections } = require("../utils/correctionLearner");
+      const currentDict = this._getDictionarySafe();
+      const corrections = extractCorrections(originalText, newFieldValue, currentDict);
+      debugLogger.debug("[AutoLearn] Corrections result", {
+        corrections,
+        dictSize: currentDict.length,
+      });
+
+      if (corrections.length > 0) {
+        const saveResult = this.databaseManager.applyDictionaryChanges(
+          { add: corrections },
+          "learned"
+        );
+
+        if (saveResult?.success === false) {
+          debugLogger.debug("[AutoLearn] Failed to save dictionary", { error: saveResult.error });
+          return;
+        }
+
+        // Broadcast the post-save normalized list, not the raw input (which
+        // still has case-variant dupes), so renderers don't flash ghost rows.
+        broadcastToWindows("dictionary-updated", this.databaseManager.getDictionary());
+        this.parakeetManager.refreshHotwordsSoon();
+
+        // Show the overlay so the toast is visible (it may have been hidden after dictation)
+        this.windowManager.showDictationPanel();
+        broadcastToWindows("corrections-learned", corrections);
+        debugLogger.debug("[AutoLearn] Saved corrections", { corrections });
+      }
+    } catch (error) {
+      debugLogger.debug("[AutoLearn] Error processing corrections", { error: error.message });
+    }
+  }
+
+  _whisperGpuFailedBackends() {
+    return resolveFailedGpuBackends(process.env.WHISPER_GPU_FAILED);
+  }
+
+  _attachWhisperServerListeners(serverManager) {
+    // Landing on the Vulkan pack or a bundled GPU build (#2168) keeps the GPU:
+    // no "switched to CPU" pop-up, but every GPU card re-reads to follow the server.
+    // WhisperManager keeps a proven backend's failure for the session only, so it
+    // isn't remembered here, and a wake re-warm retries it on its own, so its CPU
+    // fallback there isn't announced either: the cards only re-read. See #2265.
+    const isSilent = (proven) => proven && this.whisperManager.isRewarmingAfterWake();
+    serverManager.on("cuda-fallback", ({ reason, fallbackBackend, proven }) => {
+      if (!proven) this._recordWhisperGpuFailure("cuda", reason);
+      if (fallbackBackend !== "cpu" || isSilent(proven)) {
+        broadcastToWindows("whisper-gpu-status-changed");
+      } else {
+        broadcastToWindows("cuda-fallback-notification", {});
+      }
+    });
+    serverManager.on("gpu-fallback", ({ reason, fallbackBackend, proven }) => {
+      if (!proven) this._recordWhisperGpuFailure("vulkan", reason);
+      if (fallbackBackend !== "cpu" || isSilent(proven)) {
+        broadcastToWindows("whisper-gpu-status-changed");
+      } else {
+        broadcastToWindows("gpu-fallback-notification", {});
+      }
+    });
+    // Persist the discrete-GPU pin so later launches spawn pinned directly
+    // instead of paying a second Vulkan cold start. See #1606.
+    serverManager.on("vulkan-device-pinned", ({ index }) => {
+      this._syncStartupEnv({ WHISPER_VULKAN_DEVICE: String(index) });
+    });
+    serverManager.on("vulkan-device-pin-cleared", () => {
+      this._syncStartupEnv({}, ["WHISPER_VULKAN_DEVICE"]);
+    });
+    // The GPU card and banner stop offering a pack (see _whisperBundledGpu)
+    serverManager.on("bundled-gpu", () => broadcastToWindows("whisper-gpu-status-changed"));
+    // A wake re-warm retried a GPU that failed this session: only main knows
+    // whether a saved failure still holds, so the cards re-read
+    this.whisperManager.on("gpu-status-changed", () =>
+      broadcastToWindows("whisper-gpu-status-changed")
+    );
+  }
+
+  // A bundled whisper-server built for the GPU runs on it with no pack (#2168),
+  // so no pack is offered.
+  _whisperBundledGpu() {
+    const { serverManager } = this.whisperManager;
+    return (
+      !serverManager.useCuda && !serverManager.useVulkan && serverManager.getStatus().gpuAccelerated
+    );
+  }
+
+  // Remember the failed backend, and the error line that explains it, so the
+  // backend isn't re-attempted (and its model reload re-paid) on every launch
+  // and the settings card can say why (#1736). Cleared by retry, re-download,
+  // delete, and the once-per-upgrade reset. The reason is written in the same
+  // .env write as the flag. A failure with no readable reason clears the older
+  // one, so a stale cause is never shown.
+  _recordWhisperGpuFailure(backend, reason) {
+    const failed = this._whisperGpuFailedBackends();
+    if (!failed.includes(backend)) failed.push(backend);
+    const reasonKey = WHISPER_GPU_FAILURE_REASON_KEYS[backend];
+    this._syncStartupEnv(
+      { WHISPER_GPU_FAILED: failed.join(","), ...(reason ? { [reasonKey]: reason } : {}) },
+      reason ? [] : [reasonKey]
+    );
+  }
+
+  _clearWhisperGpuFailure(backend) {
+    this.whisperManager.forgetSessionGpuFailures(backend);
+    this.whisperManager.serverManager.forgetGpuProofs(backend);
+    const failed = this._whisperGpuFailedBackends().filter((b) => b !== backend);
+    const reasonKey = WHISPER_GPU_FAILURE_REASON_KEYS[backend];
+    if (failed.length > 0) {
+      this._syncStartupEnv({ WHISPER_GPU_FAILED: failed.join(",") }, [reasonKey]);
+    } else {
+      this._syncStartupEnv({}, ["WHISPER_GPU_FAILED", reasonKey]);
+    }
+  }
+
+  // The control panel shows the GPU pack notice. An app started to the tray
+  // creates none, so there the dictation panel shows it instead (#2554).
+  _gpuPackNoticeWindow() {
+    const { controlPanelWindow, mainWindow, startedMinimized } = this.windowManager;
+    if (controlPanelWindow && !controlPanelWindow.isDestroyed()) return controlPanelWindow;
+    if (startedMinimized && mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+    return null;
+  }
+
+  // Includes a proven backend's failure kept for the session only (#2265),
+  // whose reason is newer than a saved one
+  _whisperGpuFailureStatus(backend) {
+    const gpuFailed = this.whisperManager.getFailedGpuBackends().includes(backend);
+    const reason = gpuFailed
+      ? this.whisperManager.getSessionGpuFailureReason(backend) ||
+        process.env[WHISPER_GPU_FAILURE_REASON_KEYS[backend]]
+      : null;
+    return { gpuFailed, gpuFailReason: reason || null };
+  }
+
+  // Captured before a handler stops the server to touch pack files (stopServer
+  // clears currentServerModel); tells _applyWhisperGpuPreference what to reload.
+  _whisperReloadModel() {
+    return this.whisperManager.serverManager.isRemote
+      ? null
+      : this.whisperManager.currentServerModel;
+  }
+
+  // Apply a GPU pack change to the loaded server without blocking the caller's
+  // IPC reply (a Vulkan cold start can take minutes); the renderer follows
+  // progress by polling whisper-server-status. Returns whether a reload was
+  // kicked off so the UI shows "activating" only when one is coming.
+  _applyWhisperGpuPreference(modelName) {
+    this.whisperManager.restartServerWithGpuPreference(modelName).catch((err) => {
+      debugLogger.error("whisper-server GPU preference restart failed", { error: err.message });
+    });
+    // Every pack download or delete and every Retry ends here, already saved.
+    // Tell every window, not just the caller's: Retry on the fallback pop-up
+    // runs in the dictation window, and Settings keeps up to three GPU cards
+    // mounted (#1736). A fallback is announced where it is recorded.
+    broadcastToWindows("whisper-gpu-status-changed");
+    return !!modelName;
+  }
+
+  _syncStartupEnv(setVars, clearVars = []) {
+    let changed = false;
+    for (const [key, value] of Object.entries(setVars)) {
+      if (process.env[key] !== value) {
+        process.env[key] = value;
+        changed = true;
+      }
+    }
+    for (const key of clearVars) {
+      if (process.env[key]) {
+        delete process.env[key];
+        changed = true;
+      }
+    }
+    if (changed) {
+      debugLogger.debug("Synced startup env vars", {
+        set: Object.keys(setVars),
+        cleared: clearVars.filter((k) => !process.env[k]),
+      });
+      // A swallowed .env write failure here left GPU enablement flags silently
+      // out of sync with the packs on disk (#1340) — log which keys were lost.
+      this.environmentManager.saveAllKeysToEnvFile().catch((err) => {
+        debugLogger.error("Failed to persist startup env vars to .env", {
+          set: Object.keys(setVars),
+          clearRequested: clearVars,
+          error: err.message,
+        });
+      });
+    }
+  }
+
+  // Mints a Corti access token from stored BYOK credentials. Shared by the
+  // dictation streaming handlers and the meeting realtime-token resolver.
+  async _mintStoredCortiToken(options = {}) {
+    const clientId = this.environmentManager.getCortiClientId();
+    const clientSecret = this.environmentManager.getCortiClientSecret();
+    if (!clientId || !clientSecret) {
+      const err = new Error("No Corti credentials configured. Add them in Settings.");
+      err.code = "NO_API";
+      throw err;
+    }
+    const environment = options.environment || "us";
+    const tenant = (options.tenant || "").trim() || "base";
+    const token = await getCortiToken({ environment, tenant, clientId, clientSecret });
+    return { token, environment, tenant };
+  }
+
+  _stopRemoteProductWork() {
+    this._remoteProductRetirement?.abort();
+    this._remoteProductRetirement = new AbortController();
+    for (const controller of this.enterpriseStreamAborts?.values() ?? []) controller.abort();
+    for (const controller of this.activeUrlDownloads?.values() ?? []) controller.abort();
+    this._remoteCalendarsStarted = false;
+    abortDisallowedRequests(this, this.effectivePolicyManager.getCurrent(), true);
+    cancelWindowRequests(this._enterpriseReasoningRequests);
+    if (this._meetingMicStreaming || this._meetingSystemStreaming)
+      this._stopMeetingForPolicy?.("policyRestricted");
+    for (const key of [
+      "assemblyAiStreaming",
+      "deepgramStreaming",
+      "geminiStreaming",
+      "cortiStreaming",
+      "_dictationStreaming",
+    ])
+      retireProductStream(this, key);
+    // The meeting stop above already told the meeting's renderer.
+    for (const key of ["_meetingMicStreaming", "_meetingSystemStreaming"]) {
+      retireStreaming(this[key]);
+      this[key] = null;
+    }
+    this.googleCalendarManager?.stop();
+    this.microsoftCalendarManager?.stop();
+  }
+
+  _retireDisallowedProductWork(snapshot) {
+    abortDisallowedRequests(this, snapshot);
+    const allowed = (channel, args, accountId = snapshot.accountId) =>
+      runningOperationAllowed(snapshot, accountId, app.getVersion(), channel, args);
+    for (const [property, operation] of this._remoteStreamPolicies) {
+      if (!allowed(operation.channel, operation.args, operation.accountId))
+        retireProductStream(this, property);
+    }
+    for (const [streamId, provider] of this._enterpriseStreamProviders) {
+      if (!allowed("enterprise-stream-start", [{ provider }]))
+        this.enterpriseStreamAborts.get(streamId)?.abort();
+    }
+    const meetingOptions = this.getMeetingTranscriptionOptions?.();
+    if (meetingOptions && !allowed("meeting-transcription", [meetingOptions]))
+      this._stopMeetingForPolicy?.("policyRestricted");
+    if (!allowed("gcal-start-oauth")) {
+      this.googleCalendarManager?.stop();
+      this.microsoftCalendarManager?.stop();
+      this._remoteCalendarsStarted = false;
+    }
+  }
+
+  _startRemoteProductWork() {
+    if (!this._remoteCalendarsReady || this._remoteCalendarsStarted) return;
+    if (
+      !productOperationAllowed(
+        this.effectivePolicyManager.getCurrent(),
+        app.getVersion(),
+        "gcal-start-oauth"
+      )
+    )
+      return;
+    this._remoteCalendarsStarted = true;
+    this.googleCalendarManager?.start();
+    this.microsoftCalendarManager?.start();
+  }
+
+  startPolicyCalendars() {
+    this._remoteCalendarsReady = true;
+    const snapshot = this.effectivePolicyManager.getCurrent();
+    if (snapshot.success && !snapshot.localOnly) this._startRemoteProductWork();
+  }
+
+  setupHandlers() {
+    this._remoteStreamPolicies = new Map();
+    this._retireAccountProductStreams = (accountId) => {
+      this.googleCalendarManager?.stop();
+      this.microsoftCalendarManager?.stop();
+      this._remoteCalendarsStarted = false;
+      for (const [property, operation] of this._remoteStreamPolicies) {
+        if (operation.accountId !== accountId) continue;
+        if (operation.pending) {
+          // Drop held audio before a late handshake can flush it. The pending
+          // marker stays until its owners finish and check their own clients.
+          retireStreaming(operation.streaming);
+          if (this[property] === operation.streaming) this[property] = null;
+        } else retireProductStream(this, property);
+      }
+      for (const [controller, operation] of this._productRequests) {
+        if (operation.accountId === accountId) controller.abort();
+      }
+    };
+    this._productRequests = new Map();
+    this._productRequestContext = new AsyncLocalStorage();
+    this._enterpriseStreamProviders = new Map();
+    // Work that leaves the device doesn't start on a verdict still on its way,
+    // and waits for one: a held verdict answers at once, the network only as
+    // long as a policy decision may take.
+    const awaitVerdict = async (event) => {
+      await this.refreshEffectivePolicy(event, { held: true });
+      if (this.effectivePolicyManager.getCurrent().status !== "loading") return;
+      let timer;
+      await Promise.race([
+        this.refreshEffectivePolicy(event),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, POLICY_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    };
+    const mayStart = (operation) => {
+      const policy = this.effectivePolicyManager.getCurrent();
+      return (
+        (!operation.remote || (!policy.localOnly && policy.status !== "loading")) &&
+        productOperationAllowed(policy, app.getVersion(), operation.channel, operation.args)
+      );
+    };
+    const createProductHandler = (channel, handler, remote = false) => {
+      return async (event, ...args) => {
+        const startedPolicy = this.effectivePolicyManager.getCurrent();
+        const operation = { channel, args, remote, accountId: startedPolicy.accountId };
+        // Only the pill's live request belongs to its Cancel button. History and file
+        // uploads can later use the same provider through their own IPC channels.
+        if (channel === "proxy-assemblyai-transcription")
+          operation.liveDictationSenderId = event.sender.id;
+        // Retry and file routing can select a different provider. Capture the
+        // owner before dispatch waits, then enforce it only on the AssemblyAI route.
+        if (
+          channel === "proxy-assemblyai-transcription" ||
+          (channel === "retry-transcription" &&
+            args[1]?.cloudTranscriptionProvider === "assemblyai") ||
+          (channel === "transcribe-audio-file-byok" && args[0]?.provider === "assemblyai")
+        )
+          operation.dictationWorkspaceAtDispatch = captureDictationWorkspace();
+        if (channel === "cloud-api-request")
+          operation.args = [
+            args[0],
+            {
+              resolvingShareVisibility:
+                args[0]?.method?.toUpperCase() === "POST" &&
+                /^\/api\/notes\/[^/?#]+\/share\/rotate-token\/?(?:[?#]|$)/.test(args[0]?.path),
+            },
+          ];
+        operation.guestLocalDictation =
+          startedPolicy.workspaceRequired === false &&
+          operation.accountId === null &&
+          ["transcribe-local-whisper", "transcribe-local-parakeet"].includes(channel);
+        operation.preserveCreateReceipt =
+          channel === "cloud-api-request" &&
+          !args[0]?.public &&
+          args[0]?.method?.toUpperCase() === "POST" &&
+          args[0]?.path === "/api/conversations/create";
+        const streamProperty = channel.startsWith("dictation-realtime-")
+          ? "_dictationStreaming"
+          : /^(assemblyai|deepgram|gemini|corti)-streaming-(start|warmup)$/.test(channel)
+            ? {
+                assemblyai: "assemblyAiStreaming",
+                deepgram: "deepgramStreaming",
+                gemini: "geminiStreaming",
+                corti: "cortiStreaming",
+              }[channel.split("-")[0]]
+            : null;
+        let streamPolicy;
+        const controller = new AbortController();
+        operation.signal = controller.signal;
+        const interrupted = () =>
+          controller.signal.reason?.code === "TRANSCRIPTION_CANCELLED"
+            ? { success: false, error: "Cancelled", code: "TRANSCRIPTION_CANCELLED" }
+            : policyBlockedFailure(this.effectivePolicyManager.getCurrent());
+        this._productRequests.set(controller, operation);
+        try {
+          void this.refreshEffectivePolicy(event);
+          if (operation.remote && this.effectivePolicyManager.getCurrent().status === "loading")
+            await awaitVerdict(event);
+          if (
+            controller.signal.aborted ||
+            this.effectivePolicyManager.getCurrent().accountId !== operation.accountId ||
+            !mayStart(operation)
+          )
+            return interrupted();
+          if (streamProperty) {
+            const previousStreamPolicy = this._remoteStreamPolicies.get(streamProperty);
+            if (
+              previousStreamPolicy?.pending &&
+              previousStreamPolicy.accountId !== operation.accountId
+            )
+              return { success: false, error: "Operation in progress" };
+            streamPolicy = previousStreamPolicy?.pending
+              ? previousStreamPolicy
+              : { channel, args, accountId: operation.accountId, pending: 0 };
+            streamPolicy.pending += 1;
+            this._remoteStreamPolicies.set(streamProperty, streamPolicy);
+            operation.streamPolicy = streamPolicy;
+          }
+          const result = await this._productRequestContext.run(operation, () =>
+            handler(event, ...args)
+          );
+          // The sender-bound acknowledgement must learn which cloud copy now exists.
+          if (operation.preserveCreateReceipt && result?.success) return result;
+          let snapshot = this.effectivePolicyManager.getCurrent();
+          if (
+            !controller.signal.aborted &&
+            snapshot.status === "loading" &&
+            snapshot.deviceReady &&
+            snapshot.accountId === operation.accountId &&
+            snapshot.authGeneration !== startedPolicy.authGeneration
+          ) {
+            await this.refreshEffectivePolicy(event);
+            snapshot = this.effectivePolicyManager.getCurrent();
+          }
+          if (snapshot.accountId !== operation.accountId) {
+            return {
+              success: false,
+              code: "AUTH_CONTEXT_CHANGED",
+              error: "Authentication context changed during the request",
+            };
+          }
+          if (controller.signal.aborted) return interrupted();
+          if (operation.dictationCleanupSignal?.aborted)
+            return { success: false, ...ipcErrorFields(operation.dictationCleanupSignal.reason) };
+          if (
+            (!operation.remote || !snapshot.localOnly) &&
+            runningOperationAllowed(
+              snapshot,
+              operation.accountId,
+              app.getVersion(),
+              operation.channel,
+              operation.args
+            )
+          )
+            return result;
+          if ((!snapshot.success && snapshot.status !== "loading") || snapshot.localOnly)
+            this._stopRemoteProductWork();
+          else if (snapshot.success) this._retireDisallowedProductWork(snapshot);
+          return policyBlockedFailure(this.effectivePolicyManager.getCurrent());
+        } finally {
+          this._productRequests.delete(controller);
+          if (streamPolicy) {
+            streamPolicy.pending -= 1;
+            const snapshot = this.effectivePolicyManager.getCurrent();
+            if (
+              operation.streaming &&
+              (controller.signal.aborted ||
+                !runningOperationAllowed(
+                  snapshot,
+                  operation.accountId,
+                  app.getVersion(),
+                  channel,
+                  args
+                ))
+            ) {
+              retireStreaming(operation.streaming);
+              if (this[streamProperty] === operation.streaming) this[streamProperty] = null;
+            }
+            if (
+              this._remoteStreamPolicies.get(streamProperty) === streamPolicy &&
+              !streamPolicy.pending &&
+              (!this[streamProperty] || !streamPolicy.streaming)
+            )
+              this._remoteStreamPolicies.delete(streamProperty);
+          }
+        }
+      };
+    };
+    const handleProduct = (channel, handler, remote = false) =>
+      ipcMain.handle(channel, createProductHandler(channel, handler, remote));
+    const handleRemoteProduct = (channel, handler) => handleProduct(channel, handler, true);
+    // Register file work before the product gate can await an effective policy.
+    const handleRemoteFile = (channel, handler) =>
+      ipcMain.handle(channel, (event, ...args) => {
+        const options = channel === "transcribe-audio-file-cloud" ? args[1] : args[0];
+        const { signal, release } = this._uploadCancelRegistry.register(options?.requestId);
+        const guarded = createProductHandler(
+          channel,
+          () => handler({ signal }, event, ...args),
+          true
+        );
+        return guarded(event, ...args).finally(release);
+      });
+    const ownProductStream = (streaming) => {
+      const operation = this._productRequestContext.getStore();
+      if (!operation?.streamPolicy) return streaming;
+      if (this.effectivePolicyManager.getCurrent().accountId !== operation.accountId)
+        throw Object.assign(new Error("Authentication context changed during the request"), {
+          code: "AUTH_CONTEXT_CHANGED",
+        });
+      operation.signal.throwIfAborted();
+      if (!streaming) return streaming;
+      operation.streaming = streaming;
+      operation.streamPolicy.streaming = streaming;
+      if (
+        operation.channel.endsWith("-start") ||
+        !operation.streamPolicy.channel.endsWith("-start")
+      ) {
+        operation.streamPolicy.channel = operation.channel;
+        operation.streamPolicy.args = operation.args;
+      }
+      return streaming;
+    };
+    // Work that turns remote here starts remote work, under new remote work's rules.
+    const trackTranscriptionRoute = async (route, selectedMode) => {
+      const operation = this._productRequestContext.getStore();
+      if (route.transport === "error") return operation.signal;
+      const mode =
+        route.transport === "local"
+          ? "local"
+          : route.transport === "managed"
+            ? "enterprise"
+            : route.transport === "cloud"
+              ? "openwhispr"
+              : route.provider === "self-hosted" || selectedMode === "self-hosted"
+                ? "self-hosted"
+                : "providers";
+      const turnsRemote = !operation.remote && mode !== "local";
+      operation.channel =
+        route.transport === "proxied" && route.provider === "assemblyai"
+          ? "proxy-assemblyai-transcription"
+          : "batch-transcription";
+      operation.args = [{ mode, provider: route.provider ?? "" }];
+      operation.remote = mode !== "local";
+      if (turnsRemote) {
+        if (this.effectivePolicyManager.getCurrent().status === "loading") await awaitVerdict();
+        if (!mayStart(operation)) {
+          throw Object.assign(
+            new Error(policyBlockedMessage(this.effectivePolicyManager.getCurrent())),
+            { code: "DEVICE_POLICY_BLOCKED" }
+          );
+        }
+      }
+      return operation.signal;
+    };
+    const handleProviderTranscription = (channel, handler) =>
+      handleRemoteProduct(channel, (event, options) =>
+        handler(event, options, this._productRequestContext.getStore().signal)
+      );
+    // A push is acked only under the sign-in that sent it. After an account switch
+    // the ack would hand an unattributed row to the new account although the cloud
+    // copy is the old one's, so it is dropped and the row stays pending. A pulled
+    // row is written only under the sign-in that fetched it, for the same reason.
+    // The account counts as well as the token: a session revoked under the same
+    // token drops the scope to signed out, and a row still arriving from that
+    // sign-in's pull would be stored with no owner.
+    const isStaleSyncAck = (expectedAuthGeneration) =>
+      tokenStore.getState().generation !== expectedAuthGeneration ||
+      scopedAccountByGeneration.get(expectedAuthGeneration) !==
+        this.databaseManager.activeAccountId;
+    const isStaleNoteWrite = (guard) =>
+      guard !== undefined &&
+      (!guard ||
+        !(guard.accountId === null || typeof guard.accountId === "string") ||
+        !Number.isSafeInteger(guard.authGeneration) ||
+        guard.accountId !== this.databaseManager.activeAccountId ||
+        guard.authGeneration !== tokenStore.getState().generation);
+    // Each handler takes at most one renderer argument, so the job's signal
+    // always lands after it and can't be supplied by the renderer. onRefused
+    // hears a refusal of work that did not go ahead, with that argument.
+    const handleAudioFeature = (channel, purpose, handler, onRefused) =>
+      ipcMain.handle(channel, (event, options) =>
+        this._audioFeaturePolicy.run(event, purpose, (signal) => handler(event, options, signal), {
+          onRefused: onRefused && ((failure) => onRefused(failure, options)),
+        })
+      );
+    const auditMeetingRefusal = ({ code }, trigger, noteId) =>
+      this.meetingAuditLog?.recordingRefused({ noteId, trigger, reason: code });
+    // Runs a job under the audio policy and the caller's own cancellation
+    // ({ signal, release }); the handler gets one signal for both.
+    const runAudioJob = (event, purpose, { signal, release }, handler) =>
+      this._audioFeaturePolicy
+        .run(event, purpose, handler, {
+          signal: this._productRequestContext.getStore()?.signal
+            ? AbortSignal.any(
+                [signal, this._productRequestContext.getStore().signal].filter(Boolean)
+              )
+            : signal,
+        })
+        .finally(release);
+    ipcMain.handle("onboarding-set-window-mode", (_event, mode) =>
+      this.windowManager.setOnboardingWindowMode(mode)
+    );
+
+    ipcMain.handle("permission-guide-open", (event, state) =>
+      this.windowManager.permissionGuide.open(event, state)
+    );
+    ipcMain.handle("permission-guide-close", (event) =>
+      this.windowManager.permissionGuide.closeFromOwner(event)
+    );
+    ipcMain.handle("permission-guide-state", (event) =>
+      this.windowManager.permissionGuide.stateFor(event)
+    );
+    ipcMain.on("permission-guide-action", (event, action) =>
+      this.windowManager.permissionGuide.handleAction(event, action)
+    );
+    ipcMain.on("permission-guide-drag", (event, target) =>
+      this.windowManager.permissionGuide.startDrag(event, target)
+    );
+
+    // The agent window's own channels; each checks that it is the sender.
+    ipcMain.on("agent-window-ready", (event) => this.windowManager.agentWindow?.markReady(event));
+    ipcMain.on("agent-window-drag", (event, dragging) =>
+      this.windowManager.agentWindow?.setDragging(event, dragging)
+    );
+    ipcMain.handle(
+      "agent-window-set-layout",
+      (event, request) => this.windowManager.agentWindow?.setLayout(event, request) ?? false
+    );
+    ipcMain.handle("agent-window-hide", (event) =>
+      Boolean(this.windowManager.agentWindow?.hide(event))
+    );
+    ipcMain.handle(
+      "agent-window-voice-state",
+      (event, state, attempt) =>
+        this.windowManager.agentWindow?.setVoiceState(event, state, attempt) ?? false
+    );
+    // The dictation window's ways into the assistant: its pill menu's Ask
+    // assistant, and a conversational wake-word command it transcribed.
+    ipcMain.handle("open-agent-window", (event) => {
+      if (!isFromWindow(event, this.windowManager.mainWindow)) return false;
+      this.windowManager.openAgentWindow();
+      return true;
+    });
+    ipcMain.handle("agent-window-submit-command", (event, command) => {
+      if (!isFromWindow(event, this.windowManager.mainWindow)) return false;
+      // The renderer checked the account before sending, but it can change
+      // between that check and this delivery, or while the command waits for
+      // the agent window to load.
+      const isCurrent = () => !this.databaseManager.accountChangedSince(command?.spokenAt);
+      if (!isCurrent()) return false;
+      return this.windowManager.agentWindow?.deliverCommand(command, { isCurrent }) ?? false;
+    });
+
+    // WindowManager owns every teardown path for a demo (id-matched end,
+    // onboarding-set-active(false), control panel closed); without this hook a
+    // renderer crash mid-demo would leave the session set and broadcast every
+    // later dictation's transcripts on onboarding-demo-event forever.
+    this.windowManager.onOnboardingDemoTeardown = () => {
+      this._onboardingDemoSession = null;
+    };
+
+    ipcMain.handle("onboarding-set-active", (_event, active) => {
+      if (typeof active !== "boolean") return false;
+      const result = this.windowManager.setOnboardingActive(active);
+      // The dictation panel can show the GPU pack notice only once the normal
+      // app is up: until then it stays hidden.
+      const noticeWindow = this._gpuPackNoticeWindow();
+      if (!active && noticeWindow && noticeWindow === this.windowManager.mainWindow) {
+        noticeWindow.webContents.send("gpu-pack-migration-notice-ready");
+      }
+      return result;
+    });
+
+    ipcMain.handle("onboarding-demo-begin", (_event, session) => {
+      if (
+        !session ||
+        typeof session.id !== "string" ||
+        session.id.length > 128 ||
+        !ONBOARDING_DEMO_KINDS.has(session.kind)
+      ) {
+        return false;
+      }
+      this._onboardingDemoSession = {
+        id: session.id,
+        kind: session.kind,
+        startedAt: Date.now(),
+      };
+      return this.windowManager.beginOnboardingDemo(session.kind);
+    });
+
+    ipcMain.handle("onboarding-demo-end", (_event, id) => {
+      if (this._onboardingDemoSession?.id === id) {
+        // Session cleanup rides on the teardown hook above.
+        this.windowManager.endOnboardingDemo();
+      }
+      return true;
+    });
+
+    ipcMain.handle("onboarding-demo-stop", (_event, id) => {
+      if (this._onboardingDemoSession?.id !== id) return false;
+      return this.windowManager.stopOnboardingDemoRecording();
+    });
+
+    ipcMain.handle("onboarding-demo-publish", (_event, event) => {
+      const session = this._onboardingDemoSession;
+      if (!session || !event || event.kind !== session.kind) return false;
+      if (!ONBOARDING_DEMO_STATUSES.has(event.status)) return false;
+      const text = typeof event.text === "string" ? event.text.slice(0, 20000) : undefined;
+      const message = typeof event.message === "string" ? event.message.slice(0, 500) : undefined;
+      const tool = typeof event.tool === "string" ? event.tool.slice(0, 64) : undefined;
+      const level = Number.isFinite(event.level)
+        ? Math.min(1, Math.max(0, event.level))
+        : undefined;
+      broadcastToWindows("onboarding-demo-event", {
+        demoId: session.id,
+        kind: session.kind,
+        status: event.status,
+        text,
+        message,
+        tool,
+        level,
+      });
+      return true;
+    });
+
+    // Every panel showing the same credentials and model shares one answer.
+    const cachedConnectionCheck = createConnectionCheckCache();
+    const runPaidKeyCheck = createPaidKeyCheck(() =>
+      path.join(app.getPath("userData"), PAID_KEY_CHECKS_FILE)
+    );
+    const checkProviderConnection = async (config) => {
+      if (config?.provider === "corti" && config?.scope === "transcription") {
+        try {
+          const clientId = String(config.clientId || "").trim();
+          const clientSecret = String(config.clientSecret || "").trim();
+          if (clientId && clientSecret) {
+            await getCortiToken({
+              environment: config.environment || "us",
+              tenant: String(config.tenant || "").trim() || "base",
+              clientId,
+              clientSecret,
+            });
+          } else {
+            await this._mintStoredCortiToken({
+              environment: config.environment,
+              tenant: config.tenant,
+            });
+          }
+          return { success: true };
+        } catch (error) {
+          return describeCortiTokenFailure(error);
+        }
+      }
+      return testProviderConnection(config, proxyFetch, runPaidKeyCheck);
+    };
+    handleRemoteProduct("test-provider-connection", (_event, config) =>
+      cachedConnectionCheck(config, () => checkProviderConnection(config))
+    );
+
+    ipcMain.handle("window-minimize", () => {
+      if (this.windowManager.controlPanelWindow) {
+        this.windowManager.controlPanelWindow.minimize();
+      }
+    });
+
+    ipcMain.handle("window-maximize", () => {
+      if (this.windowManager.controlPanelWindow) {
+        if (this.windowManager.controlPanelWindow.isMaximized()) {
+          this.windowManager.controlPanelWindow.unmaximize();
+        } else {
+          this.windowManager.controlPanelWindow.maximize();
+        }
+      }
+    });
+
+    ipcMain.handle("window-close", () => {
+      if (this.windowManager.controlPanelWindow) {
+        this.windowManager.controlPanelWindow.close();
+      }
+    });
+
+    ipcMain.handle("window-is-maximized", () => {
+      if (this.windowManager.controlPanelWindow) {
+        return this.windowManager.controlPanelWindow.isMaximized();
+      }
+      return false;
+    });
+
+    ipcMain.handle("snap-to-meeting-mode", () => {
+      this.windowManager.snapControlPanelToMeetingMode();
+    });
+
+    ipcMain.handle("restore-from-meeting-mode", () => {
+      this.windowManager.restoreControlPanelFromMeetingMode();
+      this.meetingDetectionEngine?.setMeetingModeActive(false);
+    });
+
+    ipcMain.handle("hide-window", () => {
+      this.windowManager.hideDictationPanel();
+    });
+
+    ipcMain.handle("show-dictation-panel", () => {
+      this.windowManager.showDictationPanel({ reposition: true });
+    });
+
+    ipcMain.handle("open-settings-section", async (_event, section) => {
+      if (
+        !isSettingsTarget(section) &&
+        !isProviderSettingsTarget(section) &&
+        !isPlansBillingTarget(section)
+      ) {
+        return { success: false };
+      }
+      await this.windowManager.openSettings(section);
+      return { success: true };
+    });
+
+    ipcMain.handle("capture-dictation-target", async () => {
+      // Recording start awaits this handler, so the Linux/Windows window probe
+      // runs in the background: a stalled AT-SPI peer would otherwise hold the
+      // microphone for seconds (#1944). Its consumers wait for it themselves.
+      void this.selectionManager?.captureTarget?.();
+      const pid = (await this.textEditMonitor?.captureTargetPid?.()) ?? null;
+      return { success: true, pid };
+    });
+
+    // Tone & Style: which kind of app the dictation is going into. Runs while
+    // the user speaks; only the category reaches the renderer.
+    ipcMain.handle("capture-dictation-app-category", async () => {
+      const context = await this.selectionManager?.getTargetAppContext?.();
+      const category = classifyToneAppCategory(context);
+      debugLogger.debug("Dictation app category", {
+        category,
+        hasWindowTitle: !!context?.windowTitle,
+        hasUrlHost: !!context?.urlHost,
+      });
+      return category;
+    });
+
+    ipcMain.handle("force-stop-dictation", () => {
+      if (this.windowManager?.forceStopMacCompoundPush) {
+        this.windowManager.forceStopMacCompoundPush("manual");
+      }
+      return { success: true };
+    });
+
+    ipcMain.handle("set-main-window-interactivity", (event, shouldCapture) => {
+      this.windowManager.setMainWindowInteractivity(Boolean(shouldCapture));
+      return { success: true };
+    });
+
+    ipcMain.handle("set-main-window-input-region", (event, region) => {
+      if (event.sender !== this.windowManager.mainWindow?.webContents) return null;
+      return this.windowManager.setMainWindowInputRegion(region);
+    });
+
+    ipcMain.handle("get-main-window-horizontal-direction", () => {
+      return this.windowManager.getMainWindowHorizontalDirection();
+    });
+
+    ipcMain.handle("set-notification-interactivity", (event, interactive) => {
+      this.windowManager.setNotificationInteractivity(event.sender, Boolean(interactive));
+      return { success: true };
+    });
+
+    ipcMain.handle("resize-main-window", (event, sizeKey) => {
+      return this.windowManager.resizeMainWindow(sizeKey);
+    });
+
+    ipcMain.handle("resize-assistant-window-to-content", (event, surfaceHeight) => {
+      return this.windowManager.resizeAssistantWindowToContent(surfaceHeight);
+    });
+
+    ipcMain.handle("resize-dictation-error-window-to-content", (event, surfaceHeight) => {
+      return this.windowManager.resizeDictationErrorWindowToContent(surfaceHeight);
+    });
+
+    // Counts changes to any key in Settings. A streaming socket keeps the count it
+    // was opened under, so a start never reuses one authenticated before a change.
+    let credentialGeneration = 0;
+    const saveSecretKey = (getter, saver, storeKey) => (event, key) => {
+      if (typeof key !== "string") throw new TypeError("API key must be a string");
+      // Committing an unedited key field saves the same value again.
+      const changed = this.environmentManager[getter]() !== key;
+      const result = this.environmentManager[saver](key);
+      if (!changed) return result;
+      credentialGeneration += 1;
+      // Notify peers by setting name only; leave the editor's pending input alone.
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && win.webContents.id !== event.sender.id) {
+          win.webContents.send("api-key-updated", storeKey);
+        }
+      }
+      return result;
+    };
+
+    for (const k of BYOK_API_KEYS) {
+      ipcMain.handle(`get-${k.base}-key`, () => this.environmentManager[k.get]());
+      ipcMain.handle(`save-${k.base}-key`, saveSecretKey(k.get, k.save, k.storeKey));
+    }
+
+    ipcMain.handle("db-save-transcription", async (event, text, rawText, options) => {
+      const result = this.databaseManager.saveTranscription(text, rawText, options);
+      if (result?.success && result?.transcription) {
+        setImmediate(() => {
+          const transcription = this.databaseManager.getTranscriptionById(result.transcription.id);
+          if (transcription) broadcastToWindows("transcription-added", transcription);
+        });
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-account-changed-since", (_event, occurredAt) =>
+      this.databaseManager.accountChangedSince(occurredAt)
+    );
+
+    ipcMain.handle("db-get-transcriptions", async (event, limit = 50, options = {}) => {
+      return this.databaseManager.getTranscriptions(limit, options);
+    });
+
+    ipcMain.handle("analytics-record-event", async (_event, input) => {
+      // The renderer only warns when this write fails, then saves the
+      // transcription as completed anyway -- leaving a row the backfill is
+      // the only thing that will ever reconcile.
+      const result = this.databaseManager.recordAnalyticsEvent(input);
+      // Dictation and the control panel are separate renderers, so the
+      // Insights view can only learn about a new event through the main process.
+      if (result?.success && !result.ignored) {
+        setImmediate(() => {
+          broadcastToWindows("analytics-changed");
+        });
+      }
+      return result;
+    });
+
+    ipcMain.handle("analytics-get-summary", async () => {
+      await this._ensureAnalyticsHistoryBackfilled();
+      return this.databaseManager.getAnalyticsSummary();
+    });
+
+    ipcMain.handle("analytics-get-pending", async (_event, limit, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      await this._ensureAnalyticsHistoryBackfilled();
+      return this.databaseManager.getPendingAnalyticsEvents(limit, accountId);
+    });
+
+    ipcMain.handle("analytics-mark-synced", async (_event, eventIds, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.markAnalyticsEventsSynced(eventIds, accountId);
+    });
+
+    ipcMain.handle("analytics-get-pending-deletes", async (_event, limit, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.getPendingAnalyticsDeletes(limit, accountId);
+    });
+
+    ipcMain.handle("analytics-hard-delete", async (_event, eventIds, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.hardDeleteAnalyticsEvents(eventIds, accountId);
+    });
+
+    ipcMain.handle("analytics-get-pending-clear", async (_event, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.getPendingAnalyticsClear(accountId);
+    });
+
+    ipcMain.handle("analytics-complete-clear", async (_event, clearedThrough, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.completeAnalyticsClear(clearedThrough, accountId);
+    });
+
+    ipcMain.handle("analytics-count-unclaimed", async (_event, context) => {
+      assertAnalyticsSyncContext(context);
+      await this._ensureAnalyticsHistoryBackfilled();
+      return this.databaseManager.countUnclaimedAnalyticsEvents();
+    });
+
+    ipcMain.handle("analytics-count-awaiting-upload", async (_event, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      await this._ensureAnalyticsHistoryBackfilled();
+      return this.databaseManager.countAnalyticsEventsAwaitingUpload(accountId);
+    });
+
+    ipcMain.handle(
+      "analytics-claim-anonymous",
+      async (_event, accountId, expectedAuthGeneration) => {
+        const state = tokenStore.getState();
+        if (!state.token || state.generation !== expectedAuthGeneration) {
+          return { success: false, claimed: 0, code: "AUTH_CONTEXT_CHANGED" };
+        }
+        const result = this.databaseManager.claimAnonymousAnalyticsEvents(accountId);
+        // Claimed rows are only pushed by the Insights view's reload, and the
+        // claim itself changes nothing it renders, so tell it to reload.
+        if (result?.claimed > 0) {
+          setImmediate(() => {
+            broadcastToWindows("analytics-changed");
+          });
+        }
+        return result;
+      }
+    );
+
+    ipcMain.handle("db-clear-transcriptions", async (event) => {
+      const result = this.databaseManager.clearTranscriptions();
+      if (result?.success) {
+        // Only the cleared history's recordings: another account's stay.
+        this.audioStorageManager.deleteAudioForTranscriptions(result.ids);
+        setImmediate(() => {
+          broadcastToWindows("transcriptions-cleared", {
+            cleared: result.cleared,
+          });
+          broadcastToWindows("analytics-changed");
+        });
+      }
+      return { success: result.success, cleared: result.cleared };
+    });
+
+    ipcMain.handle("db-delete-transcription", async (event, id) => {
+      return this.deleteTranscriptionInternal(id);
+    });
+
+    // Audio storage handlers
+    ipcMain.handle("save-transcription-audio", async (event, id, audioBuffer, metadata) => {
+      const transcription = this.databaseManager.getTranscriptionById(id);
+      const timestamp = transcription?.timestamp || null;
+      const result = this.audioStorageManager.saveAudio(id, Buffer.from(audioBuffer), timestamp);
+      if (result.success) {
+        this.databaseManager.updateTranscriptionAudio(id, {
+          hasAudio: 1,
+          audioDurationMs: metadata?.durationMs || null,
+          provider: metadata?.provider || null,
+          model: metadata?.model || null,
+        });
+        const updated = this.databaseManager.getTranscriptionById(id);
+        if (updated) broadcastToWindows("transcription-updated", updated);
+      }
+      return result;
+    });
+
+    ipcMain.handle("merge-audio-segments", async (_event, segments) => {
+      try {
+        if (!Array.isArray(segments) || segments.length < 2 || segments.length > 100) {
+          throw new Error("Invalid audio segment count");
+        }
+        const normalized = segments.map((segment) => {
+          if (!segment?.buffer || typeof segment.mimeType !== "string") {
+            throw new Error("Invalid audio segment");
+          }
+          return { buffer: Buffer.from(segment.buffer), mimeType: segment.mimeType };
+        });
+        const { mergeAudioSegments } = require("./ffmpegUtils");
+        const buffer = await mergeAudioSegments(normalized);
+        // Slice to a real ArrayBuffer: Buffers sent over IPC arrive as Uint8Array,
+        // and pooled Buffers share a larger underlying allocation.
+        return {
+          success: true,
+          buffer: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+          mimeType: "audio/webm",
+        };
+      } catch (error) {
+        debugLogger.error("Failed to merge recovered audio segments", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("get-audio-path", async (event, id) => {
+      if (!this.databaseManager.getTranscriptionById(id)) return null;
+      return this.audioStorageManager.getAudioPath(id);
+    });
+
+    ipcMain.handle("show-audio-in-folder", async (event, id) => {
+      if (!this.databaseManager.getTranscriptionById(id)) return { success: false };
+      const filePath = this.audioStorageManager.getAudioPath(id);
+      if (!filePath) return { success: false };
+      shell.showItemInFolder(filePath);
+      return { success: true };
+    });
+
+    ipcMain.handle("get-audio-buffer", async (event, id) => {
+      if (!this.databaseManager.getTranscriptionById(id)) return null;
+      const buffer = this.audioStorageManager.getAudioBuffer(id);
+      return buffer ? buffer.buffer : null;
+    });
+
+    ipcMain.handle("delete-transcription-audio", async (event, id) => {
+      // Only a recording of a dictation the active account can see.
+      if (!this.databaseManager.getTranscriptionById(id)) return { success: false };
+      const result = this.audioStorageManager.deleteAudio(id);
+      if (result.success) {
+        this.databaseManager.updateTranscriptionAudio(id, {
+          hasAudio: 0,
+          audioDurationMs: null,
+          provider: null,
+          model: null,
+        });
+      }
+      return result;
+    });
+
+    ipcMain.handle("get-audio-storage-usage", async () => {
+      return this.audioStorageManager.getStorageUsage({
+        exceptTranscriptionIds: this.databaseManager.getOtherAccountTranscriptionIds(),
+      });
+    });
+
+    ipcMain.on(
+      "retention-settings-changed",
+      createRetentionSettingsHandler({
+        getCurrentSettings: () => this._retentionSettings,
+        getOwner: () => this.windowManager.mainWindow?.webContents,
+        hasSynced: () => this._retentionSettingsSynced,
+        onSettingsChanged: (settings) => {
+          this._retentionSettings = settings;
+          this._retentionSettingsSynced = true;
+          this._runRetentionCleanup();
+          // First point at which the local-history switch is known to be real.
+          // After the sweep, so expired transcripts are gone before they can be
+          // reconstructed into counters the sweep would only have to purge.
+          void this._ensureAnalyticsHistoryBackfilled();
+        },
+      })
+    );
+
+    ipcMain.handle("delete-all-audio", async () => {
+      // Another account's recordings stay, as with Clear history.
+      const result = this.audioStorageManager.deleteAllAudio({
+        exceptTranscriptionIds: this.databaseManager.getOtherAccountTranscriptionIds(),
+      });
+      try {
+        this.databaseManager.clearAudioFlags(this.databaseManager.getTranscriptionIdsWithAudio());
+      } catch (error) {
+        debugLogger.error(
+          "Failed to clear audio flags after delete-all",
+          { error: error.message },
+          "audio-storage"
+        );
+      }
+      return result;
+    });
+
+    ipcMain.handle("get-transcription-by-id", async (event, id) => {
+      return this.databaseManager.getTranscriptionById(id);
+    });
+
+    // Every window's AudioManager can hold the mic open outside a recording, so
+    // gate the audio-evidence meeting detector until they all release. A
+    // renderer that reloads or goes away releases implicitly — otherwise a
+    // crash mid-hold would gate detection for the rest of the session.
+    ipcMain.on("mic-warm-hold-changed", (event, active) => {
+      if (!active) {
+        this._releaseMicHold(event.sender);
+        return;
+      }
+      if (this._micHoldSenders.has(event.sender.id)) return;
+      const release = () => this._releaseMicHold(event.sender);
+      this._micHoldSenders.set(event.sender.id, release);
+      event.sender.on("destroyed", release);
+      event.sender.on("did-finish-load", release);
+      this.meetingDetectionEngine?.setMicWarmHold(true);
+    });
+
+    // Hotkey handlers run in main, while AudioManager owns the real lifecycle
+    // in the dictation renderer. Only confirmed renderer state may change the
+    // main-process recording gate. Preparing reserves it before the renderer
+    // opens the mic; an older attempt cannot release a newer reservation.
+    ipcMain.handle(
+      "dictation-lifecycle-state-changed",
+      (event, state, attempt, voiceAgentRequested) => {
+        const dictationWindow = this.windowManager.mainWindow;
+        if (!isFromWindow(event, dictationWindow) || typeof attempt !== "string" || !attempt) {
+          return false;
+        }
+        return this.windowManager.setDictationLifecycleState(
+          state,
+          attempt,
+          voiceAgentRequested === true
+        );
+      }
+    );
+
+    // Dictionary handlers
+    ipcMain.on("auto-learn-changed", (_event, enabled) => {
+      // Both renderer windows re-sync this on mount — ignore same-value updates (#1080).
+      const { changed, enabled: next } = applyAutoLearnSetting(this._autoLearnEnabled, enabled);
+      if (!changed) return;
+      this._autoLearnEnabled = next;
+      if (!this._autoLearnEnabled) {
+        if (this._autoLearnDebounceTimer) {
+          clearTimeout(this._autoLearnDebounceTimer);
+          this._autoLearnDebounceTimer = null;
+        }
+        this._autoLearnLatestData = null;
+      }
+      debugLogger.debug("[AutoLearn] Setting changed", { enabled: this._autoLearnEnabled });
+    });
+
+    ipcMain.handle("db-get-dictionary", async () => {
+      return this.databaseManager.getDictionary();
+    });
+
+    // `listsAccountId`: whose list the sending window shows. Until the account
+    // change reaches it, saving would copy the last account's list into this one.
+    const isListFromOtherAccount = (listsAccountId) =>
+      listsAccountId !== undefined && listsAccountId !== this.databaseManager.activeAccountId;
+
+    ipcMain.handle("db-set-dictionary", async (event, words, listsAccountId) => {
+      if (!Array.isArray(words)) {
+        throw new Error("words must be an array");
+      }
+      if (isListFromOtherAccount(listsAccountId)) return { success: false, stale: true };
+      const result = this.databaseManager.setDictionary(words);
+      this.parakeetManager.refreshHotwordsSoon();
+      return result;
+    });
+
+    ipcMain.handle("db-seed-dictionary", async (_event, words) => {
+      if (!Array.isArray(words)) {
+        throw new Error("words must be an array");
+      }
+      const result = this.databaseManager.seedDictionary(words);
+      if (result.seeded) this.parakeetManager.refreshHotwordsSoon();
+      return result;
+    });
+
+    ipcMain.handle("db-apply-dictionary-changes", async (_event, changes, listsAccountId) => {
+      const { add, remove } = changes ?? {};
+      if (add !== undefined && !Array.isArray(add)) {
+        throw new Error("add must be an array");
+      }
+      if (remove !== undefined && !Array.isArray(remove)) {
+        throw new Error("remove must be an array");
+      }
+      if (isListFromOtherAccount(listsAccountId)) {
+        return { success: false, added: 0, removed: 0, stale: true };
+      }
+      const result = this.databaseManager.applyDictionaryChanges({ add, remove });
+      this.parakeetManager.refreshHotwordsSoon();
+      return result;
+    });
+
+    ipcMain.handle("db-get-pending-dictionary", async () => {
+      return this.databaseManager.getPendingDictionary();
+    });
+
+    ipcMain.handle("db-get-pending-dictionary-deletes", async () => {
+      return this.databaseManager.getPendingDictionaryDeletes();
+    });
+
+    ipcMain.handle("db-get-dictionary-by-client-id", async (_event, clientDictId) => {
+      return this.databaseManager.getDictionaryEntryByClientId(clientDictId);
+    });
+
+    ipcMain.handle(
+      "db-upsert-dictionary-from-cloud",
+      async (_event, cloudEntry, expectedAuthGeneration) => {
+        if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+        return this.databaseManager.upsertDictionaryFromCloud(cloudEntry);
+      }
+    );
+
+    ipcMain.handle(
+      "db-mark-dictionary-synced",
+      async (
+        _event,
+        id,
+        cloudId,
+        serverUpdatedAt,
+        expectedWord,
+        expectedSource,
+        serverSource,
+        pushed,
+        expectedAuthGeneration
+      ) => {
+        if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+        return this.databaseManager.markDictionaryEntrySynced(
+          id,
+          cloudId,
+          serverUpdatedAt,
+          expectedWord,
+          expectedSource,
+          serverSource,
+          pushed
+        );
+      }
+    );
+
+    ipcMain.handle("db-hard-delete-dictionary", async (_event, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+      return this.databaseManager.hardDeleteDictionaryEntry(id);
+    });
+
+    ipcMain.handle("db-clear-dictionary-cloud-id", async (_event, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return { success: false, stale: true };
+      return this.databaseManager.clearDictionaryCloudId(id);
+    });
+
+    ipcMain.handle("db-keep-newer-dictionary-edit", async (_event, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+      return this.databaseManager.keepNewerDictionaryEdit(id);
+    });
+
+    ipcMain.handle("db-get-dictionary-entries-by-words", async (_event, words) => {
+      if (!Array.isArray(words)) throw new Error("words must be an array");
+      return this.databaseManager.getDictionaryEntriesByWords(words);
+    });
+
+    ipcMain.handle("db-mark-dictionary-words-shared", async (_event, words, sharedAt, options) => {
+      if (!Array.isArray(words)) throw new Error("words must be an array");
+      const pendingWords = options?.pendingWords ?? [];
+      if (!Array.isArray(pendingWords)) throw new Error("pendingWords must be an array");
+      if (isStaleSyncAck(options?.expectedAuthGeneration)) return { marked: [], stale: true };
+      return this.databaseManager.markDictionaryWordsShared(words, sharedAt, { pendingWords });
+    });
+
+    ipcMain.handle("db-retire-moved-dictionary-words", async (_event, words, options) => {
+      if (!Array.isArray(words)) throw new Error("words must be an array");
+      if (isStaleSyncAck(options?.expectedAuthGeneration)) return { retired: [], stale: true };
+      return this.databaseManager.retireMovedDictionaryWords(words, {
+        includeSynced: options?.includeSynced !== false,
+      });
+    });
+
+    ipcMain.handle("db-revive-retired-dictionary-words", async (_event, words, options) => {
+      if (!Array.isArray(words)) throw new Error("words must be an array");
+      if (isStaleSyncAck(options?.expectedAuthGeneration)) return { revived: [], stale: true };
+      return this.databaseManager.reviveRetiredDictionaryWords(words);
+    });
+
+    ipcMain.handle("db-get-moved-dictionary-words", async () => {
+      return this.databaseManager.getMovedDictionaryWords();
+    });
+
+    const requireWorkspaceId = (workspaceId) => {
+      if (typeof workspaceId !== "string" || !workspaceId) {
+        throw new Error("workspaceId must be a non-empty string");
+      }
+    };
+
+    ipcMain.handle("db-shared-dictionary-get", async (_event, workspaceId) => {
+      requireWorkspaceId(workspaceId);
+      return this.databaseManager.getSharedDictionary(workspaceId);
+    });
+
+    ipcMain.handle("db-shared-dictionary-apply-pull", async (_event, workspaceId, change) => {
+      requireWorkspaceId(workspaceId);
+      const { upserts = [], deletedIds = [], meta } = change ?? {};
+      if (!Array.isArray(upserts) || !Array.isArray(deletedIds)) {
+        throw new Error("upserts and deletedIds must be arrays");
+      }
+      return this.databaseManager.applySharedDictionaryPull(workspaceId, {
+        upserts,
+        deletedIds,
+        meta,
+      });
+    });
+
+    ipcMain.handle("db-shared-dictionary-replace", async (_event, workspaceId, full) => {
+      requireWorkspaceId(workspaceId);
+      if (!Array.isArray(full?.entries)) throw new Error("entries must be an array");
+      return this.databaseManager.replaceSharedDictionary(workspaceId, {
+        entries: full.entries,
+        meta: full.meta,
+      });
+    });
+
+    ipcMain.handle("db-shared-dictionary-apply-hides", async (_event, workspaceId, change) => {
+      requireWorkspaceId(workspaceId);
+      const { hidden = [], unhidden = [] } = change ?? {};
+      if (!Array.isArray(hidden) || !Array.isArray(unhidden)) {
+        throw new Error("hidden and unhidden must be arrays");
+      }
+      return this.databaseManager.applySharedDictionaryHides(workspaceId, { hidden, unhidden });
+    });
+
+    ipcMain.handle("db-shared-dictionary-replace-hides", async (_event, workspaceId, hidden) => {
+      requireWorkspaceId(workspaceId);
+      if (!Array.isArray(hidden)) throw new Error("hidden must be an array");
+      return this.databaseManager.replaceSharedDictionaryHides(workspaceId, hidden);
+    });
+
+    ipcMain.handle("db-shared-dictionary-clear", async (_event, workspaceId) => {
+      if (workspaceId != null) requireWorkspaceId(workspaceId);
+      return this.databaseManager.clearSharedDictionary(workspaceId);
+    });
+
+    ipcMain.handle("db-shared-dictionary-prune", async (_event, keepWorkspaceIds) => {
+      if (!Array.isArray(keepWorkspaceIds)) throw new Error("keepWorkspaceIds must be an array");
+      keepWorkspaceIds.forEach(requireWorkspaceId);
+      return this.databaseManager.pruneSharedDictionary(keepWorkspaceIds);
+    });
+
+    ipcMain.handle("dictionary-set-shared-hints", async (_event, promptHints, hotwordHints) => {
+      const isWordList = (value) =>
+        Array.isArray(value) && value.every((word) => typeof word === "string");
+      const isHints = (value) => isWordList(value?.space) && isWordList(value?.workspace);
+      if (!isHints(promptHints)) return;
+      this._sharedDictionaryHints = {
+        space: [...promptHints.space],
+        workspace: [...promptHints.workspace],
+      };
+
+      const suppressed = hotwordHints?.suppressedPersonal;
+      const accountId = hotwordHints?.accountId ?? null;
+      if (
+        !isHints(hotwordHints) ||
+        (suppressed !== undefined && !isWordList(suppressed)) ||
+        (accountId !== null && (typeof accountId !== "string" || !accountId))
+      ) {
+        this._clearDictionaryHotwordHints();
+        return;
+      }
+      const activeAccountId = this.databaseManager.activeAccountId;
+      // A saved snapshot can arrive before startup validates its owner. Once
+      // bound, ignore late snapshots from another account.
+      if (!accountId || (activeAccountId !== null && accountId !== activeAccountId)) return;
+      this._dictionaryHotwordHints = {
+        accountId,
+        space: [...hotwordHints.space],
+        workspace: [...hotwordHints.workspace],
+        suppressedPersonal: new Set((suppressed ?? []).map(dictionaryWordKey)),
+      };
+      this.parakeetManager.refreshHotwordsSoon();
+    });
+
+    ipcMain.handle("db-broadcast-dictionary-updated", async () => {
+      // Emit the normalized list straight from SQLite so renderers see the
+      // post-dedupe truth, never a caller-supplied payload.
+      const words = this.databaseManager.getDictionary();
+      broadcastToWindows("dictionary-updated", words);
+      this.parakeetManager.refreshHotwordsSoon();
+      return { success: true };
+    });
+
+    ipcMain.handle("db-get-snippets", async () => {
+      return this.databaseManager.getSnippets();
+    });
+
+    ipcMain.handle("db-set-snippets", async (_event, snippets, listsAccountId) => {
+      if (!Array.isArray(snippets)) {
+        throw new Error("snippets must be an array");
+      }
+      if (isListFromOtherAccount(listsAccountId)) return { success: false, stale: true };
+      return this.databaseManager.setSnippets(snippets);
+    });
+
+    ipcMain.handle("db-seed-snippets", async (_event, snippets) => {
+      if (!Array.isArray(snippets)) {
+        throw new Error("snippets must be an array");
+      }
+      return this.databaseManager.seedSnippets(snippets);
+    });
+
+    ipcMain.handle("db-get-pending-snippets", async () => {
+      return this.databaseManager.getPendingSnippets();
+    });
+
+    ipcMain.handle("db-get-pending-snippet-deletes", async () => {
+      return this.databaseManager.getPendingSnippetDeletes();
+    });
+
+    ipcMain.handle(
+      "db-get-snippet-for-cloud-merge",
+      async (_event, cloudEntry, expectedAuthGeneration) => {
+        if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+        return this.databaseManager.getSnippetForCloudMerge(cloudEntry);
+      }
+    );
+
+    ipcMain.handle(
+      "db-upsert-snippet-from-cloud",
+      async (_event, cloudEntry, expectedAuthGeneration) => {
+        if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+        return this.databaseManager.upsertSnippetFromCloud(cloudEntry);
+      }
+    );
+
+    ipcMain.handle(
+      "db-mark-snippet-synced",
+      async (
+        _event,
+        id,
+        cloudId,
+        serverUpdatedAt,
+        expectedTrigger,
+        expectedReplacement,
+        expectedAuthGeneration
+      ) => {
+        if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+        return this.databaseManager.markSnippetSynced(
+          id,
+          cloudId,
+          serverUpdatedAt,
+          expectedTrigger,
+          expectedReplacement
+        );
+      }
+    );
+
+    ipcMain.handle("db-hard-delete-snippet", async (_event, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+      return this.databaseManager.hardDeleteSnippet(id);
+    });
+
+    ipcMain.handle("db-clear-snippet-cloud-id", async (_event, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return { success: false, stale: true };
+      return this.databaseManager.clearSnippetCloudId(id);
+    });
+
+    ipcMain.handle("db-keep-newer-snippet-edit", async (_event, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+      return this.databaseManager.keepNewerSnippetEdit(id);
+    });
+
+    ipcMain.handle("db-broadcast-snippets-updated", async () => {
+      const snippets = this.databaseManager.getSnippets();
+      broadcastToWindows("snippets-updated", snippets);
+      return { success: true };
+    });
+
+    ipcMain.handle("undo-learned-corrections", async (_event, words) => {
+      try {
+        if (!Array.isArray(words) || words.length === 0) {
+          return { success: false };
+        }
+        const validWords = words.filter((w) => typeof w === "string" && w.trim().length > 0);
+        if (validWords.length === 0) {
+          return { success: false };
+        }
+        const saveResult = this.databaseManager.applyDictionaryChanges({ remove: validWords });
+        if (saveResult?.success === false) {
+          debugLogger.debug("[AutoLearn] Undo failed to save dictionary", {
+            error: saveResult.error,
+          });
+          return { success: false };
+        }
+        broadcastToWindows("dictionary-updated", this.databaseManager.getDictionary());
+        this.parakeetManager.refreshHotwordsSoon();
+        debugLogger.debug("[AutoLearn] Undo: removed words", { words: validWords });
+        return { success: true };
+      } catch (err) {
+        debugLogger.debug("[AutoLearn] Undo failed", { error: err.message });
+        return { success: false };
+      }
+    });
+
+    ipcMain.handle(
+      "db-save-note",
+      async (
+        event,
+        title,
+        content,
+        noteType,
+        sourceFile,
+        audioDuration,
+        folderId,
+        spaceId,
+        transcript,
+        writeGuard
+      ) => {
+        if (isStaleNoteWrite(writeGuard)) return { success: false, error: "Account changed" };
+        const result = this.databaseManager.saveNote(
+          title,
+          content,
+          noteType,
+          sourceFile,
+          audioDuration,
+          folderId,
+          spaceId,
+          transcript
+        );
+        if (result?.success && result?.note) {
+          setImmediate(() => broadcastToWindows("note-added", result.note));
+          this.notifyVectorChanges();
+          this._asyncMirrorWrite(result.note);
+        }
+        return result;
+      }
+    );
+
+    ipcMain.handle("db-get-note", async (event, id) => {
+      return this.databaseManager.getNote(id);
+    });
+
+    ipcMain.handle("db-get-notes", async (event, noteType, limit, folderId, spaceId, spaceIds) => {
+      return this.databaseManager.getNotes(noteType, limit, folderId, spaceId, spaceIds);
+    });
+
+    ipcMain.handle("db-get-space-notes", async (event, spaceId, limit) => {
+      return this.databaseManager.getNotesForSpace(spaceId, limit);
+    });
+
+    ipcMain.handle("db-get-note-undos", () => this.databaseManager.getNoteUndos());
+    ipcMain.handle("db-claim-note-undo", (_event, token) =>
+      this.databaseManager.claimNoteUndo(token)
+    );
+    ipcMain.handle("db-discard-note-undo", (_event, id, token) =>
+      this.databaseManager.discardNoteUndo(id, token)
+    );
+    ipcMain.handle("db-undo-note-update", (_event, token) => {
+      const result = this.databaseManager.undoNoteUpdate(token);
+      if (result?.success && result?.note) {
+        setImmediate(() => broadcastToWindows("note-updated", result.note));
+        this.notifyVectorChanges();
+        this._asyncMirrorWrite(result.note);
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-update-note", async (event, id, updates, options) => {
+      if (isStaleNoteWrite(options?.writeGuard))
+        return { success: false, error: "Account changed" };
+      const result = this.databaseManager.updateNote(id, updates, options);
+      if (result?.success && result?.note) {
+        setImmediate(() => broadcastToWindows("note-updated", result.note));
+        this.notifyVectorChanges();
+        this._asyncMirrorWrite(result.note);
+        if (updates.participants) {
+          this._tryAutoLabelOneOnOne(id);
+          this._refreshMeetingSpeakerConfigFromNote(id, result.note);
+        }
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-delete-note", async (event, id) => {
+      return this.deleteNoteInternal(id);
+    });
+
+    ipcMain.handle("db-search-notes", async (event, query, limit, spaceId, folderId, spaceIds) => {
+      return this.databaseManager.searchNotes(
+        query,
+        limit,
+        spaceId,
+        folderId,
+        spaceIdsArgument(spaceIds)
+      );
+    });
+
+    ipcMain.handle(
+      "db-semantic-search-notes",
+      async (event, query, limit = 5, spaceId, folderId, requestedSpaceIds) => {
+        // The assistant names the spaces in its workspace scope; an empty or
+        // malformed list reads nothing rather than everything.
+        const spaceIds = spaceIdsArgument(requestedSpaceIds);
+        if (spaceIds?.length === 0) return [];
+        try {
+          // Qdrant payload updates are best-effort. Use its space filter to
+          // reduce the candidate set, then validate every scoped vector hit
+          // against SQLite before it can enter the fused ranking.
+          const overFetch = folderId != null ? limit * 4 : limit * 2;
+          const must = [];
+          if (spaceId != null) must.push({ key: "space_id", match: { value: spaceId } });
+          if (spaceIds) must.push({ key: "space_id", match: { any: spaceIds } });
+          const vectorFilter = must.length > 0 ? { must } : undefined;
+          const [ftsResults, vectorResults] = await Promise.all([
+            this.databaseManager.searchNotes(query, overFetch, spaceId, folderId, spaceIds),
+            this.getSemanticSearch?.()?.search(query, overFetch, vectorFilter),
+          ]);
+          if (vectorResults == null) return ftsResults.slice(0, limit);
+          const scopedIds = new Set(
+            this.databaseManager.getNoteIdsInScope(
+              spaceId,
+              folderId,
+              vectorResults.map(({ noteId }) => noteId),
+              spaceIds
+            )
+          );
+
+          // Filter low-confidence semantic matches before RRF
+          const filteredVectorResults = vectorResults.filter(
+            ({ noteId, score }) => score > 0.3 && scopedIds.has(noteId)
+          );
+
+          // Reciprocal Rank Fusion (K=60, matching cloud implementation)
+          const scores = new Map();
+          ftsResults.forEach((note, i) => {
+            scores.set(note.id, (scores.get(note.id) || 0) + 1 / (60 + i));
+          });
+          filteredVectorResults.forEach(({ noteId }, i) => {
+            scores.set(noteId, (scores.get(noteId) || 0) + 1 / (60 + i));
+          });
+
+          const rankedIds = [...scores.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, limit)
+            .map(([id]) => id);
+
+          const noteMap = new Map();
+          ftsResults.forEach((n) => noteMap.set(n.id, n));
+          for (const id of rankedIds) {
+            if (!noteMap.has(id)) {
+              const note = this.databaseManager.getNote(id);
+              if (note) noteMap.set(id, note);
+            }
+          }
+
+          return rankedIds.map((id) => noteMap.get(id)).filter(Boolean);
+        } catch (error) {
+          debugLogger.error("Semantic search failed, falling back to FTS5", {
+            error: error.message,
+          });
+          return this.databaseManager.searchNotes(query, limit, spaceId, folderId, spaceIds);
+        }
+      }
+    );
+
+    ipcMain.handle("db-update-note-cloud-id", async (event, id, cloudId) => {
+      return this.databaseManager.updateNoteCloudId(id, cloudId);
+    });
+
+    ipcMain.handle("db-update-note-share-state", async (event, id, state) => {
+      const note = this.databaseManager.updateNoteShareState(id, state);
+      if (note) {
+        setImmediate(() => broadcastToWindows("note-updated", note));
+      }
+      return note;
+    });
+
+    ipcMain.handle("db-get-folders", async (event, spaceId) => {
+      return this.databaseManager.getFolders(spaceId);
+    });
+
+    // Notes that left the device-only list are filed, indexed and visible in
+    // every window, and the list itself changed.
+    const publishDeviceNoteChange = (movedNotes) => {
+      this.notifyVectorChanges();
+      this.noteFiles.notesMoved();
+      setImmediate(() => {
+        // A claimed tombstone syncs but must not appear in the renderer's list.
+        for (const note of movedNotes) {
+          if (!note.deleted_at) broadcastToWindows("note-updated", note);
+        }
+        broadcastToWindows("device-notes-changed");
+      });
+    };
+
+    ipcMain.handle("db-get-device-notes", async () => this.databaseManager.getDeviceNotes());
+
+    ipcMain.handle("db-get-device-note", async (_event, id) =>
+      isRowIdArgument(id) ? this.databaseManager.getDeviceNote(id) : null
+    );
+
+    ipcMain.handle("db-move-device-notes", async (_event, request) => {
+      const { noteIds, folderId, workspaceId = null, targetFolderId, accountId } = request ?? {};
+      const namesNotes = Array.isArray(noteIds) && noteIds.length > 0;
+      // The database reads a request naming neither as "move everything".
+      if (
+        !(namesNotes || isRowIdArgument(folderId)) ||
+        (noteIds !== undefined && !(namesNotes && noteIds.every(isRowIdArgument))) ||
+        (folderId !== undefined && !isRowIdArgument(folderId)) ||
+        (targetFolderId !== undefined && !isRowIdArgument(targetFolderId)) ||
+        !isWorkspaceIdArgument(workspaceId)
+      ) {
+        return INVALID_DEVICE_NOTES_REQUEST;
+      }
+      if (isForOtherAccount(accountId, this.databaseManager.activeAccountId)) {
+        return ACCOUNT_CHANGED_RESULT;
+      }
+      const { moved, skipped, code } = this.databaseManager.moveDeviceNotesToPrivate({
+        noteIds,
+        folderId,
+        workspaceId,
+        targetFolderId,
+      });
+      if (code) return { success: false, code, error: "The folder is no longer available" };
+      if (moved.length > 0) publishDeviceNoteChange(moved);
+      return { success: true, moved, skipped };
+    });
+
+    ipcMain.handle("db-get-stand-in-ownership-candidates", async () =>
+      this.databaseManager.getStandInOwnershipCandidates()
+    );
+
+    ipcMain.handle("db-resolve-stand-in-ownership", async (_event, request) => {
+      const { noteId, cloudId, owned, accountId } = request ?? {};
+      if (
+        !isRowIdArgument(noteId) ||
+        typeof cloudId !== "string" ||
+        !cloudId ||
+        typeof owned !== "boolean"
+      ) {
+        return INVALID_DEVICE_NOTES_REQUEST;
+      }
+      if (isForOtherAccount(accountId, this.databaseManager.activeAccountId)) {
+        return ACCOUNT_CHANGED_RESULT;
+      }
+      const { claimed, note } = this.databaseManager.resolveStandInOwnership(
+        noteId,
+        cloudId,
+        owned
+      );
+      if (claimed) publishDeviceNoteChange(note ? [note] : []);
+      return { claimed };
+    });
+
+    ipcMain.handle("db-create-folder", (_event, name, spaceId, writeGuard, parentFolderId) =>
+      isStaleNoteWrite(writeGuard)
+        ? { success: false, error: "Account changed" }
+        : this.createFolderWithEffects(name, spaceId, parentFolderId)
+    );
+
+    ipcMain.handle("db-delete-folder", async (event, id) => {
+      const snapshots = this._captureMirrorDeletionNotes({ folder_id: id });
+      this._captureSubfolderDeletionNotes(id, snapshots);
+      const result = this.databaseManager.deleteFolder(id);
+      if (result?.success) {
+        this.notifyVectorChanges();
+        this._mirrorRemovedFolder(result, snapshots);
+        // Subfolders first, as the database deleted them. Each event names every
+        // note the delete took, so a recording in one of them hears of it.
+        const noteIds = result.noteIds ?? [];
+        setImmediate(() => {
+          for (const folderId of result.folderIds ?? [id]) {
+            broadcastToWindows("folder-deleted", { id: folderId, noteIds });
+          }
+        });
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-rename-folder", async (event, id, name) => {
+      const result = this.databaseManager.renameFolder(id, name);
+      if (result?.success && result?.folder) {
+        this.noteFiles.containersChanged();
+        setImmediate(() => broadcastToWindows("folder-renamed", result.folder));
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-move-folder-to-space", async (event, id, spaceId) => {
+      const result = this.databaseManager.moveFolderToSpace(id, spaceId);
+      if (result?.success) {
+        // Qdrant payloads carry space_id — the triggers journaled the moved notes.
+        this.notifyVectorChanges();
+        this.noteFiles.containersChanged();
+        if (result.folder) {
+          setImmediate(() => broadcastToWindows("folder-synced", result.folder));
+        }
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-set-folder-parent", async (event, id, parentFolderId, writeGuard) => {
+      if (isStaleNoteWrite(writeGuard)) return { success: false, error: "Account changed" };
+      const result = this.databaseManager.setFolderParent(id, parentFolderId ?? null);
+      if (result?.success && result?.folder) {
+        this.noteFiles.containersChanged();
+        setImmediate(() => broadcastToWindows("folder-synced", result.folder));
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-get-folder-note-counts", async () => {
+      return this.databaseManager.getFolderNoteCounts();
+    });
+
+    ipcMain.handle("db-get-spaces", async () => {
+      return this.databaseManager.getSpaces();
+    });
+
+    ipcMain.handle("db-has-other-account-rows", () => this.databaseManager.hasOtherAccountRows());
+    ipcMain.handle("db-has-unclaimed-legacy-rows", () =>
+      this.databaseManager.hasUnclaimedLegacyRows()
+    );
+
+    ipcMain.handle("set-active-workspace-scope", (_event, scope) => {
+      if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
+        return { success: false, error: "Invalid workspace scope" };
+      }
+      const { activeWorkspaceId = null, defaultWorkspaceId = null, accountId } = scope;
+      if (!isWorkspaceIdArgument(activeWorkspaceId) || !isWorkspaceIdArgument(defaultWorkspaceId)) {
+        return { success: false, error: "Invalid workspace scope" };
+      }
+      if (isForOtherAccount(accountId, this.databaseManager.activeAccountId)) {
+        return ACCOUNT_CHANGED_RESULT;
+      }
+      this.databaseManager.setActiveWorkspaceScope({ activeWorkspaceId, defaultWorkspaceId });
+      observeDictationWorkspace({
+        accountId: getScope().accountId,
+        workspaceId: activeWorkspaceId,
+      });
+      return { success: true };
+    });
+
+    ipcMain.handle("get-private-space-id", (_event, workspaceId = null, expectedAuthGeneration) => {
+      if (!isWorkspaceIdArgument(workspaceId)) return null;
+      if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+        return null;
+      return this.databaseManager.getPrivateSpaceId(workspaceId);
+    });
+
+    // Personal cloud rows without recorded placement fall back to the account's
+    // default Private, never the active workspace's.
+    ipcMain.handle("get-default-private-space-id", (_event, expectedAuthGeneration) => {
+      if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+        return null;
+      return this.databaseManager.getDefaultPrivateSpaceId();
+    });
+
+    ipcMain.handle("bind-default-private-space", (_event, defaultWorkspaceId, accountId) => {
+      if (typeof defaultWorkspaceId !== "string" || !defaultWorkspaceId.trim()) {
+        return { success: false, error: "Invalid workspace" };
+      }
+      if (isForOtherAccount(accountId, this.databaseManager.activeAccountId)) {
+        return ACCOUNT_CHANGED_RESULT;
+      }
+      if (!this.databaseManager.activeAccountId) {
+        return { success: false, code: "SIGNED_OUT", error: "No account is signed in" };
+      }
+      this.databaseManager.bindDefaultPrivateSpace(defaultWorkspaceId);
+      this.noteFiles.containersChanged();
+      broadcastToWindows(
+        "space-synced",
+        this.databaseManager.getSpace(this.databaseManager.getDefaultPrivateSpaceId())
+      );
+      // Moved notes carry their space in Qdrant payloads; the triggers journaled them.
+      this.notifyVectorChanges();
+      return { success: true };
+    });
+
+    ipcMain.handle("copy-note-to-space", (_event, noteId, targetSpaceId, folderId = null) => {
+      if (
+        !isRowIdArgument(noteId) ||
+        !isRowIdArgument(targetSpaceId) ||
+        (folderId !== null && !isRowIdArgument(folderId))
+      ) {
+        return null;
+      }
+      const note = this.databaseManager.copyNoteToSpace(noteId, targetSpaceId, folderId);
+      if (note) {
+        setImmediate(() => broadcastToWindows("note-added", note));
+        this.notifyVectorChanges();
+        this._asyncMirrorWrite(note);
+      }
+      return note;
+    });
+
+    ipcMain.handle(
+      "relocate-private-space",
+      (_event, fromWorkspaceId, toWorkspaceId = null, accountId) => {
+        if (
+          typeof fromWorkspaceId !== "string" ||
+          !fromWorkspaceId.trim() ||
+          !isWorkspaceIdArgument(toWorkspaceId)
+        ) {
+          return { success: false, error: "Invalid workspace" };
+        }
+        if (isForOtherAccount(accountId, this.databaseManager.activeAccountId)) {
+          return ACCOUNT_CHANGED_RESULT;
+        }
+        if (!this.databaseManager.activeAccountId) {
+          return { success: false, code: "SIGNED_OUT", error: "No account is signed in" };
+        }
+        const moved = this.databaseManager.relocatePrivateSpace(fromWorkspaceId, toWorkspaceId);
+        this.noteFiles.containersChanged();
+        if (moved.notes > 0 || moved.folders > 0) {
+          const targetId =
+            toWorkspaceId == null
+              ? this.databaseManager.getDefaultPrivateSpaceId()
+              : this.databaseManager.getPrivateSpaceId(toWorkspaceId);
+          broadcastToWindows("space-synced", this.databaseManager.getSpace(targetId));
+        }
+        // Moved notes carry their space in Qdrant payloads; the triggers journaled them.
+        if (moved.notes > 0) this.notifyVectorChanges();
+        return { success: true, ...moved };
+      }
+    );
+
+    ipcMain.handle("set-active-account-scope", async (_event, accountId, expectedGeneration) => {
+      const state = tokenStore.getState();
+      const verdict = accountScopeBinding.evaluateScopeRequest({
+        accountId,
+        expectedGeneration,
+        token: state.token,
+        generation: state.generation,
+      });
+      if (!verdict.ok) {
+        return {
+          success: false,
+          code: verdict.code,
+          error:
+            verdict.code === "INVALID_ACCOUNT"
+              ? "Invalid account scope"
+              : "Authentication context changed before account scoping",
+        };
+      }
+      const previousScope = accountScopeBinding.resolveActiveAccountScope({
+        ...state,
+        binding: accountScopeBinding.read(),
+      });
+      affiliateLinks.setAccountScope(accountId, state.generation);
+      const accountChanged = this.databaseManager.activeAccountId !== accountId;
+      // Every window asks again whenever its auth state moves, so most calls repeat the scope
+      // this process last applied. A repeat changes nothing below: the claims only find rows
+      // written signed out, which can't appear while an account is active (see saveTranscription
+      // for the one that can), and the flushes ran for this scope already. Nor does it broadcast:
+      // every window reacts to the broadcast, and those reactions led back here.
+      if (
+        !accountChanged &&
+        this._appliedAccountScope?.accountId === accountId &&
+        this._appliedAccountScope.generation === state.generation &&
+        (accountId === null
+          ? previousScope === null
+          : accountScopeBinding.matchesActiveAccountScope(previousScope, {
+              accountId,
+              authGeneration: state.generation,
+            }))
+      ) {
+        return { success: true };
+      }
+      const guest = accountId === null && !state.token;
+      const scopeChanged =
+        accountChanged || (accountId !== null && previousScope?.accountId !== accountId);
+      // Work a guest started needs no account's leave to go on: the new verdict
+      // decides it when it lands. Leaving an account does end its work.
+      const leftAccount =
+        accountChanged && typeof this.databaseManager.activeAccountId === "string";
+      if (accountChanged) this._meetingAdmission?.cancelPending();
+      if (accountChanged && !leftAccount && accountId !== null) {
+        for (const operation of this._productRequests.values()) {
+          if (operation.guestLocalDictation && operation.accountId === null)
+            operation.accountId = accountId;
+        }
+      }
+      if (leftAccount) this._localModelPolicy?.cancelJobs();
+      if (leftAccount) this._retireAccountProductStreams?.(this.databaseManager.activeAccountId);
+      // A rotated bearer no longer matches the stored binding, so this also
+      // holds for the same account: that only re-scopes the policy, and only a
+      // different account ends the work and meeting already running.
+      if (scopeChanged) {
+        this.updateManager?.invalidatePolicy();
+        this._audioFeaturePolicy?.invalidate();
+        if (leftAccount) {
+          this._audioFeaturePolicy?.cancelJobs();
+          this._stopMeetingForPolicy?.("accountChanged");
+        }
+        if (accountChanged) {
+          this._retireEnterpriseAudio?.(false, "accountChanged");
+          this._enterpriseAudioOwner = null;
+        }
+        this.windowManager.retireMeetingNotificationScope();
+        this._cancelCalendarAuthorizations();
+      }
+      if (accountChanged) this._noteFilesSync?.flushSync();
+      this.databaseManager.setActiveAccountId(accountId);
+      this.databaseManager.claimSignedOutLocalRows();
+      this.databaseManager.claimLegacyRowsOfOnlyAccount();
+      // After those two: they give the account the signed-out chats this moves
+      // out of the stand-in along with the notes.
+      const privateNotesClaimed = this._claimSignedOutPrivateNotes();
+      this.databaseManager.ensureAccountDefaultFolders();
+      this._flushAccountRepairMirrors();
+      // After the claims, so the new account's notes include the ones it took over.
+      if (accountChanged) this.noteFiles.accountChanged();
+      if (accountChanged) {
+        if (this._dictionaryHotwordHints?.accountId === accountId) {
+          this.parakeetManager.refreshHotwordsSoon();
+        } else {
+          this._clearDictionaryHotwordHints();
+        }
+      }
+      if (accountId !== null) {
+        accountScopeBinding.persist(accountId, state.token);
+        scopedAccountByGeneration.set(state.generation, accountId);
+      } else accountScopeBinding.clear();
+      // After the scope moved: the verdict this fetches is stamped with the
+      // account and cached under the binding, so neither may still be the old one.
+      if (scopeChanged) {
+        this._localModelPolicy?.invalidate(
+          guest ? this.effectivePolicyManager.getCurrent() : undefined
+        );
+        this.effectivePolicyManager.invalidate();
+      } else if (guest) this._localModelPolicy?.update(this.effectivePolicyManager.getCurrent());
+      void this.updateManager?.refreshPolicy();
+      void this.refreshEffectivePolicy();
+      // A failed best-effort claim must remain eligible for the next scope request.
+      this._appliedAccountScope = privateNotesClaimed
+        ? { accountId, generation: state.generation }
+        : null;
+      broadcastToWindows(
+        "active-account-scope-changed",
+        accountId !== null ? { accountId, authGeneration: state.generation } : null
+      );
+      this._broadcastDatabaseAccountScope();
+      if (accountChanged) this._broadcastAccountScopedSettings();
+      this.connectorManager?.accountChanged();
+      void this.connectorManager?.notifyStatusChanged();
+      void this.metaActivation?.flush();
+      void this.productEvents?.flush();
+      return { success: true };
+    });
+
+    ipcMain.handle("get-active-account-scope", () =>
+      accountScopeBinding.resolveActiveAccountScope({
+        ...tokenStore.getState(),
+        binding: accountScopeBinding.read(),
+      })
+    );
+
+    // A tool can wait on folder lookup or a lock before writing; keep its original account.
+    ipcMain.handle("get-note-write-guard", () => ({
+      accountId: this.databaseManager.activeAccountId,
+      authGeneration: tokenStore.getState().generation,
+    }));
+
+    // The binding above stops matching as soon as the token rotates, while the
+    // database keeps the account until the renderer re-scopes it, so a window
+    // taking its baseline from the binding reads that re-scope as a change.
+    ipcMain.handle("get-database-account-scope", () => this.databaseManager.getAccountScope());
+
+    ipcMain.handle(
+      "delete-account-data",
+      async (_event, accountId, expectedGeneration, options) => {
+        const state = tokenStore.getState();
+        if (
+          typeof accountId !== "string" ||
+          accountId.trim().length === 0 ||
+          !state.token ||
+          state.generation !== expectedGeneration
+        ) {
+          return {
+            success: false,
+            code: "AUTH_CONTEXT_CHANGED",
+            error: "Authentication context changed before local account cleanup",
+          };
+        }
+        try {
+          // Best effort; each revoke has a 5s deadline (connectorManager.js).
+          // Erasing the device takes the calendar logins with it, so a grant
+          // Gmail shares with a calendar is revoked too: cleanup-app runs
+          // after this and finds no Gmail login left to revoke.
+          await this.connectorManager?.disconnectAll({
+            erasingDevice: options?.erasingDevice === true,
+          });
+          const snapshots = this._captureMirrorDeletionNotes({ account_id: accountId });
+          const result = this.databaseManager.deleteAccountData(accountId);
+          let productEventsFailure;
+          try {
+            this.productEvents?.purge(accountId);
+          } catch (error) {
+            productEventsFailure = error;
+          }
+          this.audioStorageManager.deleteAudioForTranscriptions(result.deletedTranscriptionIds);
+          this.metaActivation?.purge(accountId);
+          this.notifyVectorChanges();
+          for (const noteId of result.deletedNoteIds) {
+            this._asyncMirrorDelete(noteId, snapshots);
+          }
+          for (const note of result.relocatedNotes) {
+            if (!note.deleted_at) this._asyncMirrorWrite(note);
+          }
+          this.noteFiles.containersChanged();
+          // The account's rows are already gone, so a vault that won't delete
+          // must not report the deletion as failed; a later deletion retries it.
+          try {
+            await this.enterpriseAudioCredentials?.removeAccount(accountId);
+          } catch (error) {
+            debugLogger.warn("Enterprise audio credential removal failed", {
+              error: error.message,
+            });
+          }
+          if (productEventsFailure) throw productEventsFailure;
+          return { success: true, ...result };
+        } catch (error) {
+          return { success: false, code: "LOCAL_ACCOUNT_CLEANUP_FAILED", error: error.message };
+        }
+      }
+    );
+
+    ipcMain.handle("db-update-space", async (event, id, updates) => {
+      const result = this.databaseManager.updateSpace(id, updates);
+      if (result?.success && result.space) {
+        this.noteFiles.containersChanged();
+        setImmediate(() => broadcastToWindows("space-synced", result.space));
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-purge-space", async (event, id, options) => {
+      if (options?.expectedAuthGeneration !== undefined) {
+        const state = tokenStore.getState();
+        if (!state.token || state.generation !== options.expectedAuthGeneration) {
+          return {
+            success: false,
+            error: "Authentication context changed before account cleanup",
+            code: "AUTH_CONTEXT_CHANGED",
+          };
+        }
+      }
+      const snapshots = this._captureMirrorDeletionNotes({ space_id: id });
+      const result = this.databaseManager.purgeSpace(id, options);
+      if (result?.success) {
+        if (!result.preservedForOtherAccounts) {
+          // The purge row and the relocated notes' trigger rows drain together.
+          this.databaseManager.addPendingVectorPurge(result.spaceId);
+          this.notifyVectorChanges();
+          for (const note of result.relocatedNotes ?? []) {
+            this._asyncMirrorWrite(note);
+          }
+          for (const noteId of result.noteIds ?? []) {
+            this._asyncMirrorDelete(noteId, snapshots);
+          }
+        }
+        this.noteFiles.containersChanged();
+        setImmediate(() => broadcastToWindows("space-purged", { spaceId: result.spaceId }));
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-get-actions", async () => {
+      return this.databaseManager.getActions();
+    });
+
+    ipcMain.handle("db-get-action", async (event, id) => {
+      return this.databaseManager.getAction(id);
+    });
+
+    ipcMain.handle("db-create-action", async (event, name, description, prompt, icon, fields) => {
+      const result = this.databaseManager.createAction(name, description, prompt, icon, fields);
+      if (result?.success && result?.action) {
+        setImmediate(() => {
+          broadcastToWindows("action-created", result.action);
+        });
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-update-action", async (event, id, updates) => {
+      const result = this.databaseManager.updateAction(id, updates);
+      if (result?.success && result?.action) {
+        setImmediate(() => {
+          broadcastToWindows("action-updated", result.action);
+        });
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-delete-action", async (event, id) => {
+      const result = this.databaseManager.deleteAction(id);
+      if (result?.success) {
+        setImmediate(() => {
+          broadcastToWindows("action-deleted", { id });
+        });
+      }
+      return result;
+    });
+
+    // One renderer owns a running turn or a recoverable question. Process lifecycle
+    // events release it even when the renderer cannot run its effect cleanup.
+    const conversationOwners = new Map();
+    const conversationScope = () =>
+      `${this.databaseManager.activeAccountId ?? ""}:${tokenStore.getState().generation}`;
+    ipcMain.handle("claim-agent-conversation", (event, id, ownerId) => {
+      if (
+        !Number.isSafeInteger(id) ||
+        typeof ownerId !== "string" ||
+        !ownerId ||
+        ownerId.length > 128
+      ) {
+        return { owned: false, conversation: null };
+      }
+      const conversation = this.databaseManager.getAgentConversation(id);
+      if (!conversation) return { owned: false, conversation: null };
+      const scope = conversationScope();
+      let owner = conversationOwners.get(id);
+      if (owner && owner.scope !== scope) {
+        owner.release();
+        owner = undefined;
+      }
+      if (owner) {
+        return { owned: owner.sender === event.sender && owner.id === ownerId, conversation };
+      }
+      const sender = event.sender;
+      const release = () => {
+        if (conversationOwners.get(id) !== entry) return;
+        conversationOwners.delete(id);
+        sender.removeListener("destroyed", release);
+        sender.removeListener("render-process-gone", release);
+        sender.removeListener("did-navigate", release);
+        broadcastToWindows("agent-conversation-released", { conversationId: id });
+      };
+      const entry = { sender, id: ownerId, scope, release };
+      conversationOwners.set(id, entry);
+      sender.once("destroyed", release);
+      sender.once("render-process-gone", release);
+      sender.on("did-navigate", release);
+      return { owned: true, conversation };
+    });
+    ipcMain.handle("release-agent-conversation", (event, id, ownerId) => {
+      const owner = conversationOwners.get(id);
+      if (owner?.sender === event.sender && owner.id === ownerId) owner.release();
+    });
+
+    // Agent conversation handlers
+    ipcMain.handle(
+      "db-create-agent-conversation",
+      async (event, title, noteId, spaceId, folderId) => {
+        return this.databaseManager.createAgentConversation(title, noteId, spaceId, folderId);
+      }
+    );
+
+    ipcMain.handle("db-get-conversations-for-note", async (event, noteId, limit) => {
+      return this.databaseManager.getConversationsForNote(noteId, limit);
+    });
+
+    ipcMain.handle(
+      "db-get-conversations-for-container",
+      async (event, spaceId, folderId, limit) => {
+        return this.databaseManager.getConversationsForContainer(spaceId, folderId, limit);
+      }
+    );
+
+    ipcMain.handle("db-protect-conversation", (_, id, notes, deviceOnly, expectedAccountId) =>
+      this.databaseManager.protectConversation(id, notes, deviceOnly, expectedAccountId)
+    );
+
+    ipcMain.handle("db-get-agent-conversations", async (event, limit) => {
+      return this.databaseManager.getAgentConversations(limit);
+    });
+
+    ipcMain.handle("db-get-agent-conversation", async (event, id) => {
+      const conversation = this.databaseManager.getAgentConversation(id);
+      return conversation
+        ? {
+            ...conversation,
+            has_active_turn: conversationOwners.get(id)?.scope === conversationScope(),
+          }
+        : null;
+    });
+
+    ipcMain.handle("db-delete-agent-conversation", async (event, id) => {
+      const result = this.databaseManager.deleteAgentConversation(id);
+      if (this.vectorIndex?.isReady?.()) {
+        this.vectorIndex.deleteConversationChunks(id).catch(() => {});
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-update-agent-conversation-title", async (event, id, title) => {
+      return this.databaseManager.updateAgentConversationTitle(id, title);
+    });
+
+    ipcMain.handle(
+      "db-add-agent-message",
+      async (event, conversationId, role, content, metadata) => {
+        const result = this.databaseManager.addAgentMessage(
+          conversationId,
+          role,
+          content,
+          metadata
+        );
+        if (result && this.vectorIndex?.isReady?.()) {
+          const conv = this.databaseManager.getAgentConversation(conversationId);
+          if (conv && conv.messages?.length % 3 === 0) {
+            this.vectorIndex
+              .upsertConversationChunks(conversationId, conv.title, conv.messages)
+              .catch(() => {});
+          }
+        }
+        return result;
+      }
+    );
+
+    ipcMain.handle("db-update-agent-message", async (event, id, content, metadata) => {
+      return this.databaseManager.updateAgentMessage(id, content, metadata);
+    });
+
+    ipcMain.handle(
+      "db-fork-agent-conversation",
+      async (event, conversationId, throughMessageId, forkContext) => {
+        return this.databaseManager.forkAgentConversation(
+          conversationId,
+          throughMessageId,
+          forkContext
+        );
+      }
+    );
+
+    ipcMain.handle("db-get-agent-messages", async (event, conversationId) => {
+      return this.databaseManager.getAgentMessages(conversationId);
+    });
+
+    ipcMain.handle(
+      "db-get-agent-conversations-with-preview",
+      async (event, limit, offset, includeArchived, spaceIds = null) => {
+        return this.databaseManager.getAgentConversationsWithPreview(
+          limit,
+          offset,
+          includeArchived,
+          spaceIdsArgument(spaceIds)
+        );
+      }
+    );
+
+    ipcMain.handle(
+      "db-search-agent-conversations",
+      async (event, query, limit, spaceIds = null) => {
+        return this.databaseManager.searchAgentConversations(
+          query,
+          limit,
+          spaceIdsArgument(spaceIds)
+        );
+      }
+    );
+
+    ipcMain.handle("db-archive-agent-conversation", async (event, id) => {
+      return this.databaseManager.archiveAgentConversation(id);
+    });
+
+    ipcMain.handle("db-unarchive-agent-conversation", async (event, id) => {
+      return this.databaseManager.unarchiveAgentConversation(id);
+    });
+
+    ipcMain.handle("db-update-agent-conversation-cloud-id", async (event, id, cloudId) => {
+      return this.databaseManager.updateAgentConversationCloudId(id, cloudId);
+    });
+
+    ipcMain.handle(
+      "db-semantic-search-conversations",
+      async (event, query, limit = 20, spaceIds = null) => {
+        const scopeSpaceIds = spaceIdsArgument(spaceIds);
+        const allowedIds = this.databaseManager.getConversationIdsInScope(scopeSpaceIds);
+        if (allowedIds.length === 0) return [];
+        if (this.vectorIndex?.isReady?.()) {
+          try {
+            const vectorResults = await this.vectorIndex.searchConversations(
+              query,
+              limit,
+              allowedIds
+            );
+            if (vectorResults?.length > 0) {
+              const currentIds = new Set(
+                this.databaseManager.getConversationIdsInScope(scopeSpaceIds)
+              );
+              const ids = vectorResults
+                .map((r) => r.conversationId)
+                .filter((id) => currentIds.has(id));
+              const previews = ids
+                .map((id) => this.databaseManager.getAgentConversation(id))
+                .filter(Boolean)
+                .map((c) => ({
+                  ...c,
+                  message_count: c.messages?.length ?? 0,
+                  last_message: c.messages?.[c.messages.length - 1]?.content,
+                }));
+              if (previews.length > 0) return previews;
+            }
+          } catch {
+            // fall through to keyword search
+          }
+        }
+        return this.databaseManager.searchAgentConversations(query, limit, scopeSpaceIds);
+      }
+    );
+
+    // Notes sync
+    // Full Backup reads personal rows too; SyncService applies the current consent.
+    ipcMain.handle("db-get-pending-notes", (_, scope) =>
+      SYNC_NOTE_QUEUES.has(scope) ? this.databaseManager.getPendingNotes(scope) : []
+    );
+    ipcMain.handle("db-get-pending-note-deletes", () =>
+      this.databaseManager.getPendingNoteDeletes()
+    );
+    ipcMain.handle("db-get-note-by-client-id", (_, clientNoteId) =>
+      this.databaseManager.getNoteByClientId(clientNoteId)
+    );
+    ipcMain.handle("db-get-note-for-cloud-row", (_, clientNoteId, cloudId) =>
+      this.databaseManager.getNoteForCloudRow(clientNoteId, cloudId)
+    );
+    // A pull passes its sign-in generation so replacement accounts cannot accept its rows.
+    ipcMain.handle(
+      "db-upsert-note-from-cloud",
+      (_, cloudNote, localFolderId, localSpaceId, expectedAuthGeneration, options) => {
+        if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration)) {
+          return STALE_SYNC_ACK;
+        }
+        const note = this.databaseManager.upsertNoteFromCloud(
+          cloudNote,
+          localFolderId,
+          localSpaceId,
+          { newKeyIfTaken: options?.newKeyIfTaken === true }
+        );
+        if (note) {
+          setImmediate(() => broadcastToWindows("note-synced", note));
+          this.notifyVectorChanges();
+          this.noteFiles.queueNote(note.id);
+        }
+        return note;
+      }
+    );
+    ipcMain.handle("db-mark-note-creates-attempted", (_, clientNoteIds, expectedAuthGeneration) => {
+      if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration)) return [];
+      return this.databaseManager.markNoteCreatesAttempted(clientNoteIds);
+    });
+    ipcMain.handle(
+      "db-renew-note-cloud-identity",
+      (_, id, clientNoteId, cloudId, spaceId, expectedAuthGeneration) => {
+        if (
+          !Number.isSafeInteger(expectedAuthGeneration) ||
+          isStaleSyncAck(expectedAuthGeneration)
+        ) {
+          return STALE_SYNC_ACK;
+        }
+        const result = this.databaseManager.renewNoteCloudIdentity(
+          id,
+          clientNoteId,
+          cloudId,
+          spaceId
+        );
+        if (result.note) setImmediate(() => broadcastToWindows("note-synced", result.note));
+        return result;
+      }
+    );
+    ipcMain.handle("db-get-private-placement-backup-candidates", (_, expectedAuthGeneration) => {
+      if (!Number.isSafeInteger(expectedAuthGeneration) || isStaleSyncAck(expectedAuthGeneration)) {
+        return STALE_SYNC_ACK;
+      }
+      return this.databaseManager.getPrivatePlacementBackupCandidates();
+    });
+    ipcMain.handle(
+      "db-get-private-placement-backup-rows",
+      (_, expectedAuthGeneration, candidates) => {
+        if (
+          !Number.isSafeInteger(expectedAuthGeneration) ||
+          isStaleSyncAck(expectedAuthGeneration)
+        ) {
+          return STALE_SYNC_ACK;
+        }
+        return this.databaseManager.getPrivatePlacementBackupRows(candidates);
+      }
+    );
+    ipcMain.handle("db-queue-unlinked-private-folders", (_, expectedAuthGeneration) => {
+      if (!Number.isSafeInteger(expectedAuthGeneration) || isStaleSyncAck(expectedAuthGeneration)) {
+        return STALE_SYNC_ACK;
+      }
+      return this.databaseManager.queueUnlinkedPrivateFolders();
+    });
+    // Scope changes run before useAuth waits for the sync lock. Cloud ownership
+    // evidence must still belong to the active account when its queued IPC lands.
+    const assertSyncAccountScope = (expectedScope) => {
+      const activeScope = accountScopeBinding.resolveActiveAccountScope({
+        ...tokenStore.getState(),
+        binding: accountScopeBinding.read(),
+      });
+      if (
+        !accountScopeBinding.matchesActiveAccountScope(expectedScope, activeScope) ||
+        this.databaseManager.activeAccountId !== expectedScope.accountId
+      ) {
+        throw new Error("Authentication context changed during sync acknowledgement");
+      }
+    };
+    ipcMain.handle(
+      "db-acknowledge-note-create",
+      (_, id, snapshot, cloudId, cloudUpdatedAt, ownerUserId, options) => {
+        if (
+          options?.expectedAuthGeneration !== undefined &&
+          isStaleSyncAck(options.expectedAuthGeneration)
+        )
+          return STALE_SYNC_ACK;
+        const result = this.databaseManager.acknowledgeNoteCreate(
+          id,
+          snapshot,
+          cloudId,
+          cloudUpdatedAt,
+          ownerUserId,
+          options
+        );
+        if (result.note) {
+          setImmediate(() => broadcastToWindows("note-synced", result.note));
+          this.notifyVectorChanges();
+          this.noteFiles.queueNote(result.note.id);
+        }
+        return result;
+      }
+    );
+    ipcMain.handle(
+      "db-mark-note-synced-if-unchanged",
+      (
+        _,
+        id,
+        snapshot,
+        expectedCloudId,
+        cloudUpdatedAt,
+        ownerUserId,
+        cloudRevision,
+        cloudNote,
+        expectedAuthGeneration
+      ) => {
+        if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+          return STALE_SYNC_ACK;
+        const result = this.databaseManager.markNoteSyncedIfUnchanged(
+          id,
+          snapshot,
+          expectedCloudId,
+          cloudUpdatedAt,
+          ownerUserId,
+          cloudRevision,
+          cloudNote
+        );
+        // The ack took the server's copy of a field: refresh open editors.
+        if (result.note) {
+          setImmediate(() => broadcastToWindows("note-synced", result.note));
+          this.notifyVectorChanges();
+          this.noteFiles.queueNote(result.note.id);
+        }
+        return result;
+      }
+    );
+    ipcMain.handle("db-set-note-cloud-base", (_, id, cloudUpdatedAt, cloudRevision, options) =>
+      this.databaseManager.setNoteCloudBase(id, cloudUpdatedAt, cloudRevision, options)
+    );
+    ipcMain.handle("db-set-note-owner-from-cloud", (_, id, ownerUserId) =>
+      this.databaseManager.setNoteOwnerFromCloud(id, ownerUserId)
+    );
+    ipcMain.handle("db-count-notes-missing-revision", (_, spaceKind) =>
+      this.databaseManager.countNotesMissingRevision(spaceKind)
+    );
+    ipcMain.handle("db-count-team-notes-missing-owner", () =>
+      this.databaseManager.countTeamNotesMissingOwner()
+    );
+    ipcMain.handle("db-mark-note-sync-error", (_, id) =>
+      this.databaseManager.markNoteSyncError(id)
+    );
+    // No broadcast or mirror write: the note stays deleted until its delete is answered.
+    ipcMain.handle("db-keep-deleted-note-transcript", (_, id, transcript, writeGuard) => {
+      if (writeGuard === undefined || isStaleNoteWrite(writeGuard)) {
+        return { success: false, error: "Account changed" };
+      }
+      return this.databaseManager.keepTranscriptOnDeletedNote(id, transcript);
+    });
+    ipcMain.handle("db-restore-note-after-denied-delete", (_, id) => {
+      const result = this.databaseManager.restoreNoteAfterDeniedDelete(id);
+      // Its files went when the delete was made locally.
+      if (result?.success) this.noteFiles.queueNote(id);
+      // A synced restore reaches its windows with the snapshot pull that replaces
+      // it. A pending one keeps its own text, which that pull leaves alone.
+      const restored = result?.pending ? this.databaseManager.getNote(id) : null;
+      if (restored) setImmediate(() => broadcastToWindows("note-synced", restored));
+      return result;
+    });
+    // A pulled delete names the copy it decided from (options.expected); main
+    // leaves a row written since, so its text is decided again, not deleted.
+    ipcMain.handle("db-hard-delete-note", (_, id, expectedAuthGeneration, options) => {
+      if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+        return STALE_SYNC_ACK;
+      const expected =
+        options?.expected && typeof options.expected === "object" ? options.expected : undefined;
+      const snapshots = this._captureMirrorDeletionNotes({ id });
+      const result = this.databaseManager.hardDeleteNote(id, { expected });
+      if (result?.success) {
+        this.notifyVectorChanges();
+        this._asyncMirrorDelete(id, snapshots);
+        setImmediate(() => broadcastToWindows("note-deleted", { id }));
+      }
+      return result;
+    });
+
+    // Folders sync
+    ipcMain.handle("db-get-pending-folders", (_, scope) =>
+      scope == null || scope === "private" || scope === "team"
+        ? this.databaseManager.getPendingFolders(scope)
+        : []
+    );
+    ipcMain.handle("db-get-folder-by-client-id", (_, clientFolderId) =>
+      this.databaseManager.getFolderByClientId(clientFolderId)
+    );
+    ipcMain.handle("db-get-folder-by-cloud-id", (_, cloudId) =>
+      typeof cloudId === "string" && cloudId
+        ? this.databaseManager.getFolderByCloudId(cloudId)
+        : null
+    );
+    // Pinned, and keyed afresh on request, like db-upsert-note-from-cloud.
+    ipcMain.handle(
+      "db-upsert-folder-from-cloud",
+      (_, cloudFolder, localSpaceId, expectedAuthGeneration, options) => {
+        if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration)) {
+          return STALE_SYNC_ACK;
+        }
+        const folder = this.databaseManager.upsertFolderFromCloud(cloudFolder, localSpaceId, {
+          newKeyIfTaken: options?.newKeyIfTaken === true,
+        });
+        if (folder) {
+          this.noteFiles.containersChanged();
+          setImmediate(() => broadcastToWindows("folder-synced", folder));
+        }
+        return folder;
+      }
+    );
+    ipcMain.handle(
+      "db-acknowledge-folder-create",
+      (
+        _,
+        id,
+        snapshot,
+        expectedCloudId,
+        responseClientFolderId,
+        cloudId,
+        cloudUpdatedAt,
+        expectedAuthGeneration
+      ) => {
+        if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration)) {
+          return STALE_SYNC_ACK;
+        }
+        return this.databaseManager.acknowledgeFolderCreate(
+          id,
+          snapshot,
+          expectedCloudId,
+          responseClientFolderId,
+          cloudId,
+          cloudUpdatedAt
+        );
+      }
+    );
+    ipcMain.handle(
+      "db-mark-folder-synced-if-unchanged",
+      (_, id, snapshot, expectedCloudId, expectedAuthGeneration) => {
+        if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+          return STALE_SYNC_ACK;
+        return this.databaseManager.markFolderSyncedIfUnchanged(id, snapshot, expectedCloudId);
+      }
+    );
+    ipcMain.handle("db-ensure-account-default-folders", (_, foreignCloudIds, expectedScope) => {
+      assertSyncAccountScope(expectedScope);
+      const before = this.databaseManager.getFolders();
+      this.databaseManager.ensureAccountDefaultFolders(
+        Array.isArray(foreignCloudIds)
+          ? foreignCloudIds.filter((cloudId) => typeof cloudId === "string")
+          : []
+      );
+      this._flushAccountRepairMirrors();
+      // A folder proved to be another account's is gone from this scope.
+      const kept = new Set(this.databaseManager.getFolders().map((folder) => folder.id));
+      setImmediate(() => {
+        for (const { id } of before) {
+          if (!kept.has(id)) broadcastToWindows("folder-deleted", { id });
+        }
+      });
+    });
+    ipcMain.handle("db-get-folder-id-map", () => this.databaseManager.getFolderIdMap());
+    ipcMain.handle("db-apply-cloud-folder-parents", (_, links, expectedAuthGeneration) => {
+      if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+        return STALE_SYNC_ACK;
+      const changed = this.databaseManager.applyCloudFolderParents(links);
+      if (changed.length > 0) this.noteFiles.containersChanged();
+      setImmediate(() => {
+        for (const folder of changed) {
+          broadcastToWindows("folder-synced", folder);
+        }
+      });
+    });
+    ipcMain.handle("db-get-pending-folder-deletes", () =>
+      this.databaseManager.getPendingFolderDeletes()
+    );
+    ipcMain.handle("db-restore-folder-after-denied-delete", (_, id) => {
+      const result = this.databaseManager.restoreFolderAfterDeniedDelete(id);
+      if (!result?.success) return result;
+      this.notifyVectorChanges();
+      this.noteFiles.containersChanged();
+      for (const note of result.notes ?? []) {
+        this._asyncMirrorWrite(note);
+      }
+      // A stand-in folder also brings back the signed-out notes it holds; only
+      // the account's own reach its windows.
+      const notes = (result.notes ?? []).filter((note) => this.databaseManager.getNote(note.id));
+      setImmediate(() => {
+        if (result.folder) broadcastToWindows("folder-synced", result.folder);
+        for (const subfolder of result.subfolders ?? []) {
+          broadcastToWindows("folder-synced", subfolder);
+        }
+        for (const note of notes) {
+          broadcastToWindows("note-synced", note);
+        }
+      });
+      return { ...result, notes };
+    });
+    ipcMain.handle("db-hard-delete-folder", (_, id, expectedAuthGeneration, options) => {
+      if (expectedAuthGeneration !== undefined && isStaleSyncAck(expectedAuthGeneration))
+        return STALE_SYNC_ACK;
+      const snapshots = this._captureMirrorDeletionNotes({ folder_id: id });
+      const result = this.databaseManager.hardDeleteFolder(id, options);
+      if (result?.success) {
+        this.notifyVectorChanges();
+        // Notes a pulled delete unfiled to their space's top level are among the
+        // relocated notes, so _mirrorRemovedFolder writes them.
+        this._mirrorRemovedFolder(result, snapshots);
+        setImmediate(() => {
+          // Before the folder goes, so a window showing one of them keeps it open.
+          for (const note of [...(result.preservedNotes ?? []), ...(result.unfiledNotes ?? [])]) {
+            broadcastToWindows("note-updated", note);
+          }
+          broadcastToWindows("folder-deleted", { id, noteIds: result.noteIds ?? [] });
+        });
+      }
+      return result;
+    });
+    // A private folder that left a team keeps the team's cloud identity until
+    // sync detaches it, so the team's row stays the team's (D8).
+    ipcMain.handle("db-fork-folder-identity", (_, id) =>
+      this.databaseManager.forkFolderIdentity(id)
+    );
+    ipcMain.handle("db-relocate-revoked-folder", (_, id, privateSpaceId, preserveFolder) => {
+      const snapshots = this._captureMirrorDeletionNotes({ folder_id: id });
+      const result = this.databaseManager.relocateRevokedFolder(id, privateSpaceId, preserveFolder);
+      if (result?.success) {
+        // The triggers journaled the relocated and deleted notes. Mirror files live by
+        // folder, so rewrite the relocated notes and drop the server-owned ones.
+        this.notifyVectorChanges();
+        this.noteFiles.containersChanged();
+        const movedNotes = [...(result.relocatedNotes ?? []), ...(result.unfiledNotes ?? [])];
+        for (const note of movedNotes) {
+          this._asyncMirrorWrite(note);
+        }
+        for (const noteId of result.deletedNoteIds ?? []) {
+          this._asyncMirrorDelete(noteId, snapshots);
+        }
+        setImmediate(() => {
+          if (result.folder) broadcastToWindows("folder-synced", result.folder);
+          else broadcastToWindows("folder-deleted", { id });
+          for (const note of movedNotes) {
+            broadcastToWindows("note-updated", note);
+          }
+          for (const noteId of result.deletedNoteIds ?? []) {
+            broadcastToWindows("note-deleted", { id: noteId });
+          }
+        });
+      }
+      return result;
+    });
+
+    // Renderer-side sync events (conflicts, revocation toasts, …) happen in
+    // whichever window ran the pass — rebroadcast them to ALL windows.
+    ipcMain.handle("broadcast-sync-event", (_, name, payload) => {
+      broadcastToWindows("sync-event", { name, payload });
+      return { success: true };
+    });
+
+    // Spaces sync
+    ipcMain.handle("db-upsert-space-from-cloud", (_, cloudSpace) => {
+      const space = this.databaseManager.upsertSpaceFromCloud(cloudSpace);
+      if (space) {
+        this.noteFiles.containersChanged();
+        setImmediate(() => broadcastToWindows("space-synced", space));
+      }
+      return space;
+    });
+    ipcMain.handle("db-set-space-sync-status", (_, id, status) => {
+      const result = this.databaseManager.setSpaceSyncStatus(id, status);
+      if (result?.success && result.space) {
+        // Live skeleton toggling: the tree keys pending/synced off this flag.
+        setImmediate(() => broadcastToWindows("space-synced", result.space));
+      }
+      return result;
+    });
+
+    // Conversations sync
+    ipcMain.handle("db-get-pending-conversations", () =>
+      this.databaseManager.getPendingConversations()
+    );
+    ipcMain.handle("db-get-pending-conversation-deletes", () =>
+      this.databaseManager.getPendingConversationDeletes()
+    );
+    ipcMain.handle("db-get-conversation-by-client-id", (_, clientId) =>
+      this.databaseManager.getConversationByClientId(clientId)
+    );
+    ipcMain.handle("db-claim-conversation-from-cloud", (_, cloudConv, expectedAuthGeneration) =>
+      isStaleSyncAck(expectedAuthGeneration)
+        ? STALE_SYNC_ACK
+        : this.databaseManager.claimConversationFromCloud(cloudConv)
+    );
+    ipcMain.handle(
+      "db-upsert-conversation-from-cloud",
+      (_, cloudConv, messages, snapshot, expectedAuthGeneration) =>
+        isStaleSyncAck(expectedAuthGeneration)
+          ? STALE_SYNC_ACK
+          : this.databaseManager.upsertConversationFromCloud(cloudConv, messages, snapshot)
+    );
+    ipcMain.handle("db-mark-conversation-create-attempted", (_, id, expectedAuthGeneration) =>
+      isStaleSyncAck(expectedAuthGeneration)
+        ? STALE_SYNC_ACK
+        : this.databaseManager.markConversationCreateAttempted(id)
+    );
+    ipcMain.handle("db-mark-conversation-pending", (_, id, expectedAuthGeneration) =>
+      isStaleSyncAck(expectedAuthGeneration)
+        ? STALE_SYNC_ACK
+        : this.databaseManager.markConversationPending(id)
+    );
+    ipcMain.handle("db-get-synced-linked-conversations", (_, expectedAuthGeneration) =>
+      isStaleSyncAck(expectedAuthGeneration)
+        ? STALE_SYNC_ACK
+        : this.databaseManager.getSyncedLinkedConversations()
+    );
+    ipcMain.handle("db-clear-conversation-create-attempted", (_, id) =>
+      this.databaseManager.clearConversationCreateAttempted(id)
+    );
+    // Unlike the other tables' acks, a chat's is never dropped: its copy now
+    // exists in the sender's cloud, and an unattributed chat left unlinked would
+    // go up again under whichever account syncs next. It is recorded for the
+    // account that sent it, which may no longer be the active one.
+    ipcMain.handle(
+      "db-acknowledge-conversation-create",
+      (_, id, snapshot, cloudId, accountId, authGeneration) => {
+        const sender = syncSenderAccount(accountId, authGeneration);
+        if (!sender) return { success: false, outcome: "unresolved", cloud_id: null };
+        return this.databaseManager.acknowledgeConversationCreate(id, snapshot, cloudId, sender);
+      }
+    );
+    ipcMain.handle(
+      "db-mark-conversation-synced",
+      (_, id, cloudId, snapshot, cloudUpdatedAt, accountId, authGeneration) => {
+        const sender = syncSenderAccount(accountId, authGeneration);
+        if (!sender) return { success: false };
+        return this.databaseManager.markConversationSynced(
+          id,
+          cloudId,
+          snapshot,
+          cloudUpdatedAt,
+          sender
+        );
+      }
+    );
+    // As the create ack: the tombstone it answers is in the sender's cloud.
+    ipcMain.handle(
+      "db-replace-conversation-client-id",
+      (_, id, expectedClientId, accountId, authGeneration) => {
+        const sender = syncSenderAccount(accountId, authGeneration);
+        if (!sender) return { success: false };
+        return this.databaseManager.replaceConversationClientId(id, expectedClientId, sender);
+      }
+    );
+    ipcMain.handle("db-hard-delete-conversation", (_, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+      const result = this.databaseManager.hardDeleteConversation(id, true);
+      if (result?.success) {
+        setImmediate(() => broadcastToWindows("conversation-deleted", { id }));
+      }
+      return result;
+    });
+
+    // Transcriptions sync
+    ipcMain.handle("db-get-pending-transcriptions", () =>
+      this.databaseManager.getPendingTranscriptions()
+    );
+    ipcMain.handle("db-get-transcription-by-client-id", (_, clientId) =>
+      this.databaseManager.getTranscriptionByClientId(clientId)
+    );
+    ipcMain.handle(
+      "db-upsert-transcription-from-cloud",
+      (_, cloudTranscription, expectedAuthGeneration) =>
+        isStaleSyncAck(expectedAuthGeneration)
+          ? STALE_SYNC_ACK
+          : this.databaseManager.upsertTranscriptionFromCloud(cloudTranscription)
+    );
+    ipcMain.handle("db-mark-transcription-synced", (_, id, cloudId, expectedAuthGeneration) =>
+      isStaleSyncAck(expectedAuthGeneration)
+        ? STALE_SYNC_ACK
+        : this.databaseManager.markTranscriptionSynced(id, cloudId)
+    );
+    ipcMain.handle("db-get-pending-transcription-deletes", () =>
+      this.databaseManager.getPendingTranscriptionDeletes()
+    );
+    ipcMain.handle("db-hard-delete-transcription", (_, id, expectedAuthGeneration) => {
+      if (isStaleSyncAck(expectedAuthGeneration)) return STALE_SYNC_ACK;
+      const result = this.databaseManager.hardDeleteTranscription(id);
+      if (result?.success) {
+        this.audioStorageManager.deleteAudio(id);
+        setImmediate(() => broadcastToWindows("transcription-deleted", { id }));
+      }
+      return result;
+    });
+
+    ipcMain.handle("export-note", async (event, noteId, format) => {
+      try {
+        const note = this.databaseManager.getNote(noteId);
+        if (!note) return { success: false, error: "Note not found" };
+
+        const { dialog } = require("electron");
+        const fs = require("fs");
+        const exportFormat =
+          format === "txt"
+            ? { name: "Text", extension: "txt" }
+            : { name: "Markdown", extension: "md" };
+        const safeName = (note.title || "Untitled").replace(/[/\\?%*:|"<>]/g, "-");
+
+        const result = await dialog.showSaveDialog({
+          defaultPath: `${safeName}.${exportFormat.extension}`,
+          filters: [{ name: exportFormat.name, extensions: [exportFormat.extension] }],
+        });
+
+        if (result.canceled || !result.filePath) return { success: false };
+
+        let exportContent;
+        if (format === "txt") {
+          const { markdownToPlainText } = await import("./markdownToPlainText.ts");
+          exportContent = markdownToPlainText(note.content || "");
+        } else {
+          exportContent = note.enhanced_content || note.content;
+        }
+
+        fs.writeFileSync(result.filePath, exportContent, "utf-8");
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Error exporting note", { error: error.message }, "notes");
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("export-transcript", async (event, noteId, format, options) => {
+      try {
+        const note = this.databaseManager.getNote(noteId);
+        if (!note) return { success: false, error: "Note not found" };
+
+        const segments = JSON.parse(note.transcript || "[]");
+        if (!segments.length) return { success: false, error: "No transcript available" };
+
+        const speakerMappings = this._buildSpeakerMappings(noteId);
+
+        const { dialog } = require("electron");
+        const fs = require("fs");
+        const exportFormats = {
+          txt: { name: "Text", extension: "txt" },
+          srt: { name: "SubRip Subtitles", extension: "srt" },
+          json: { name: "JSON", extension: "json" },
+          md: { name: "Markdown", extension: "md" },
+        };
+        const exportFormat = exportFormats[format] || exportFormats.txt;
+        const safeName = (note.title || "Untitled").replace(/[/\\?%*:|"<>]/g, "-");
+
+        const result = await dialog.showSaveDialog({
+          defaultPath: `${safeName}.${exportFormat.extension}`,
+          filters: [{ name: exportFormat.name, extensions: [exportFormat.extension] }],
+        });
+
+        if (result.canceled || !result.filePath) return { success: false };
+
+        // The renderer resolves the original recorder from the space roster;
+        // legacy segments need that fallback because they have no session recorder.
+        const recorderLabel =
+          typeof options?.recorderLabel === "string" ? options.recorderLabel.trim() : "";
+        const formatOptions = { recorderLabel };
+        const transcriptFormatter = require("./transcriptFormatter");
+        let exportContent;
+        if (format === "txt") {
+          exportContent = transcriptFormatter.formatTxt(
+            note,
+            segments,
+            speakerMappings,
+            formatOptions
+          );
+        } else if (format === "srt") {
+          exportContent = transcriptFormatter.formatSrt(
+            segments,
+            speakerMappings,
+            note,
+            formatOptions
+          );
+        } else if (format === "md") {
+          exportContent = transcriptFormatter.formatMd(
+            note,
+            segments,
+            speakerMappings,
+            formatOptions
+          );
+        } else {
+          exportContent = transcriptFormatter.formatJson(
+            note,
+            segments,
+            speakerMappings,
+            formatOptions
+          );
+        }
+
+        fs.writeFileSync(result.filePath, exportContent, "utf-8");
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Error exporting transcript", { error: error.message }, "notes");
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("export-dictionary", async (event, words) => {
+      try {
+        const { dialog } = require("electron");
+        const fs = require("fs");
+
+        const result = await dialog.showSaveDialog({
+          defaultPath: "dictionary.txt",
+          filters: [{ name: "Text", extensions: ["txt"] }],
+        });
+
+        if (result.canceled || !result.filePath) return { success: false };
+
+        fs.writeFileSync(result.filePath, words.join("\n"), "utf-8");
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Error exporting dictionary", { error: error.message }, "dictionary");
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleAudioFeature("select-audio-file", "upload", async (event, options = {}) => {
+      const { dialog } = require("electron");
+      const properties = ["openFile"];
+      if (options.multiple === true) properties.push("multiSelections");
+      const result = await dialog.showOpenDialog({
+        properties,
+        filters: [{ name: "Audio and Video Files", extensions: UPLOAD_AUDIO_EXTENSIONS }],
+      });
+      if (result.canceled || !result.filePaths.length) {
+        return { canceled: true };
+      }
+      result.filePaths.forEach(approveAudioPath);
+      if (options.multiple === true) {
+        return { canceled: false, filePaths: result.filePaths };
+      }
+      return { canceled: false, filePath: result.filePaths[0] };
+    });
+
+    // Fired by the preload's getPathForFile for real drag-dropped files; a
+    // renderer-constructed File yields "" there, so this can't be forged.
+    ipcMain.on("approve-audio-path", (_event, filePath) => {
+      approveAudioPath(filePath);
+    });
+
+    ipcMain.handle("get-file-size", async (_event, filePath) => {
+      const fs = require("fs");
+      try {
+        if (typeof filePath !== "string") return 0;
+        const real = resolveAllowedAudioPath(filePath);
+        if (!real) return 0;
+        const stats = fs.statSync(real);
+        return stats.size;
+      } catch {
+        return 0;
+      }
+    });
+
+    const activeUrlDownloads = new Map();
+    this.activeUrlDownloads = activeUrlDownloads;
+    let urlDownloadSeq = 0;
+
+    // Sweep ow-url-*/ow-diarize-* orphans from crashes or windows closed mid-download.
+    require("./urlAudioDownloader").sweepStaleTempArtifacts();
+
+    handleRemoteProduct("download-url-audio", async (event, url, downloadId) => {
+      const id =
+        typeof downloadId === "string" && downloadId ? downloadId : `dl-${++urlDownloadSeq}`;
+      const abortController = new AbortController();
+      activeUrlDownloads.set(id, abortController);
+
+      const cancel = {
+        signal: abortController.signal,
+        release: () => {
+          if (activeUrlDownloads.get(id) === abortController) {
+            activeUrlDownloads.delete(id);
+          }
+        },
+      };
+      return runAudioJob(event, "upload", cancel, async (signal) => {
+        try {
+          signal.throwIfAborted();
+          if (typeof url !== "string" || url.length > 2048) {
+            return { success: false, error: "Invalid URL", code: "INVALID_URL" };
+          }
+          const { download } = require("./urlAudioDownloader");
+          const result = await download(
+            url,
+            (progress) => {
+              if (!event.sender.isDestroyed()) {
+                event.sender.send("url-download-progress", { ...progress, downloadId: id });
+              }
+            },
+            signal
+          );
+          return { success: true, ...result };
+        } catch (error) {
+          if (signal.aborted) {
+            return {
+              success: false,
+              error: i18nMain.t("notes.upload.batchCancelled"),
+              code: "DOWNLOAD_CANCELLED",
+            };
+          }
+          debugLogger.error("URL audio download error", {
+            error: error.message,
+            code: error.code,
+          });
+          return { success: false, error: error.message, code: error.code || "DOWNLOAD_FAILED" };
+        }
+      });
+    });
+
+    // With an id, cancels that download; without, cancels all (unmount cleanup).
+    ipcMain.handle("cancel-url-download", async (_event, downloadId) => {
+      if (typeof downloadId === "string" && downloadId) {
+        const controller = activeUrlDownloads.get(downloadId);
+        if (!controller) return { success: false };
+        controller.abort();
+        activeUrlDownloads.delete(downloadId);
+        return { success: true };
+      }
+      if (activeUrlDownloads.size === 0) return { success: false };
+      for (const controller of activeUrlDownloads.values()) controller.abort();
+      activeUrlDownloads.clear();
+      return { success: true };
+    });
+
+    ipcMain.handle("delete-temp-file", async (event, filePath) => {
+      try {
+        if (typeof filePath !== "string") {
+          return { success: false, error: "Invalid file path" };
+        }
+        const { getSafeTempDir } = require("./safeTempDir");
+        const resolved = path.resolve(filePath);
+        const basename = path.basename(resolved);
+        if (!basename.startsWith("ow-url-") && !basename.startsWith("ow-diarize-")) {
+          return { success: false, error: "Not an OpenWhispr temp file" };
+        }
+        const real = fs.realpathSync(resolved);
+        let tempDir = getSafeTempDir();
+        try {
+          tempDir = fs.realpathSync(tempDir);
+        } catch {}
+        const rel = path.relative(tempDir, real);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+          return { success: false, error: "Not an OpenWhispr temp file" };
+        }
+        fs.unlinkSync(real);
+        return { success: true };
+      } catch (error) {
+        debugLogger.warn("Failed to delete temp file", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("transcribe-audio-file", async (event, filePath, options = {}) => {
+      const purpose = audioFilePurpose(filePath, options.purpose);
+      const cancel = this._uploadCancelRegistry.register(options.requestId);
+      return runAudioJob(event, purpose, cancel, async (signal) => {
+        try {
+          signal.throwIfAborted();
+          if (typeof filePath !== "string") {
+            return { success: false, error: "Invalid file path" };
+          }
+          const real = resolveAllowedAudioPath(filePath);
+          if (!real) return { success: false, error: "File path not allowed" };
+          return await this.transcribeLocalFile(real, { ...options, signal });
+        } catch (error) {
+          if (error?.name === "AbortError" || signal?.aborted) {
+            debugLogger.debug("Local audio file transcription cancelled", {
+              requestId: options.requestId,
+            });
+            return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+          }
+          debugLogger.error("Audio file transcription error", { error: error.message });
+          return { success: false, error: error.message, code: error.code };
+        }
+      });
+    });
+
+    ipcMain.handle("capture-selected-text", async (event, options = {}) => {
+      if (!this.selectionManager) {
+        return { status: "unavailable", code: "selection_manager_unavailable" };
+      }
+      return this.selectionManager.captureSelectedText({
+        probeEditable: options.probeEditable === true,
+      });
+    });
+
+    ipcMain.handle("cancel-selection-edit", (_event, sessionId) => {
+      this.selectionManager?.cancelSelectionEdit(sessionId);
+    });
+
+    ipcMain.handle("replace-selected-text", async (event, sessionId, text, options = {}) => {
+      if (!this.selectionManager) {
+        return { success: false, code: "selection_manager_unavailable" };
+      }
+      return this.selectionManager.replaceSelectedText(sessionId, text, {
+        restoreClipboard: options.restoreClipboard !== false,
+        allowClipboardFallback: options.allowClipboardFallback === true,
+        webContents: event.sender,
+      });
+    });
+
+    ipcMain.handle("paste-at-captured-target", async (event, sessionId, text) => {
+      if (!this.selectionManager) {
+        return { success: false, code: "selection_manager_unavailable" };
+      }
+      return this.selectionManager.pasteAtCapturedTarget(sessionId, text, {
+        webContents: event.sender,
+      });
+    });
+
+    ipcMain.handle("paste-text", async (event, text, options) => {
+      // An onboarding demo already puts the transcript in its own textarea from
+      // the demo event, and that textarea is what has focus — pasting on top of
+      // it appends the same sentence a second time. This is a successful no-op,
+      // not a completed paste, so callers can avoid reporting paste-dependent
+      // fallbacks as if text reached another application.
+      if (this.windowManager?.isOnboardingDemoActive()) {
+        return { success: true, pasted: false };
+      }
+
+      // A raw paste lands exactly as given: no smart space, and no AutoLearn watching edits.
+      const { raw, ...pasteOptions } = options ?? {};
+
+      const mainWindow = this.windowManager?.mainWindow;
+      const targetPid = this.textEditMonitor?.lastTargetPid || null;
+
+      // Activating the target by PID is more reliable than hide()'s implicit
+      // focus hand-off for Chromium apps like Claude desktop and Brave (#668).
+      let activated = false;
+      if (process.platform === "darwin" && this.textEditMonitor) {
+        activated = await this.textEditMonitor.activateTargetPid();
+      }
+
+      if (!activated && mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) {
+        if (process.platform === "darwin") {
+          mainWindow.hide();
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          mainWindow.showInactive();
+        } else {
+          mainWindow.blur();
+          // On Linux blur() leaves X focus on the pill, so the paste would land
+          // in the pill.
+          if (process.platform === "linux") this.windowManager.returnLinuxKeyboardFocus();
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+      }
+
+      // Smart spacing (#856): append a trailing space so the next paste's leading
+      // space self-corrects the gap. Reading the char before the cursor to space
+      // the front instead would take a macOS Accessibility read costing hundreds
+      // of ms — too slow for the paste hot path.
+      const textToPaste = raw === true ? text : applySmartSpacing(text);
+
+      // Windows: restore the foreground window captured at record start so the
+      // paste lands in the field the user was dictating into, not wherever focus
+      // drifted during transcription (#859). macOS handles this via
+      // activateTargetPid above; Linux re-detects the target inside pasteLinux.
+      const winTarget =
+        process.platform === "win32"
+          ? ((await this.selectionManager?.getWinTarget?.()) ?? null)
+          : null;
+      const targetWindow =
+        winTarget &&
+        isRestorablePasteTarget({
+          target: winTarget,
+          ownExeName: path.basename(process.execPath),
+          ownWindowHandles: BrowserWindow.getAllWindows()
+            .filter((win) => !win.isDestroyed())
+            .map((win) => win.getNativeWindowHandle()),
+        })
+          ? winTarget.id
+          : null;
+
+      let pasteResult;
+      try {
+        pasteResult = await this.clipboardManager.pasteText(textToPaste, {
+          ...pasteOptions,
+          webContents: event.sender,
+          targetWindow,
+          silentAccessibilityCheck: true,
+        });
+      } catch (error) {
+        if (error?.code !== "ACCESSIBILITY_PERMISSION_REQUIRED" || error.clipboardCopied !== true) {
+          throw error;
+        }
+        return {
+          success: false,
+          pasted: false,
+          code: "ACCESSIBILITY_PERMISSION_REQUIRED",
+          clipboardCopied: true,
+        };
+      }
+      const pasted = pasteResult?.pasted !== false;
+      debugLogger.debug("[AutoLearn] Paste completed", {
+        autoLearnEnabled: this._autoLearnEnabled,
+        hasMonitor: !!this.textEditMonitor,
+        targetPid,
+        pasted,
+      });
+      if (raw !== true && pasted && this.textEditMonitor && this._autoLearnEnabled) {
+        setTimeout(() => {
+          try {
+            debugLogger.debug("[AutoLearn] Starting monitoring", {
+              textPreview: text.substring(0, 80),
+            });
+            this.textEditMonitor.startMonitoring(text, 30000, { targetPid });
+          } catch (err) {
+            debugLogger.debug("[AutoLearn] Failed to start monitoring", { error: err.message });
+          }
+        }, 500);
+      }
+      // ClipboardManager returns `restoreComplete` so main-process callers can
+      // serialize subsequent clipboard work behind its delayed restore. A
+      // Promise cannot cross Electron's IPC boundary, though, and renderer
+      // callers need to know whether text was pasted, but not the delayed
+      // clipboard restoration promise. Successful platform paths predate the
+      // explicit `pasted` outcome; only the clipboard-only fallback and a held-back paste
+      // (held modifiers or a missing or failed wl-copy) set false, each with a `reason`.
+      return {
+        success: true,
+        pasted,
+        ...(pasteResult?.reason ? { reason: pasteResult.reason } : {}),
+      };
+    });
+
+    ipcMain.handle("check-accessibility-permission", async (_event, silent = false) => {
+      return this.clipboardManager.checkAccessibilityPermissions(silent);
+    });
+
+    // Passes `true` to isTrustedAccessibilityClient to trigger the macOS system prompt
+    ipcMain.handle("prompt-accessibility-permission", async () => {
+      if (process.platform !== "darwin") return true;
+      return systemPreferences.isTrustedAccessibilityClient(true);
+    });
+
+    ipcMain.handle("read-clipboard", async (event) => {
+      return this.clipboardManager.readClipboard();
+    });
+
+    ipcMain.handle("write-clipboard", async (event, text) => {
+      return this.clipboardManager.writeClipboard(text, event.sender);
+    });
+
+    ipcMain.handle("leaderboard-copy-image", async (_event, dataUrl) => {
+      try {
+        const { clipboard, nativeImage } = require("electron");
+        const image = nativeImage.createFromBuffer(decodeLeaderboardPngDataUrl(dataUrl));
+        if (image.isEmpty()) throw new Error("Leaderboard image could not be decoded");
+        clipboard.writeImage(image);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to copy leaderboard image",
+          { error: error.message },
+          "analytics"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("leaderboard-save-image", async (event, dataUrl, suggestedName) => {
+      try {
+        const { dialog } = require("electron");
+        const parentWindow = BrowserWindow.fromWebContents(event.sender);
+        const options = {
+          defaultPath: leaderboardImageFilename(suggestedName),
+          filters: [{ name: "PNG image", extensions: ["png"] }],
+        };
+        const result = parentWindow
+          ? await dialog.showSaveDialog(parentWindow, options)
+          : await dialog.showSaveDialog(options);
+        if (result.canceled || !result.filePath) return { success: true, canceled: true };
+        await fs.promises.writeFile(result.filePath, decodeLeaderboardPngDataUrl(dataUrl));
+        return { success: true, canceled: false };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to save leaderboard image",
+          { error: error.message },
+          "analytics"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("check-paste-tools", async () => {
+      return this.clipboardManager.checkPasteTools();
+    });
+
+    // Voice drafts (chat input): persist a recorded buffer so the file-based
+    // transcription pipeline (all providers) can consume it, then delete it.
+    ipcMain.handle("save-temp-audio", async (_event, buffer) => {
+      const tempPath = path.join(
+        os.tmpdir(),
+        `ow-voice-draft-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.webm`
+      );
+      fs.writeFileSync(tempPath, Buffer.from(buffer));
+      voiceDraftAudioPaths.add(tempPath);
+      return { success: true, path: tempPath };
+    });
+
+    ipcMain.handle("delete-temp-audio", async (_event, tempPath) => {
+      // Only files this handler family created are deletable.
+      const resolved = path.resolve(tempPath);
+      const validPrefix = path.join(os.tmpdir(), "ow-voice-draft-");
+      if (!resolved.startsWith(validPrefix)) {
+        return { success: false, error: "Invalid temp path" };
+      }
+      voiceDraftAudioPaths.delete(resolved);
+      try {
+        fs.unlinkSync(resolved);
+      } catch {
+        // Already gone — fine.
+      }
+      return { success: true };
+    });
+
+    handleProduct("transcribe-local-whisper", async (_event, audioBlob, options = {}) => {
+      debugLogger.log("transcribe-local-whisper called", {
+        audioBlobType: typeof audioBlob,
+        audioBlobSize: audioBlob?.byteLength || audioBlob?.length || 0,
+        options,
+      });
+
+      try {
+        // skipVad: dictionary-echo rescue retries decode VAD-free, since VAD
+        // stripping the speech is what turned the transcript into prompt echo.
+        const { skipVad, ...requestOptions } = options;
+        const vadOptions = skipVad
+          ? { vadEnabled: false }
+          : this._resolveWhisperVadOptions("dictation");
+        const result = await this.whisperManager.transcribeLocalWhisper(audioBlob, {
+          ...requestOptions,
+          ...vadOptions,
+          signal: this._productRequestContext.getStore().signal,
+        });
+
+        debugLogger.log("Whisper result", {
+          success: result.success,
+          hasText: !!result.text,
+          message: result.message,
+          error: result.error,
+        });
+
+        return result;
+      } catch (error) {
+        debugLogger.error("Local Whisper transcription error", error);
+        if (isLocalModelPolicyRefusal(error))
+          return { success: false, error: error.message, code: error.code };
+        const errorMessage = error.message || "Unknown error";
+
+        // Return specific error types for better user feedback
+        if (errorMessage.includes("FFmpeg not found")) {
+          return {
+            success: false,
+            error: "ffmpeg_not_found",
+            message: "FFmpeg is missing. Please reinstall the app or install FFmpeg manually.",
+          };
+        }
+        if (
+          errorMessage.includes("FFmpeg conversion failed") ||
+          errorMessage.includes("FFmpeg process error")
+        ) {
+          return {
+            success: false,
+            error: "ffmpeg_error",
+            message: "Audio conversion failed. The recording may be corrupted.",
+          };
+        }
+        if (
+          errorMessage.includes("whisper.cpp not found") ||
+          errorMessage.includes("whisper-cpp")
+        ) {
+          return {
+            success: false,
+            error: "whisper_not_found",
+            message: "Whisper binary is missing. Please reinstall the app.",
+          };
+        }
+        if (
+          errorMessage.includes("Audio buffer is empty") ||
+          errorMessage.includes("Audio data too small")
+        ) {
+          return {
+            success: false,
+            error: "no_audio_data",
+            message: "No audio detected",
+          };
+        }
+        if (errorMessage.includes("model") && errorMessage.includes("not downloaded")) {
+          return {
+            success: false,
+            error: "model_not_found",
+            message: errorMessage,
+          };
+        }
+
+        throw error;
+      }
+    });
+
+    ipcMain.handle("check-whisper-installation", async (event) => {
+      return this.whisperManager.checkWhisperInstallation();
+    });
+
+    ipcMain.handle("get-audio-diagnostics", async () => {
+      return this.whisperManager.getDiagnostics();
+    });
+
+    ipcMain.handle("download-whisper-model", async (event, modelName) => {
+      const hadActiveDownload = this.localModelDownloadStatus.has("whisper", modelName);
+      this.localModelDownloadStatus.start("whisper", modelName);
+      try {
+        const result = await this.whisperManager.downloadWhisperModel(modelName, (progressData) => {
+          const status = this._updateNativeModelDownloadStatus("whisper", modelName, progressData);
+          this.windowManager.sendToControlPanel("whisper-download-progress", {
+            ...progressData,
+            sequence: status?.sequence,
+          });
+        });
+        const status = this.localModelDownloadStatus.has("whisper", modelName)
+          ? this.localModelDownloadStatus.finish("whisper", modelName)
+          : null;
+        if (status) {
+          this.windowManager.sendToControlPanel("whisper-download-progress", {
+            type: "complete",
+            model: modelName,
+            percentage: 100,
+            sequence: status.sequence,
+          });
+        }
+        return result;
+      } catch (error) {
+        const status = hadActiveDownload
+          ? null
+          : this.localModelDownloadStatus.finish("whisper", modelName);
+        if (!hadActiveDownload && error.code !== "DOWNLOAD_IN_PROGRESS") {
+          this.windowManager.sendToControlPanel("whisper-download-progress", {
+            type: "error",
+            model: modelName,
+            error: error.message,
+            code: error.code || "DOWNLOAD_FAILED",
+            sequence: status?.sequence,
+          });
+        }
+        return {
+          success: false,
+          error: error.message,
+          code: error.code || "DOWNLOAD_FAILED",
+        };
+      }
+    });
+
+    ipcMain.handle("check-model-status", async (event, modelName) => {
+      return this.whisperManager.checkModelStatus(modelName);
+    });
+
+    ipcMain.handle("list-whisper-models", async (event) => {
+      return this.whisperManager.listWhisperModels();
+    });
+
+    ipcMain.handle("delete-whisper-model", async (event, modelName) => {
+      return this.whisperManager.deleteWhisperModel(modelName);
+    });
+
+    ipcMain.handle("delete-all-whisper-models", async () => {
+      return this.whisperManager.deleteAllWhisperModels();
+    });
+
+    ipcMain.handle("cancel-whisper-download", async (event) => {
+      return this.whisperManager.cancelDownload();
+    });
+
+    ipcMain.handle("whisper-server-start", async (event, modelName) => {
+      return this.whisperManager.startServer(
+        modelName,
+        this.whisperManager.resolveGpuStartOptions()
+      );
+    });
+
+    ipcMain.handle("whisper-server-stop", async () => {
+      return this.whisperManager.stopServer();
+    });
+
+    ipcMain.handle("whisper-server-status", async () => {
+      return this.whisperManager.getServerStatus();
+    });
+
+    ipcMain.handle("detect-gpu", async () => {
+      const { detectNvidiaGpu } = require("../utils/gpuDetection");
+      return detectNvidiaGpu();
+    });
+
+    ipcMain.handle("list-gpus", async () => {
+      const { listNvidiaGpus } = require("../utils/gpuDetection");
+      return listNvidiaGpus();
+    });
+
+    ipcMain.handle("set-gpu-device-index", async (_event, purpose, uuid) => {
+      if (purpose !== "transcription" && purpose !== "intelligence") {
+        return { success: false };
+      }
+      // Empty string clears the pinned GPU; otherwise require an nvidia-smi UUID. See #531.
+      if (typeof uuid !== "string" || (uuid !== "" && !uuid.startsWith("GPU-"))) {
+        return { success: false };
+      }
+      const key = purpose === "intelligence" ? "INTELLIGENCE_GPU_UUID" : "TRANSCRIPTION_GPU_UUID";
+      const oldUuid = process.env[key] || "";
+      process.env[key] = uuid;
+      this.environmentManager.saveAllKeysToEnvFile().catch((err) => {
+        debugLogger.error("Failed to persist GPU UUID", { error: err.message }, "gpu");
+      });
+
+      if (oldUuid !== uuid) {
+        try {
+          if (purpose === "transcription" && this.whisperManager?.serverManager?.process) {
+            debugLogger.info(
+              "Restarting whisper-server for GPU change",
+              { from: oldUuid, to: uuid },
+              "gpu"
+            );
+            await this.whisperManager.restartServerWithGpuPreference();
+          }
+          if (purpose === "intelligence") {
+            const modelManager = require("./modelManagerBridge").default;
+            if (modelManager.serverManager?.process) {
+              debugLogger.info(
+                "Restarting llama-server for GPU change",
+                { from: oldUuid, to: uuid },
+                "gpu"
+              );
+              const modelId = modelManager.currentServerModelId;
+              await modelManager.serverManager.stop();
+              if (modelId) {
+                await modelManager.prewarmServer(modelId);
+              }
+            }
+          }
+        } catch (err) {
+          debugLogger.error(
+            "Failed to restart server after GPU change",
+            { error: err.message, purpose },
+            "gpu"
+          );
+        }
+      }
+
+      return { success: true };
+    });
+
+    ipcMain.handle("get-gpu-device-index", async (_event, purpose) => {
+      if (purpose !== "transcription" && purpose !== "intelligence") {
+        return "";
+      }
+      const key = purpose === "intelligence" ? "INTELLIGENCE_GPU_UUID" : "TRANSCRIPTION_GPU_UUID";
+      return process.env[key] || "";
+    });
+
+    ipcMain.handle("get-cuda-whisper-status", async () => {
+      const { detectNvidiaGpu } = require("../utils/gpuDetection");
+      const gpuInfo = await detectNvidiaGpu();
+      if (!this.whisperCudaManager) {
+        return { downloaded: false, needsUpdate: false, downloading: false, path: null, gpuInfo };
+      }
+      return {
+        downloaded: this.whisperCudaManager.isDownloaded(),
+        needsUpdate: this.whisperCudaManager.needsUpdate(),
+        downloading: this.whisperCudaManager.isDownloading(),
+        path: this.whisperCudaManager.getCudaBinaryPath(),
+        gpuInfo,
+        ...this._whisperGpuFailureStatus("cuda"),
+        inUse: this.whisperManager.resolveGpuPackInUse() === "cuda",
+        bundledGpu: this._whisperBundledGpu(),
+      };
+    });
+
+    ipcMain.handle("download-cuda-whisper-binary", async (event) => {
+      if (!this.whisperCudaManager) {
+        return { success: false, error: "CUDA not supported on this platform" };
+      }
+      try {
+        const reloadModel = this._whisperReloadModel();
+        // Stop the server first: swapping in a pack a running binary is loaded
+        // from EBUSYs on Windows (same rule as the Vulkan handler below)
+        await this.whisperManager.stopServer().catch(() => {});
+        await this.whisperCudaManager.download((downloaded, total) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("cuda-download-progress", {
+              downloadedBytes: downloaded,
+              totalBytes: total,
+              percentage: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+            });
+          }
+        });
+        this._syncStartupEnv({ WHISPER_CUDA_ENABLED: "true" });
+        this._clearWhisperGpuFailure("cuda");
+        return { success: true, willRestart: this._applyWhisperGpuPreference(reloadModel) };
+      } catch (error) {
+        debugLogger.error("CUDA binary download failed", {
+          error: error.message,
+          stack: error.stack,
+        });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("cancel-cuda-whisper-download", async () => {
+      if (!this.whisperCudaManager) return { success: false };
+      return this.whisperCudaManager.cancelDownload();
+    });
+
+    ipcMain.handle("delete-cuda-whisper-binary", async () => {
+      if (!this.whisperCudaManager) return { success: false };
+      const reloadModel = this._whisperReloadModel();
+      // Stop the server first so the running binary can be deleted on Windows
+      await this.whisperManager.stopServer().catch(() => {});
+      const result = await this.whisperCudaManager.delete();
+      if (result.success) {
+        this._syncStartupEnv({}, ["WHISPER_CUDA_ENABLED"]);
+        this._clearWhisperGpuFailure("cuda");
+        this._applyWhisperGpuPreference(reloadModel);
+      }
+      return result;
+    });
+
+    ipcMain.handle("get-vulkan-whisper-status", async () => {
+      const { detectVulkanGpu } = require("../utils/vulkanDetection");
+      const { detectNvidiaGpu } = require("../utils/gpuDetection");
+      const [vulkan, gpuInfo] = await Promise.all([detectVulkanGpu(), detectNvidiaGpu()]);
+      return {
+        downloaded: this.whisperVulkanManager?.isDownloaded() ?? false,
+        needsUpdate: this.whisperVulkanManager?.needsUpdate() ?? false,
+        downloading: this.whisperVulkanManager?.isDownloading() ?? false,
+        vulkan,
+        hasNvidiaGpu: gpuInfo.hasNvidiaGpu,
+        ...this._whisperGpuFailureStatus("vulkan"),
+        inUse: this.whisperManager.resolveGpuPackInUse() === "vulkan",
+        bundledGpu: this._whisperBundledGpu(),
+      };
+    });
+
+    ipcMain.handle("download-vulkan-whisper-binary", async (event) => {
+      if (!this.whisperVulkanManager) {
+        return { success: false, error: "Vulkan not supported on this platform" };
+      }
+      try {
+        const reloadModel = this._whisperReloadModel();
+        // Stop the server first: overwriting a running binary EBUSYs on Windows
+        await this.whisperManager.stopServer().catch(() => {});
+        await this.whisperVulkanManager.download((downloaded, total) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("vulkan-whisper-download-progress", {
+              downloadedBytes: downloaded,
+              totalBytes: total,
+              percentage: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+            });
+          }
+        });
+        this._syncStartupEnv({ WHISPER_VULKAN_ENABLED: "true" });
+        this._clearWhisperGpuFailure("vulkan");
+        return { success: true, willRestart: this._applyWhisperGpuPreference(reloadModel) };
+      } catch (error) {
+        debugLogger.error("Vulkan whisper binary download failed", {
+          error: error.message,
+          stack: error.stack,
+        });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("cancel-vulkan-whisper-download", async () => {
+      if (!this.whisperVulkanManager) return { success: false };
+      return { success: this.whisperVulkanManager.cancelDownload() };
+    });
+
+    ipcMain.handle("delete-vulkan-whisper-binary", async () => {
+      if (!this.whisperVulkanManager) return { success: false };
+      const reloadModel = this._whisperReloadModel();
+      // Stop the server first so the running binary can be deleted on Windows
+      await this.whisperManager.stopServer().catch(() => {});
+      const { deletedCount } = await this.whisperVulkanManager.delete();
+      this._syncStartupEnv({}, ["WHISPER_VULKAN_ENABLED", "WHISPER_VULKAN_DEVICE"]);
+      this._clearWhisperGpuFailure("vulkan");
+      this._applyWhisperGpuPreference(reloadModel);
+      return { success: true, deletedCount };
+    });
+
+    // One-time "GPU pack needs re-downloading" notice recorded before any
+    // window existed (#1606). Only the window that shows it can take it.
+    ipcMain.handle("take-gpu-pack-migration-notice", (event) => {
+      if (event.sender !== this._gpuPackNoticeWindow()?.webContents) return null;
+      return require("./gpuPackMigrationNotice").take();
+    });
+
+    // Clears the remembered GPU failure and reloads the server with the GPU
+    // backend re-enabled (Retry on the "GPU could not be activated" state)
+    ipcMain.handle("whisper-gpu-retry", async () => {
+      this.whisperManager.forgetSessionGpuFailures();
+      this._syncStartupEnv({}, [
+        "WHISPER_GPU_FAILED",
+        ...Object.values(WHISPER_GPU_FAILURE_REASON_KEYS),
+      ]);
+      return {
+        success: true,
+        willRestart: this._applyWhisperGpuPreference(this._whisperReloadModel()),
+      };
+    });
+
+    ipcMain.handle("check-ffmpeg-availability", async (event) => {
+      return this.whisperManager.checkFFmpegAvailability();
+    });
+
+    handleProduct("transcribe-local-parakeet", async (_event, audioBlob, options = {}) => {
+      debugLogger.log("transcribe-local-parakeet called", {
+        audioBlobType: typeof audioBlob,
+        audioBlobSize: audioBlob?.byteLength || audioBlob?.length || 0,
+        options,
+      });
+
+      try {
+        const result = await this.parakeetManager.transcribeLocalParakeet(audioBlob, {
+          ...options,
+          signal: this._productRequestContext.getStore().signal,
+        });
+
+        debugLogger.log("Parakeet result", {
+          success: result.success,
+          hasText: !!result.text,
+          message: result.message,
+          error: result.error,
+        });
+
+        return result;
+      } catch (error) {
+        debugLogger.error("Local Parakeet transcription error", error);
+        if (isLocalModelPolicyRefusal(error))
+          return { success: false, error: error.message, code: error.code };
+        const errorMessage = error.message || "Unknown error";
+
+        if (errorMessage.includes("sherpa-onnx") && errorMessage.includes("not found")) {
+          return {
+            success: false,
+            error: "parakeet_not_found",
+            message: "Parakeet binary is missing. Please reinstall the app.",
+          };
+        }
+        if (errorMessage.includes("model") && errorMessage.includes("not downloaded")) {
+          return {
+            success: false,
+            error: "model_not_found",
+            message: errorMessage,
+          };
+        }
+        if (error.code === PARAKEET_UNSUPPORTED_OS_CODE) {
+          return {
+            success: false,
+            error: error.code,
+            message: errorMessage,
+          };
+        }
+
+        throw error;
+      }
+    });
+
+    ipcMain.handle("check-parakeet-installation", async () => {
+      return this.parakeetManager.checkInstallation();
+    });
+
+    ipcMain.handle("download-parakeet-model", async (event, modelName) => {
+      const hadActiveDownload = this.localModelDownloadStatus.has("parakeet", modelName);
+      this.localModelDownloadStatus.start("parakeet", modelName);
+      try {
+        const result = await this.parakeetManager.downloadParakeetModel(
+          modelName,
+          (progressData) => {
+            const status = this._updateNativeModelDownloadStatus(
+              "parakeet",
+              modelName,
+              progressData
+            );
+            this.windowManager.sendToControlPanel("parakeet-download-progress", {
+              ...progressData,
+              sequence: status?.sequence,
+            });
+          }
+        );
+        const status = this.localModelDownloadStatus.has("parakeet", modelName)
+          ? this.localModelDownloadStatus.finish("parakeet", modelName)
+          : null;
+        if (status) {
+          this.windowManager.sendToControlPanel("parakeet-download-progress", {
+            type: "complete",
+            model: modelName,
+            percentage: 100,
+            sequence: status.sequence,
+          });
+        }
+        return result;
+      } catch (error) {
+        const status = hadActiveDownload
+          ? null
+          : this.localModelDownloadStatus.finish("parakeet", modelName);
+        if (!hadActiveDownload && error.code !== "DOWNLOAD_IN_PROGRESS") {
+          this.windowManager.sendToControlPanel("parakeet-download-progress", {
+            type: "error",
+            model: modelName,
+            error: error.message,
+            code: error.code || "DOWNLOAD_FAILED",
+            sequence: status?.sequence,
+          });
+        }
+        return {
+          success: false,
+          error: error.message,
+          code: error.code || "DOWNLOAD_FAILED",
+        };
+      }
+    });
+
+    ipcMain.handle("check-parakeet-model-status", async (_event, modelName) => {
+      return this.parakeetManager.checkModelStatus(modelName);
+    });
+
+    ipcMain.handle("list-parakeet-models", async () => {
+      return this.parakeetManager.listParakeetModels();
+    });
+
+    ipcMain.handle("delete-parakeet-model", async (_event, modelName) => {
+      return this.parakeetManager.deleteParakeetModel(modelName);
+    });
+
+    ipcMain.handle("delete-all-parakeet-models", async () => {
+      return this.parakeetManager.deleteAllParakeetModels();
+    });
+
+    ipcMain.handle("cancel-parakeet-download", async () => {
+      return this.parakeetManager.cancelDownload();
+    });
+
+    ipcMain.handle("get-parakeet-diagnostics", async () => {
+      return this.parakeetManager.getDiagnostics();
+    });
+
+    ipcMain.handle("parakeet-server-start", async (event, modelName) => {
+      const result = await this.parakeetManager.startServer(modelName);
+      // Persisting a provider that failed to start would wedge every launch
+      // into a failing pre-warm.
+      if (result.success) {
+        process.env.LOCAL_TRANSCRIPTION_PROVIDER =
+          getModelType(modelName) === "cohere-transcribe" ? "cohere" : "nvidia";
+        process.env.PARAKEET_MODEL = modelName;
+        await this.environmentManager.saveAllKeysToEnvFile();
+      }
+      return result;
+    });
+
+    ipcMain.handle("parakeet-server-stop", async () => {
+      const result = await this.parakeetManager.stopServer();
+      delete process.env.LOCAL_TRANSCRIPTION_PROVIDER;
+      delete process.env.PARAKEET_MODEL;
+      await this.environmentManager.saveAllKeysToEnvFile();
+      return result;
+    });
+
+    ipcMain.handle("parakeet-server-status", async () => {
+      return this.parakeetManager.getServerStatus();
+    });
+
+    // Diarization model management
+    ipcMain.handle("download-diarization-models", async (event) => {
+      try {
+        const result = await this.diarizationManager.downloadModels((progressData) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("diarization-download-progress", progressData);
+          }
+        });
+        return result;
+      } catch (error) {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send("diarization-download-progress", {
+            type: "error",
+            error: error.message,
+            code: error.code || "DOWNLOAD_FAILED",
+          });
+        }
+        return {
+          success: false,
+          error: error.message,
+          code: error.code || "DOWNLOAD_FAILED",
+        };
+      }
+    });
+
+    ipcMain.handle("get-diarization-model-status", async () => {
+      return {
+        available: this.diarizationManager?.isAvailable() ?? false,
+        modelsDownloaded:
+          (this.diarizationManager?.isModelDownloaded() ?? false) &&
+          (this.diarizationManager?.isVadModelDownloaded() ?? false),
+      };
+    });
+
+    ipcMain.handle("delete-diarization-models", async () => {
+      try {
+        await this.diarizationManager.deleteModels();
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to delete diarization models", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("diarize-audio-file", async (event, filePath, options = {}) => {
+      // Registered under the same requestId as the upload's transcription, so
+      // one cancel kills both the decode and the diarization child process.
+      const cancel = this._uploadCancelRegistry.register(options.requestId);
+      return runAudioJob(event, "upload", cancel, async (signal) => {
+        try {
+          signal.throwIfAborted();
+          if (!this.diarizationManager) {
+            return { success: false, error: "Diarization not available" };
+          }
+          if (!this.diarizationManager.isModelDownloaded()) {
+            return { success: false, error: "Diarization models not downloaded" };
+          }
+
+          if (typeof filePath !== "string") {
+            return { success: false, error: "Invalid file path" };
+          }
+          const realPath = resolveAllowedAudioPath(filePath);
+          if (!realPath) return { success: false, error: "File path not allowed" };
+          filePath = realPath;
+
+          const maxSpeakers = normalizeStoredSpeakerCount(options.numSpeakers) ?? MAX_SPEAKER_COUNT;
+
+          const { convertToWav } = require("./ffmpegUtils");
+          const { getSafeTempDir } = require("./safeTempDir");
+          const {
+            resolveClusterThreshold,
+            dropNegligibleClusters,
+            isCollapsedDiarization,
+            capSpeakerClustersByVoice,
+          } = require("./diarizationPolicy");
+          const { PCM16_MONO_16K_BYTES_PER_SECOND } = require("./transcriptionTimeout");
+          const wavPath = path.join(getSafeTempDir(), `ow-diarize-${Date.now()}.wav`);
+
+          try {
+            await convertToWav(filePath, wavPath, { sampleRate: 16000, channels: 1 });
+            if (signal?.aborted) {
+              return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+            }
+            // Auto-clustering over-splits long single-mic audio at the 0.55
+            // default, so the threshold ramps with duration unless pinned.
+            const durationSeconds = fs.statSync(wavPath).size / PCM16_MONO_16K_BYTES_PER_SECOND;
+            const threshold = resolveClusterThreshold(durationSeconds, options.threshold);
+
+            // Always auto-cluster: forcing 2 clusters on #2021's two-person call
+            // split short utterances from long ones instead of one speaker from
+            // the other, merging both speakers. The requested count is applied
+            // as a cap after cleanup instead.
+            let segments = await this.diarizationManager.diarize(wavPath, { threshold, signal });
+            if (signal?.aborted) {
+              return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+            }
+            // A collapsed run's labels are wrong either way: two people under
+            // one label, or one person split off into a phantom. With no
+            // segments the renderer keeps the plain transcript and shows the
+            // diarization warning instead. Judged before phantoms are dropped;
+            // a request for one speaker is met by the cap below instead.
+            if (maxSpeakers > 1 && isCollapsedDiarization(segments)) {
+              debugLogger.warn("Discarding diarization: one cluster holds nearly all speech", {
+                durationSeconds,
+              });
+              segments = [];
+            }
+            // Raw sherpa output reaching the merge is how a 2-person voice memo
+            // surfaced 46 speakers.
+            segments = dropNegligibleClusters(segments);
+            if (new Set(segments.map((s) => s.speaker)).size > maxSpeakers) {
+              const speakerEmbeddings = require("./speakerEmbeddings");
+              let centroids = new Map();
+              try {
+                centroids = await speakerEmbeddings.extractClusterCentroids(wavPath, segments, {
+                  signal,
+                });
+              } catch (error) {
+                debugLogger.warn(
+                  "Speaker voices unavailable; extra clusters fold into the largest",
+                  {
+                    error: error.message,
+                  }
+                );
+              }
+              if (signal?.aborted) {
+                return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+              }
+              segments = capSpeakerClustersByVoice(segments, maxSpeakers, centroids, (a, b) =>
+                speakerEmbeddings.cosineSimilarity(a, b)
+              );
+            }
+            // Callers persist this as audio_duration_seconds: for picked files
+            // the renderer has no other duration source.
+            return { success: true, segments, durationSeconds };
+          } finally {
+            try {
+              fs.unlinkSync(wavPath);
+            } catch {}
+          }
+        } catch (error) {
+          if (error?.name === "AbortError" || signal?.aborted) {
+            debugLogger.debug("Diarization cancelled", { requestId: options.requestId });
+            return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+          }
+          debugLogger.error("Diarization error", { error: error.message });
+          return { success: false, error: error.message };
+        }
+      });
+    });
+
+    ipcMain.handle("merge-speaker-text", async (event, { segments, text, duration }) => {
+      try {
+        if (
+          !Array.isArray(segments) ||
+          typeof text !== "string" ||
+          typeof duration !== "number" ||
+          !isFinite(duration)
+        ) {
+          return { success: false, error: "Invalid arguments" };
+        }
+        if (segments.length > 10000 || text.length > 1_000_000) {
+          return { success: false, error: "Input too large" };
+        }
+        const sanitizedSegments = segments.map((s) => ({
+          speaker: typeof s.speaker === "string" ? s.speaker.slice(0, 100) : "unknown",
+          start: typeof s.start === "number" && isFinite(s.start) ? s.start : 0,
+          end: typeof s.end === "number" && isFinite(s.end) ? s.end : 0,
+        }));
+        const merged = mergeSpeakersWithText(sanitizedSegments, text, duration);
+        return { success: true, text: formatSpeakerTranscript(merged), segments: merged };
+      } catch (error) {
+        debugLogger.error("Speaker merge error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("cancel-diarization-download", async () => {
+      return this.diarizationManager.cancelDownload();
+    });
+
+    // Under `npm run dev` the Vite server dies with Electron, so a relaunched dev
+    // instance would have no renderer: just quit there.
+    ipcMain.handle("relaunch-app", async () => {
+      if (process.env.NODE_ENV === "development") return app.quit();
+      // Once Squirrel.Mac holds a downloaded update it installs it on this quit regardless
+      // of any flag, so the updater owns that restart instead of racing app.relaunch().
+      if (this.updateManager.hasStagedUpdate()) {
+        const { success } = await this.updateManager.restartIntoStagedUpdate().catch((error) => {
+          debugLogger.error("Restart into staged update failed", { error: error.message });
+          return { success: false };
+        });
+        if (success) return;
+      }
+      this.updateManager.deferInstallOnQuit();
+      const { launcherPath, args } = getRelaunchOptions({
+        argv: process.argv,
+        protocol: this.oauthProtocol,
+        appImagePath: process.env.APPIMAGE,
+      });
+      if (launcherPath) {
+        const waiter = getRelaunchWaiter({ launcherPath, args, pid: process.pid });
+        require("child_process")
+          .spawn(waiter.file, waiter.args, {
+            detached: true,
+            stdio: "ignore",
+            cwd: path.dirname(launcherPath), // never inside the directory being removed
+          })
+          .unref();
+      } else {
+        app.relaunch({ args });
+      }
+      app.quit();
+    });
+
+    ipcMain.handle("cleanup-app", async (event) => {
+      const fs = require("fs");
+      const os = require("os");
+      const errors = [];
+      const mainWindow = this.windowManager.mainWindow;
+
+      // Stop services before deleting files they hold open
+      try {
+        await this.parakeetManager?.stopServer();
+      } catch (e) {
+        errors.push(`Parakeet stop: ${e.message}`);
+      }
+      try {
+        this.whisperManager?.stopServer();
+      } catch (e) {
+        errors.push(`Whisper stop: ${e.message}`);
+      }
+      try {
+        this.googleCalendarManager?.stop();
+      } catch (e) {
+        errors.push(`GCal stop: ${e.message}`);
+      }
+      try {
+        this.microsoftCalendarManager?.stop();
+      } catch (e) {
+        errors.push(`MCal stop: ${e.message}`);
+      }
+      try {
+        this.appleCalendarManager?.stop();
+      } catch (e) {
+        errors.push(`ACal stop: ${e.message}`);
+      }
+      try {
+        await this.diarizationManager?.shutdown();
+      } catch (e) {
+        errors.push(`Diarization stop: ${e.message}`);
+      }
+      try {
+        await this.getSemanticSearch?.()?.stop();
+      } catch (e) {
+        errors.push(`Vector index stop: ${e.message}`);
+      }
+      try {
+        const onnxWorkerClient = require("./onnxWorkerClient");
+        await onnxWorkerClient.stop();
+      } catch (e) {
+        errors.push(`Embedding worker stop: ${e.message}`);
+      }
+
+      // Revoke Google OAuth tokens before DB is closed
+      try {
+        await this.googleCalendarManager?.revokeAllTokens();
+      } catch (e) {
+        errors.push(`GCal revoke: ${e.message}`);
+      }
+
+      // Revoke every connector login stored on this device (Slack, Gmail) at
+      // its provider, for every account: Settings signs out before this
+      // runs, so there may be no signed-in account left. It must run before
+      // the connectors directory is deleted below. Best effort: the revokes
+      // run in parallel under a 5 s deadline and never block the reset.
+      try {
+        await this.connectorManager?.revokeAllStored();
+      } catch (e) {
+        const { describeError } = require("./connectors/errorSummary");
+        const { errorName, errorCode } = describeError(e);
+        errors.push(`Connector revoke: ${errorCode ?? errorName}`);
+      }
+
+      try {
+        this.metaActivation?.dispose();
+        this.metaActivation = null;
+        const activationPath = path.join(app.getPath("userData"), "meta-activation.db");
+        for (const suffix of ["", "-wal", "-shm"])
+          fs.rmSync(activationPath + suffix, { force: true });
+      } catch (e) {
+        errors.push(`Activation data cleanup: ${e.message}`);
+      }
+      try {
+        this.productEvents?.dispose();
+        this.productEvents = null;
+        createProductEventsStore(productEventsFile()).erase();
+      } catch (e) {
+        errors.push(`Product events cleanup: ${e.message}`);
+      }
+
+      // Close DB connection before deleting the file
+      try {
+        this.databaseManager?.db?.close();
+      } catch (e) {
+        errors.push(`DB close: ${e.message}`);
+      }
+
+      // Delete audio files
+      try {
+        this.audioStorageManager.deleteAllAudio();
+      } catch (e) {
+        errors.push(`Audio delete: ${e.message}`);
+      }
+
+      // Delete downloaded models
+      try {
+        const { getModelsDirForService } = require("./modelDirUtils");
+        const whisperDir = getModelsDirForService("whisper");
+        if (fs.existsSync(whisperDir)) fs.rmSync(whisperDir, { recursive: true, force: true });
+      } catch (e) {
+        errors.push(`Whisper models: ${e.message}`);
+      }
+      try {
+        await this.parakeetManager?.deleteAllParakeetModels();
+      } catch (e) {
+        errors.push(`Parakeet models: ${e.message}`);
+      }
+      try {
+        await this.diarizationManager?.deleteModels();
+      } catch (e) {
+        errors.push(`Diarization models: ${e.message}`);
+      }
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        await modelManager.deleteAllModels();
+      } catch (e) {
+        errors.push(`LLM models: ${e.message}`);
+      }
+
+      // These caches are not owned by one account. Remove them only through
+      // the explicit device-erasure path, never during normal account deletion.
+      const homeCacheRoot = path.join(os.homedir(), ".cache", "openwhispr");
+      for (const cacheName of ["embedding-models", "qdrant-data", "qdrant-data-dev", "yt-dlp"]) {
+        try {
+          fs.rmSync(path.join(homeCacheRoot, cacheName), { recursive: true, force: true });
+        } catch (e) {
+          errors.push(`${cacheName} cache: ${e.message}`);
+        }
+      }
+
+      // Delete database file + WAL/SHM
+      try {
+        const dbPath = path.join(
+          app.getPath("userData"),
+          process.env.NODE_ENV === "development" ? "transcriptions-dev.db" : "transcriptions.db"
+        );
+        if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+        if (fs.existsSync(dbPath + "-wal")) fs.unlinkSync(dbPath + "-wal");
+        if (fs.existsSync(dbPath + "-shm")) fs.unlinkSync(dbPath + "-shm");
+      } catch (e) {
+        errors.push(`DB file: ${e.message}`);
+      }
+
+      // Delete device-wide settings and encrypted credentials.
+      try {
+        await this.environmentManager?.clearAllPersistedData();
+      } catch (e) {
+        errors.push(`Environment settings: ${e.message}`);
+      }
+      try {
+        const tokenCleanup = tokenStore.clear();
+        if (!tokenCleanup.success) throw new Error("Could not clear the stored bearer token");
+      } catch (e) {
+        errors.push(`Authentication token: ${e.message}`);
+      }
+      try {
+        this.enterpriseIdentityManager?.clear();
+      } catch (e) {
+        errors.push(`Enterprise settings: ${e.message}`);
+      }
+      try {
+        for (const fileName of [
+          "workspace-policy.json",
+          "managed-enterprise-config.json",
+          "globe-preference-state.json",
+          ".system-audio-permission",
+          "account-scope-binding.json",
+          "affiliate-candidate.json",
+          "affiliate-candidate.json.tmp",
+          "installed-models.json",
+          "model-registry.json",
+          "model-registry.json.backup",
+          PAID_KEY_CHECKS_FILE,
+        ]) {
+          fs.rmSync(path.join(app.getPath("userData"), fileName), { force: true });
+        }
+      } catch (e) {
+        errors.push(`Device setting files: ${e.message}`);
+      }
+      try {
+        fs.rmSync(path.join(app.getPath("userData"), "enterprise-audio-keys"), {
+          recursive: true,
+          force: true,
+        });
+        for (const fileName of ["enterprise-audio-bootstrap.json", ENTERPRISE_AUDIO_DEVICE_ID_FILE])
+          fs.rmSync(path.join(app.getPath("userData"), fileName), { force: true });
+        await require("./enterpriseAudioBootstrap").removeClaimedBootstraps(
+          app.getPath("userData")
+        );
+      } catch (error) {
+        errors.push(`Enterprise audio credentials: ${error.message}`);
+      }
+      // "connectors" holds encrypted connector logins (Slack, Gmail), all
+      // revoked above. "skills" holds the user's assistant skills, and
+      // "skill-versions" the copies Undo restores.
+      for (const directoryName of ["bin", "llama-cpp", "connectors", "skills", "skill-versions"]) {
+        try {
+          fs.rmSync(path.join(app.getPath("userData"), directoryName), {
+            recursive: true,
+            force: true,
+          });
+        } catch (e) {
+          errors.push(`${directoryName} runtime: ${e.message}`);
+        }
+      }
+      try {
+        autoStart.setAutoStartEnabled(false);
+      } catch (e) {
+        errors.push(`Launch at login: ${e.message}`);
+      }
+
+      // Clear browser-held account/session state, including cookies, IndexedDB,
+      // Cache Storage and localStorage persisted by any app window.
+      try {
+        const win = BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+          await win.webContents.session.clearStorageData();
+          await win.webContents.session.clearCache();
+        }
+      } catch (e) {
+        errors.push(`Browser data: ${e.message}`);
+      }
+
+      // Clear localStorage
+      if (mainWindow?.webContents) {
+        try {
+          await mainWindow.webContents.executeJavaScript("localStorage.clear()");
+        } catch (e) {
+          errors.push(`localStorage: ${e.message}`);
+        }
+      }
+
+      if (errors.length > 0) {
+        debugLogger.warn("Cleanup completed with errors", { errors }, "cleanup");
+      }
+
+      return { success: errors.length === 0, message: "Cleanup completed", errors };
+    });
+
+    ipcMain.handle("update-hotkey", async (event, hotkey) => {
+      return await this.windowManager.updateHotkey(hotkey);
+    });
+
+    ipcMain.handle("set-hotkey-listening-mode", async (event, enabled) => {
+      if (enabled) {
+        const captureWindow = BrowserWindow.fromWebContents(event.sender);
+        // Only the control panel owns editable hotkey fields. Refocusing the
+        // sender before the idempotence check also repairs a stale capture-mode
+        // flag after Windows has moved foreground focus to another window.
+        if (captureWindow === this.windowManager.controlPanelWindow) {
+          focusWindowsHotkeyCaptureWindow(captureWindow);
+        }
+      }
+      if (this._hotkeyCaptureMode === enabled) return { success: true, skipped: true };
+      this._hotkeyCaptureMode = enabled;
+      if (enabled && (process.platform === "win32" || process.platform === "linux")) {
+        // Retired listeners cannot release an active Hold. End it before capture
+        // mode blocks the stop event sent to the recording renderer.
+        this.windowManager.resetWindowsPushState();
+      }
+      this.windowManager.setHotkeyListeningMode(enabled);
+      ipcMain.emit("hotkey-listening-mode-changed", null, enabled);
+      const hotkeyManager = this.windowManager.hotkeyManager;
+
+      // Restore from slot state only. A freshly captured hotkey is registered by
+      // its own update IPC (invoked before this one); re-binding it here would
+      // overwrite the primary on DE backends or leak untracked registrations.
+      const effectiveHotkey = hotkeyManager.getCurrentHotkey();
+
+      const {
+        isGlobeLikeHotkey,
+        isModifierOnlyHotkey,
+        isRightSideModifier,
+        isMouseButtonHotkey,
+      } = require("./hotkeyManager");
+      const usesNativeListener = (hotkey) =>
+        !hotkey ||
+        isGlobeLikeHotkey(hotkey) ||
+        isMouseButtonHotkey(hotkey) ||
+        isModifierOnlyHotkey(hotkey) ||
+        isRightSideModifier(hotkey);
+
+      if (enabled) {
+        // Entering capture mode — unregister ALL slots so none intercept keypresses.
+        // Dictation is always active; meeting and agent may or may not be set.
+        const allSlots = hotkeyManager.slots;
+        for (const [slot, info] of allSlots) {
+          // Native-listener entries (null accelerator) are handled by stopping
+          // the key listeners below.
+          for (const accel of info?.accelerators || []) {
+            if (!accel) continue;
+            debugLogger.log(
+              `[IPC] Unregistering globalShortcut "${accel}" (slot "${slot}") for capture mode`
+            );
+            const { globalShortcut } = require("electron");
+            try {
+              globalShortcut.unregister(accel);
+            } catch {}
+          }
+        }
+
+        // On Windows, stop the Windows key listener
+        if (process.platform === "win32" && this.windowsKeyManager) {
+          debugLogger.log("[IPC] Stopping Windows key listener for hotkey capture mode");
+          this.windowsKeyManager.stop();
+        }
+
+        // On Linux, stop the Linux key listener
+        if (process.platform === "linux" && this.linuxKeyManager) {
+          debugLogger.log("[IPC] Stopping Linux key listener for hotkey capture mode");
+          this.linuxKeyManager.stop();
+        }
+
+        // On GNOME, unregister all native keybindings during capture
+        if (hotkeyManager.isUsingGnome() && hotkeyManager.gnomeManager) {
+          await hotkeyManager.gnomeManager.unregisterPushToTalk();
+          for (const slot of [...hotkeyManager.gnomeManager.registeredSlots]) {
+            debugLogger.log(
+              `[IPC] Unregistering GNOME keybinding (slot "${slot}") for capture mode`
+            );
+            await hotkeyManager.gnomeManager.unregisterKeybinding(slot).catch((err) => {
+              debugLogger.warn(`[IPC] Failed to unregister GNOME slot "${slot}":`, err.message);
+            });
+          }
+        }
+
+        // On Hyprland Wayland, unregister the keybinding during capture
+        if (hotkeyManager.isUsingHyprland() && hotkeyManager.hyprlandManager) {
+          debugLogger.log("[IPC] Unregistering Hyprland keybinding for hotkey capture mode");
+          const unregistered = await hotkeyManager.hyprlandManager
+            .unregisterKeybinding()
+            .catch((err) => {
+              debugLogger.warn("[IPC] Failed to unregister Hyprland keybinding:", err.message);
+              return false;
+            });
+          if (!unregistered) {
+            debugLogger.warn("[IPC] Hyprland keybinding remained active during capture");
+          }
+        }
+      } else {
+        // Exiting capture mode - re-register globalShortcut if not already registered
+        // Skip for KDE/GNOME/Hyprland — updateHotkey handles re-registration via native path
+        const usesNativePath =
+          hotkeyManager.isUsingKDE() ||
+          hotkeyManager.isUsingGnome() ||
+          hotkeyManager.isUsingHyprland();
+        if (!usesNativePath) {
+          const { globalShortcut } = require("electron");
+          // Re-register every globalShortcut-backed dictation hotkey (the slot
+          // may hold several).
+          for (const hk of hotkeyManager.getSlotHotkeys("dictation")) {
+            if (!hk || usesNativeListener(hk)) continue;
+            const accelerator = hk;
+            if (!globalShortcut.isRegistered(accelerator)) {
+              debugLogger.log(
+                `[IPC] Re-registering globalShortcut "${accelerator}" after capture mode`
+              );
+              const callback = this.windowManager.createHotkeyCallback();
+              const registered = hotkeyManager.registerGlobalShortcut(accelerator, hk, callback);
+              if (!registered) {
+                debugLogger.warn(
+                  `[IPC] Failed to re-register globalShortcut "${accelerator}" after capture mode`
+                );
+              }
+            }
+          }
+        }
+
+        // Re-sync native key listeners (Windows/Linux) across all hotkey slots now
+        // that capture is done. Idempotent — reads the current slot hotkeys.
+        this.windowManager.reconcileNativeKeyListeners();
+
+        // On GNOME, re-register the keybinding with the effective hotkey
+        if (hotkeyManager.isUsingGnome() && hotkeyManager.gnomeManager && effectiveHotkey) {
+          debugLogger.log(
+            `[IPC] Re-registering GNOME keybinding "${effectiveHotkey}" after capture mode`
+          );
+          await hotkeyManager.registerGnomeDictationHotkey(
+            effectiveHotkey,
+            this.windowManager.createHotkeyCallback()
+          );
+        }
+
+        // On Hyprland Wayland, re-register the keybinding with the effective hotkey
+        if (hotkeyManager.isUsingHyprland() && hotkeyManager.hyprlandManager && effectiveHotkey) {
+          debugLogger.log(
+            `[IPC] Re-registering Hyprland keybinding "${effectiveHotkey}" after capture mode`
+          );
+          await hotkeyManager.hyprlandManager.registerKeybinding(
+            effectiveHotkey,
+            this.windowManager.getActivationMode() === "push"
+          );
+        }
+
+        // On KDE (X11 or Wayland), re-register the keybinding with the effective hotkey
+        if (hotkeyManager.isUsingKDE() && hotkeyManager.kdeManager && effectiveHotkey) {
+          debugLogger.log(
+            `[IPC] Re-registering KDE keybinding "${effectiveHotkey}" after capture mode`
+          );
+          const callback = this.windowManager.createHotkeyCallback();
+          const result = await hotkeyManager.kdeManager.registerKeybinding(
+            effectiveHotkey,
+            "dictation",
+            callback,
+            this.windowManager.getActivationMode() === "push"
+          );
+          if (result !== true) {
+            debugLogger.warn(
+              `[IPC] Failed to re-register KDE keybinding "${effectiveHotkey}" after capture mode`,
+              { result }
+            );
+          }
+        }
+
+        // Re-register non-dictation slots (meeting, agent) that were unregistered on capture enter
+        for (const [slot, info] of hotkeyManager.slots) {
+          const hotkeys = info?.hotkeys || [];
+          if (slot === "dictation" || slot === "cancel" || hotkeys.length === 0 || !info?.callback)
+            continue;
+          debugLogger.log(
+            `[IPC] Re-registering slot "${slot}" ("${hotkeys.join(", ")}") after capture mode`
+          );
+          const result = await hotkeyManager
+            .registerSlot(slot, hotkeys, info.callback)
+            .catch((err) => {
+              debugLogger.warn(`[IPC] Failed to re-register slot "${slot}":`, err.message);
+              return { success: false };
+            });
+          if (!result.success) {
+            debugLogger.warn(`[IPC] Slot "${slot}" was not restored after capture`);
+          }
+        }
+      }
+
+      return { success: true };
+    });
+
+    ipcMain.handle("get-hotkey-mode-info", async (_event, requestedHotkey) => {
+      const hotkeyManager = this.windowManager.hotkeyManager;
+      const hotkey =
+        typeof requestedHotkey === "string" && requestedHotkey.trim()
+          ? requestedHotkey.split(",")[0].trim()
+          : hotkeyManager.getCurrentHotkey();
+      const isUsingNativeShortcut = this.windowManager.isUsingNativeShortcutHotkeys();
+      const supportsPushToTalk = hotkeyManager.supportsPushToTalk(hotkey);
+
+      return {
+        isUsingGnome: this.windowManager.isUsingGnomeHotkeys(),
+        isUsingHyprland: this.windowManager.isUsingHyprlandHotkeys(),
+        isUsingKDE: this.windowManager.isUsingKDEHotkeys(),
+        isUsingNativeShortcut,
+        supportsPushToTalk,
+        pushToTalkUnavailableReason: supportsPushToTalk
+          ? null
+          : hotkeyManager.getPushToTalkUnavailableReason(hotkey),
+        // Lets the renderer show the setup box outside push mode, where the
+        // disabled-Hold tooltip is the only other place this surfaces. Desktop
+        // backends see their own hotkeys, so access matters only without one.
+        linuxInputAccessDenied:
+          hotkeyManager.reliesOnLinuxKeyListener() &&
+          hotkeyManager.nativeListenerProbe().reason === "input_access_denied",
+      };
+    });
+
+    ipcMain.handle("get-hyprland-config-status", async () => {
+      if (!this.windowManager.isUsingHyprlandHotkeys()) return null;
+      return this.windowManager.getHyprlandConfigStatus();
+    });
+
+    // Esc goes to the window that is recording (dictation or the agent
+    // window), and only that window may take it back. A renderer that
+    // reloads, crashes or closes can't, so it gives Esc back by going.
+    const releaseCancelHotkey = () => {
+      this._cancelHotkeyOwner = null;
+      this.windowManager.hotkeyManager.unregisterSlot("cancel");
+    };
+    const watchedCancelOwners = new WeakSet();
+    const watchCancelOwner = (owner) => {
+      if (watchedCancelOwners.has(owner)) return;
+      watchedCancelOwners.add(owner);
+      const releaseIfOwner = () => {
+        if (this._cancelHotkeyOwner === owner) releaseCancelHotkey();
+      };
+      // A committed main-frame navigation only: one will-navigate blocks keeps the renderer.
+      owner.on("did-navigate", releaseIfOwner);
+      owner.on("render-process-gone", releaseIfOwner);
+      owner.once("destroyed", releaseIfOwner);
+    };
+
+    ipcMain.handle("register-cancel-hotkey", async (event, key) => {
+      const hotkeyManager = this.windowManager.hotkeyManager;
+      const owner = event.sender;
+      this._cancelHotkeyOwner = owner;
+      watchCancelOwner(owner);
+      return hotkeyManager.registerSlot("cancel", key, () => {
+        if (!owner.isDestroyed()) owner.send("cancel-hotkey-pressed");
+      });
+    });
+
+    ipcMain.handle("unregister-cancel-hotkey", async (event) => {
+      const owner = this._cancelHotkeyOwner;
+      if (owner && !owner.isDestroyed() && owner !== event.sender) return { success: false };
+      releaseCancelHotkey();
+      return { success: true };
+    });
+
+    ipcMain.handle("start-window-drag", async (event) => {
+      return await this.windowManager.startWindowDrag();
+    });
+
+    ipcMain.handle("stop-window-drag", async (event) => {
+      return await this.windowManager.stopWindowDrag();
+    });
+
+    ipcMain.handle("start-control-panel-drag", async () => {
+      return await this.windowManager.startControlPanelDrag();
+    });
+
+    ipcMain.handle("stop-control-panel-drag", async () => {
+      return await this.windowManager.stopControlPanelDrag();
+    });
+
+    ipcMain.handle("open-external", async (event, url) => {
+      try {
+        const { protocol } = new URL(url);
+        if (!["http:", "https:", "mailto:"].includes(protocol)) {
+          return { success: false, error: `Blocked URL scheme: ${protocol}` };
+        }
+        await openExternalUrl(url);
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("get-auto-start-enabled", async () => {
+      try {
+        return autoStart.getAutoStartState();
+      } catch (error) {
+        debugLogger.error("Error getting auto-start status:", error);
+        return { enabled: false, requiresApproval: false };
+      }
+    });
+
+    ipcMain.handle("set-auto-start-enabled", async (event, enabled) => {
+      try {
+        autoStart.setAutoStartEnabled(enabled);
+        debugLogger.debug("Auto-start setting updated", { enabled });
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Error setting auto-start:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("model-get-all", async () => {
+      try {
+        debugLogger.debug("model-get-all called", undefined, "ipc");
+        const modelManager = require("./modelManagerBridge").default;
+        const models = await modelManager.getModelsWithStatus();
+        debugLogger.debug("Returning models", { count: models.length }, "ipc");
+        return models;
+      } catch (error) {
+        debugLogger.error("Error in model-get-all:", error);
+        throw error;
+      }
+    });
+
+    ipcMain.handle("model-get-active-downloads", async () => {
+      return this.localModelDownloadStatus.getActiveDownloads();
+    });
+
+    ipcMain.handle("model-check", async (_, modelId) => {
+      const modelManager = require("./modelManagerBridge").default;
+      return modelManager.isModelDownloaded(modelId);
+    });
+
+    ipcMain.handle("model-download", async (event, modelId) => {
+      if (this.localModelDownloadStatus.has("llm", modelId)) {
+        return {
+          success: false,
+          error: "Model is already being downloaded",
+          code: "DOWNLOAD_IN_PROGRESS",
+          details: { modelId },
+        };
+      }
+      // Claim ownership before the manager's asynchronous filesystem preflight.
+      this.localModelDownloadStatus.start("llm", modelId);
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        const result = await modelManager.downloadModel(
+          modelId,
+          (progress, downloadedSize, totalSize) => {
+            const status = this.localModelDownloadStatus.update("llm", modelId, {
+              phase: "downloading",
+              progress,
+              downloadedBytes: downloadedSize,
+              totalBytes: totalSize,
+            });
+            this.windowManager.sendToControlPanel("model-download-progress", {
+              modelId,
+              type: "progress",
+              progress,
+              downloadedSize,
+              totalSize,
+              sequence: status.sequence,
+            });
+          }
+        );
+        const status = this.localModelDownloadStatus.finish("llm", modelId);
+        this.windowManager.sendToControlPanel("model-download-progress", {
+          modelId,
+          type: "complete",
+          progress: 100,
+          downloadedSize: status?.downloadedBytes,
+          totalSize: status?.totalBytes,
+          sequence: status?.sequence,
+        });
+        return { success: true, path: result };
+      } catch (error) {
+        const status = this.localModelDownloadStatus.finish("llm", modelId);
+        if (error.code !== "DOWNLOAD_IN_PROGRESS") {
+          this.windowManager.sendToControlPanel("model-download-progress", {
+            modelId,
+            type: "error",
+            error: error.message,
+            code: error.code,
+            details: error.details,
+            sequence: status?.sequence,
+          });
+        }
+        return {
+          success: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        };
+      }
+    });
+
+    ipcMain.handle("model-delete", async (event, modelId) => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        await modelManager.deleteModel(modelId);
+        return { success: true };
+      } catch (error) {
+        return {
+          success: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        };
+      }
+    });
+
+    const retiredModelDirs = () => {
+      const { getModelsDirForService } = require("./modelDirUtils");
+      return {
+        whisperDir: getModelsDirForService("whisper"),
+        parakeetDir: getModelsDirForService("parakeet"),
+        llamaDir: require("./modelManagerBridge").default.getModelsDir(),
+      };
+    };
+    ipcMain.handle("list-retired-local-models", (_event, inUse) =>
+      require("./retiredLocalModels").listRetiredLocalModels(retiredModelDirs(), inUse)
+    );
+    ipcMain.handle("delete-retired-local-models", (_event, inUse) =>
+      require("./retiredLocalModels").deleteRetiredLocalModels(retiredModelDirs(), inUse)
+    );
+
+    ipcMain.handle("model-delete-all", async () => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        await modelManager.deleteAllModels();
+        return { success: true };
+      } catch (error) {
+        return {
+          success: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        };
+      }
+    });
+
+    ipcMain.handle("model-cancel-download", async (event, modelId) => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        const cancelled = modelManager.cancelDownload(modelId);
+        return { success: cancelled };
+      } catch (error) {
+        return {
+          success: false,
+          error: error.message,
+        };
+      }
+    });
+
+    ipcMain.handle("model-check-runtime", async (event) => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        await modelManager.ensureLlamaCpp();
+        return { available: true };
+      } catch (error) {
+        return {
+          available: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        };
+      }
+    });
+
+    handleProviderTranscription(
+      "proxy-xai-transcription",
+      serializeIpcError(async (event, { audioBuffer, language, keyterms }, signal) => {
+        const apiKey = this.environmentManager.getXaiKey();
+        if (!apiKey) {
+          throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+            provider: "xAI",
+            surface: "transcription",
+          });
+        }
+
+        const formData = new FormData();
+        const audioBlob = new Blob([Buffer.from(audioBuffer)], { type: "audio/webm" });
+        formData.append("file", audioBlob, "audio.webm");
+        const { XAI_STT_LANGUAGES } = await import("./transcriptionRoute.ts");
+        if (language && language !== "auto" && XAI_STT_LANGUAGES.has(language)) {
+          formData.append("language", language);
+          formData.append("format", "true");
+        }
+        if (keyterms && keyterms.length > 0) {
+          for (const term of keyterms) {
+            formData.append("keyterm", term);
+          }
+        }
+
+        const response = await proxyFetch(XAI_STT_URL, {
+          signal,
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}` },
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          debugLogger.warn("xAI transcription failed", {
+            status: response.status,
+            body: redactProviderBody(errorText),
+          });
+          throw providerHttpError({
+            provider: "xAI",
+            status: response.status,
+            body: errorText,
+            headers: response.headers,
+            surface: "transcription",
+          });
+        }
+
+        return await response.json();
+      })
+    );
+
+    handleProviderTranscription(
+      "proxy-assemblyai-transcription",
+      serializeIpcError(
+        async (event, { audioBuffer, mimeType, durationSeconds, language, keyterms }, signal) => {
+          return await transcribeAssemblyAiDictation(event, {
+            signal,
+            audioBuffer,
+            durationSeconds,
+            contentType: mimeType,
+            language,
+            keyterms,
+            apiKey: this.environmentManager.getAssemblyAIKey(),
+          });
+        }
+      )
+    );
+
+    handleProviderTranscription(
+      "proxy-mistral-transcription",
+      serializeIpcError(async (event, { audioBuffer, model, language, contextBias }, signal) => {
+        const apiKey = this.environmentManager.getMistralKey();
+        if (!apiKey) {
+          throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+            provider: "Mistral",
+            surface: "transcription",
+          });
+        }
+
+        const transcriptionModel = model || "voxtral-mini-latest";
+        const formData = new FormData();
+        const audioBlob = new Blob([Buffer.from(audioBuffer)], { type: "audio/webm" });
+        formData.append("file", audioBlob, "audio.webm");
+        formData.append("model", transcriptionModel);
+        if (language && language !== "auto") {
+          formData.append("language", language);
+        }
+        if (contextBias && contextBias.length > 0) {
+          for (const token of contextBias) {
+            formData.append("context_bias", token);
+          }
+        }
+
+        const response = await proxyFetch(MISTRAL_TRANSCRIPTION_URL, {
+          signal,
+          method: "POST",
+          headers: {
+            "x-api-key": apiKey,
+          },
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          debugLogger.warn("Mistral transcription failed", {
+            status: response.status,
+            body: redactProviderBody(errorText),
+          });
+          throw providerHttpError({
+            provider: "Mistral",
+            model: transcriptionModel,
+            status: response.status,
+            body: errorText,
+            headers: response.headers,
+            surface: "transcription",
+          });
+        }
+
+        return await response.json();
+      })
+    );
+
+    ipcMain.handle("get-corti-client-id", async () => {
+      return this.environmentManager.getCortiClientId();
+    });
+
+    ipcMain.handle(
+      "save-corti-client-id",
+      saveSecretKey("getCortiClientId", "saveCortiClientId", "cortiClientId")
+    );
+
+    ipcMain.handle("get-corti-client-secret", async () => {
+      return this.environmentManager.getCortiClientSecret();
+    });
+
+    ipcMain.handle(
+      "save-corti-client-secret",
+      saveSecretKey("getCortiClientSecret", "saveCortiClientSecret", "cortiClientSecret")
+    );
+
+    handleProviderTranscription(
+      "proxy-corti-transcription",
+      serializeIpcError(async (event, { audioBuffer, language, environment, tenant }, signal) => {
+        const clientId = this.environmentManager.getCortiClientId();
+        const clientSecret = this.environmentManager.getCortiClientSecret();
+        if (!clientId || !clientSecret) {
+          throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+            provider: "Corti",
+            surface: "transcription",
+          });
+        }
+
+        const { transcribeAudio } = require("./cortiTranscription");
+        return await transcribeAudio({
+          signal,
+          environment,
+          tenant,
+          clientId,
+          clientSecret,
+          audioBuffer,
+          language,
+        });
+      })
+    );
+
+    handleRemoteProduct("get-tinfoil-chat-models", async () => {
+      return getTinfoilChatModels(this._productRequestContext.getStore().signal);
+    });
+
+    // Enclave attestation is Node-only, so batch transcription is proxied through main.
+    handleProviderTranscription(
+      "proxy-tinfoil-transcription",
+      serializeIpcError(async (event, { audioBuffer, language, prompt }, signal) => {
+        return await transcribeWithTinfoil({
+          signal,
+          audioBuffer: Buffer.from(audioBuffer),
+          fileName: "audio.webm",
+          contentType: "audio/webm",
+          language,
+          prompt,
+          apiKey: this.environmentManager.getTinfoilKey(),
+        });
+      })
+    );
+
+    // Gemini's Interactions API takes JSON with inline base64 audio, not
+    // OpenAI-compatible multipart, so batch transcription is proxied through main.
+    handleProviderTranscription(
+      "proxy-gemini-transcription",
+      serializeIpcError(async (event, { audioBuffer, model, language, keyterms }, signal) => {
+        return await transcribeWithGemini({
+          signal,
+          audioBuffer: Buffer.from(audioBuffer),
+          model,
+          contentType: "audio/webm",
+          language,
+          keyterms,
+          apiKey: this.environmentManager.getGeminiKey(),
+        });
+      })
+    );
+
+    // ElevenLabs Scribe authenticates with xi-api-key and takes model_id /
+    // language_code, so it has no OpenAI-compatible path either.
+    const elevenLabsDictations = new AgentStreamRequestRegistry();
+    const transcribeElevenLabsDictation = createProductHandler(
+      "proxy-elevenlabs-transcription",
+      serializeIpcError(
+        async (_event, { audioBuffer, model, language, keyterms }, cancelSignal) => {
+          return transcribeElevenLabsSpeech({
+            signal: AbortSignal.any([cancelSignal, this._productRequestContext.getStore().signal]),
+            audioBuffer: Buffer.from(audioBuffer),
+            model,
+            fileName: "audio.webm",
+            contentType: "audio/webm",
+            language,
+            keyterms,
+            apiKey: this.environmentManager.getElevenlabsKey(),
+          });
+        }
+      ),
+      true
+    );
+    ipcMain.handle("proxy-elevenlabs-transcription", async (event, options) => {
+      // Register before the policy lookup can yield so an early Cancel cannot miss the upload.
+      const sender = event.sender;
+      const senderId = sender.id;
+      const requestId = crypto.randomUUID();
+      const controller = elevenLabsDictations.begin(senderId, requestId);
+      const abort = () => controller.abort();
+      sender.once("destroyed", abort);
+      try {
+        return await transcribeElevenLabsDictation(event, options, controller.signal);
+      } finally {
+        sender.removeListener("destroyed", abort);
+        elevenLabsDictations.complete(senderId, requestId, controller);
+      }
+    });
+
+    // Headers and redirect mode for a request to the self-hosted speech server of `surface`
+    // ("dictation" or "upload"), with the custom key for a route that takes one (Orukeet's).
+    const selfHostedRequest = (surface, route) => {
+      const key =
+        route?.auth.keyRef === "custom" ? this.environmentManager.getCustomTranscriptionKey() : "";
+      return selfHostedSttRequest(
+        parseSelfHostedSttHeaders(this.environmentManager.getSelfHostedSttHeaders())[surface],
+        key ? { Authorization: `Bearer ${key}` } : {}
+      );
+    };
+    ipcMain.handle("get-self-hosted-stt-headers", () =>
+      this.environmentManager.getSelfHostedSttHeaders()
+    );
+    ipcMain.handle(
+      "save-self-hosted-stt-headers",
+      saveSecretKey("getSelfHostedSttHeaders", "saveSelfHostedSttHeaders", "selfHostedSttHeaders")
+    );
+    ipcMain.handle("get-custom-transcription-key", async () => {
+      return this.environmentManager.getCustomTranscriptionKey();
+    });
+
+    ipcMain.handle(
+      "save-custom-transcription-key",
+      saveSecretKey(
+        "getCustomTranscriptionKey",
+        "saveCustomTranscriptionKey",
+        "customTranscriptionApiKey"
+      )
+    );
+
+    ipcMain.handle("get-cleanup-custom-key", async () => {
+      return this.environmentManager.getCleanupCustomKey();
+    });
+
+    ipcMain.handle(
+      "save-cleanup-custom-key",
+      saveSecretKey("getCleanupCustomKey", "saveCleanupCustomKey", "cleanupCustomApiKey")
+    );
+
+    // Enterprise provider key handlers
+    ipcMain.handle("get-bedrock-region", async () => {
+      return this.environmentManager.getBedrockRegion();
+    });
+    ipcMain.handle("save-bedrock-region", async (event, value) => {
+      return this.environmentManager.saveBedrockRegion(value);
+    });
+    ipcMain.handle("get-bedrock-profile", async () => {
+      return this.environmentManager.getBedrockProfile();
+    });
+    ipcMain.handle("save-bedrock-profile", async (event, value) => {
+      return this.environmentManager.saveBedrockProfile(value);
+    });
+    ipcMain.handle("get-bedrock-access-key-id", async () => {
+      return this.environmentManager.getBedrockAccessKeyId();
+    });
+    ipcMain.handle(
+      "save-bedrock-access-key-id",
+      saveSecretKey("getBedrockAccessKeyId", "saveBedrockAccessKeyId", "bedrockAccessKeyId")
+    );
+    ipcMain.handle("get-bedrock-secret-access-key", async () => {
+      return this.environmentManager.getBedrockSecretAccessKey();
+    });
+    ipcMain.handle(
+      "save-bedrock-secret-access-key",
+      saveSecretKey(
+        "getBedrockSecretAccessKey",
+        "saveBedrockSecretAccessKey",
+        "bedrockSecretAccessKey"
+      )
+    );
+    ipcMain.handle("get-bedrock-session-token", async () => {
+      return this.environmentManager.getBedrockSessionToken();
+    });
+    ipcMain.handle(
+      "save-bedrock-session-token",
+      saveSecretKey("getBedrockSessionToken", "saveBedrockSessionToken", "bedrockSessionToken")
+    );
+    ipcMain.handle("get-azure-endpoint", async () => {
+      return this.environmentManager.getAzureEndpoint();
+    });
+    ipcMain.handle("save-azure-endpoint", async (event, value) => {
+      return this.environmentManager.saveAzureEndpoint(value);
+    });
+    ipcMain.handle("get-azure-api-key", async () => {
+      return this.environmentManager.getAzureApiKey();
+    });
+    ipcMain.handle(
+      "save-azure-api-key",
+      saveSecretKey("getAzureApiKey", "saveAzureApiKey", "azureApiKey")
+    );
+    ipcMain.handle("get-azure-deployment", async () => {
+      return this.environmentManager.getAzureDeployment();
+    });
+    ipcMain.handle("save-azure-deployment", async (event, value) => {
+      return this.environmentManager.saveAzureDeployment(value);
+    });
+    ipcMain.handle("get-azure-api-version", async () => {
+      return this.environmentManager.getAzureApiVersion();
+    });
+    ipcMain.handle("save-azure-api-version", async (event, value) => {
+      return this.environmentManager.saveAzureApiVersion(value);
+    });
+    ipcMain.handle("get-vertex-project", async () => {
+      return this.environmentManager.getVertexProject();
+    });
+    ipcMain.handle("save-vertex-project", async (event, value) => {
+      return this.environmentManager.saveVertexProject(value);
+    });
+    ipcMain.handle("get-vertex-location", async () => {
+      return this.environmentManager.getVertexLocation();
+    });
+    ipcMain.handle("save-vertex-location", async (event, value) => {
+      return this.environmentManager.saveVertexLocation(value);
+    });
+    ipcMain.handle("get-vertex-api-key", async () => {
+      return this.environmentManager.getVertexApiKey();
+    });
+    ipcMain.handle(
+      "save-vertex-api-key",
+      saveSecretKey("getVertexApiKey", "saveVertexApiKey", "vertexApiKey")
+    );
+
+    // Enterprise provider test connection
+    handleRemoteProduct("test-enterprise-connection", async (event, provider, config) => {
+      const {
+        mapEnterpriseError,
+        runAbortableOperation,
+        runBedrockRequest,
+        validateEnterpriseEndpoint,
+      } = require("./enterpriseProviderErrors");
+      const signal = this._productRequestContext.getStore().signal;
+      let runtime;
+      try {
+        const { generateText } = require("ai");
+        const { getEnterpriseAIModel } = require("./enterpriseAiProviders");
+
+        const resolveModel = (abortSignal = signal) =>
+          runAbortableOperation(async () => {
+            runtime = await resolveEnterpriseRuntime(
+              event,
+              provider,
+              config?.model || "test",
+              config
+            );
+            abortSignal?.throwIfAborted();
+            validateEnterpriseEndpoint(runtime.enterprise.azureEndpoint);
+            return getEnterpriseAIModel(
+              runtime.provider,
+              runtime.model,
+              runtime.apiKey,
+              runtime.enterprise
+            );
+          }, abortSignal);
+
+        if (provider === "bedrock") {
+          await runBedrockRequest(
+            async () => {
+              const abortSignal = AbortSignal.any([
+                signal,
+                AbortSignal.timeout(config?.timeoutMs || 30_000),
+              ]);
+              const model = await resolveModel(abortSignal);
+              return generateText({
+                model,
+                prompt: "Say hello in one word.",
+                maxOutputTokens: CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+                abortSignal,
+                maxRetries: 0,
+              });
+            },
+            { signal }
+          );
+        } else {
+          const model = await resolveModel();
+          await generateText({
+            model,
+            prompt: "Say hello in one word.",
+            maxOutputTokens: CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+            abortSignal: signal,
+          });
+        }
+
+        return { success: true };
+      } catch (err) {
+        const mappingConfig =
+          runtime?.provider === "bedrock" && runtime.enterprise?.bedrockRegion
+            ? { ...(config || {}), bedrockRegion: runtime.enterprise.bedrockRegion }
+            : config;
+        const mapped = mapEnterpriseError(provider, err, mappingConfig);
+        return {
+          success: false,
+          error: mapped.message,
+          messageKey: mapped.messageKey,
+          messageParams: mapped.messageParams,
+          action: mapped.action,
+          actionKey: mapped.actionKey,
+          copyCommand: mapped.copyCommand,
+          retryable: mapped.retryable,
+          technicalDetails: mapped.technicalDetails,
+        };
+      }
+    });
+
+    handleRemoteProduct(
+      "process-enterprise-reasoning",
+      async (event, text, modelId, _agentName, config) => {
+        const {
+          isEnterpriseProvider,
+          mapEnterpriseError,
+          runAbortableOperation,
+          runBedrockRequest,
+          validateEnterpriseEndpoint,
+        } = require("./enterpriseProviderErrors");
+        const provider = config?.provider;
+        let runtime;
+        try {
+          if (!isEnterpriseProvider(provider)) {
+            throw new Error(`Unsupported enterprise provider: ${provider}`);
+          }
+          const isBedrockCleanup =
+            provider === "bedrock" && config?.inferenceScope === "dictationCleanup";
+          const sender = isBedrockCleanup ? event.sender : null;
+          const senderId = sender?.id;
+          const requestId = isBedrockCleanup ? crypto.randomUUID() : null;
+          const controller = isBedrockCleanup
+            ? this._enterpriseReasoningRequests.begin(senderId, requestId)
+            : null;
+          const cancelSenderRequests = () =>
+            this._enterpriseReasoningRequests.cancelSender(senderId);
+          try {
+            if (controller) {
+              sender.once("destroyed", cancelSenderRequests);
+              if (sender.isDestroyed()) controller.abort();
+            }
+            controller?.signal.throwIfAborted();
+
+            const { generateText } = require("ai");
+            const { getEnterpriseAIModel } = require("./enterpriseAiProviders");
+            const timeoutMs = config?.timeoutMs || 60000;
+            // Opus 4.7 / GPT-5 / o-series dropped `temperature`; renderer
+            // derives support from the model registry and we honor that here.
+            const useTemperature = config?.supportsTemperature !== false;
+            const resolveModel = (abortSignal) =>
+              runAbortableOperation(async () => {
+                runtime = await resolveEnterpriseRuntime(event, provider, modelId, config || {});
+                abortSignal?.throwIfAborted();
+                this._productRequestContext.getStore().signal.throwIfAborted();
+                if (!runtime.model) throw new Error("No model specified for enterprise reasoning");
+                validateEnterpriseEndpoint(runtime.enterprise.azureEndpoint);
+                return getEnterpriseAIModel(
+                  runtime.provider,
+                  runtime.model,
+                  runtime.apiKey,
+                  runtime.enterprise
+                );
+              }, abortSignal);
+            const generate = (model, abortSignal, disableNestedRetries = false) => {
+              return generateText({
+                model,
+                system: config?.systemPrompt || "",
+                prompt: text,
+                maxOutputTokens: config?.maxTokens || 4096,
+                ...(useTemperature ? { temperature: config?.temperature ?? 0.3 } : {}),
+                abortSignal: AbortSignal.any(
+                  [
+                    abortSignal,
+                    this._productRequestContext.getStore()?.signal,
+                    this._remoteProductRetirement.signal,
+                  ].filter(Boolean)
+                ),
+                ...(disableNestedRetries ? { maxRetries: 0 } : {}),
+              });
+            };
+            let result;
+            if (isBedrockCleanup) {
+              result = await runBedrockRequest(
+                async () => {
+                  const abortSignal = AbortSignal.any([
+                    controller.signal,
+                    AbortSignal.timeout(timeoutMs),
+                  ]);
+                  const model = await resolveModel(abortSignal);
+                  return generate(model, abortSignal, true);
+                },
+                { signal: controller.signal }
+              );
+            } else {
+              const model = await resolveModel();
+              result = await generate(model, AbortSignal.timeout(timeoutMs));
+            }
+            const { text: generated, finishReason } = result;
+
+            if (
+              config?.requireCompleteOutput &&
+              ["length", "max-tokens", "max_tokens"].includes(finishReason)
+            ) {
+              throw Object.assign(new Error("Model output was truncated"), {
+                messageKey: CLEANUP_TRUNCATED_MESSAGE_KEY,
+              });
+            }
+
+            return { success: true, text: (generated || "").trim() };
+          } finally {
+            if (controller) {
+              sender.removeListener("destroyed", cancelSenderRequests);
+              this._enterpriseReasoningRequests.complete(senderId, requestId, controller);
+            }
+          }
+        } catch (err) {
+          debugLogger.error("Enterprise reasoning error:", err);
+          const mappingConfig =
+            runtime?.provider === "bedrock" && runtime.enterprise?.bedrockRegion
+              ? { ...(config || {}), bedrockRegion: runtime.enterprise.bedrockRegion }
+              : config || {};
+          const mapped = mapEnterpriseError(provider, err, mappingConfig);
+          return {
+            success: false,
+            error: mapped.message,
+            // mapEnterpriseError matches provider failures, so a truncation falls through
+            // to its generic mapping — keep the key the throw site set.
+            messageKey: err.messageKey || mapped.messageKey,
+            messageParams: mapped.messageParams,
+            action: mapped.action,
+            actionKey: mapped.actionKey,
+            copyCommand: mapped.copyCommand,
+            retryable: mapped.retryable,
+            technicalDetails: mapped.technicalDetails,
+          };
+        }
+      }
+    );
+
+    ipcMain.on("enterprise-reasoning-cancel", (event) => {
+      this._enterpriseReasoningRequests.cancelSender(event.sender.id);
+    });
+
+    // Runs doStream for the renderer's enterprise chat model shim; parts are
+    // relayed verbatim over enterprise-stream-part, ending with {done}/{error}.
+    this.enterpriseStreamAborts = new Map();
+    handleRemoteProduct("enterprise-stream-start", async (event, payload) => {
+      const {
+        isEnterpriseProvider,
+        mapEnterpriseError,
+        validateEnterpriseEndpoint,
+      } = require("./enterpriseProviderErrors");
+      const { streamId, provider, modelId, config, options } = payload || {};
+      let runtime;
+      const abortController = new AbortController();
+      const signal = AbortSignal.any([
+        abortController.signal,
+        this._productRequestContext.getStore().signal,
+      ]);
+      const send = (message) => {
+        if (!signal.aborted && !event.sender.isDestroyed()) {
+          event.sender.send("enterprise-stream-part", { streamId, ...message });
+        }
+      };
+      this.enterpriseStreamAborts.set(streamId, abortController);
+      this._enterpriseStreamProviders.set(streamId, provider);
+      // isDestroyed() stays false across reload/navigation, which wipes the
+      // renderer listeners — abort so the provider request isn't billed for
+      // a generation nobody receives.
+      const abortOnGone = (_event, _url, isInPlace, isMainFrame) => {
+        if (isMainFrame && !isInPlace) abortController.abort();
+      };
+      const abortOnDestroyed = () => abortController.abort();
+      event.sender.on("did-start-navigation", abortOnGone);
+      event.sender.once("destroyed", abortOnDestroyed);
+      try {
+        if (!streamId || !isEnterpriseProvider(provider)) {
+          throw new Error(`Unsupported enterprise provider: ${provider}`);
+        }
+        runtime = await resolveEnterpriseRuntime(event, provider, modelId, config || {});
+        signal.throwIfAborted();
+        if (!runtime.model) throw new Error("No model specified for enterprise streaming");
+        validateEnterpriseEndpoint(runtime.enterprise.azureEndpoint);
+
+        const { getEnterpriseAIModel } = require("./enterpriseAiProviders");
+        const model = await getEnterpriseAIModel(
+          runtime.provider,
+          runtime.model,
+          runtime.apiKey,
+          runtime.enterprise
+        );
+        signal.throwIfAborted();
+
+        const { stream } = await model.doStream({
+          ...options,
+          abortSignal: signal,
+        });
+        const reader = stream.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            signal.throwIfAborted();
+            if (done) break;
+            if (event.sender.isDestroyed()) {
+              abortController.abort();
+              break;
+            }
+            send({ part: value });
+          }
+        } finally {
+          if (signal.aborted) await reader.cancel(signal.reason).catch(() => {});
+          reader.releaseLock();
+        }
+        send({ done: true });
+        return { success: true };
+      } catch (err) {
+        debugLogger.error("Enterprise stream error:", err);
+        const mappingConfig =
+          runtime?.provider === "bedrock" && runtime.enterprise?.bedrockRegion
+            ? { ...(config || {}), bedrockRegion: runtime.enterprise.bedrockRegion }
+            : config || {};
+        const mapped = mapEnterpriseError(provider, err, mappingConfig);
+        send({ error: mapped.message });
+        return { success: false, error: mapped.message };
+      } finally {
+        this.enterpriseStreamAborts.delete(streamId);
+        this._enterpriseStreamProviders.delete(streamId);
+        if (!event.sender.isDestroyed()) {
+          event.sender.removeListener("did-start-navigation", abortOnGone);
+          event.sender.removeListener("destroyed", abortOnDestroyed);
+        }
+      }
+    });
+
+    ipcMain.handle("enterprise-stream-cancel", async (event, streamId) => {
+      this.enterpriseStreamAborts.get(streamId)?.abort();
+      this.enterpriseStreamAborts.delete(streamId);
+      this._enterpriseStreamProviders.delete(streamId);
+    });
+
+    // Lists the text models the account serves in the selected region,
+    // resolved to invocable IDs (bare on-demand or geo-scoped profile IDs).
+    handleRemoteProduct("bedrock-list-models", async (event, config) => {
+      const { mapEnterpriseError } = require("./enterpriseProviderErrors");
+      const signal = this._productRequestContext.getStore().signal;
+      try {
+        const runtime = await resolveEnterpriseRuntime(
+          event,
+          "bedrock",
+          config?.model || "test",
+          config
+        );
+        signal.throwIfAborted();
+        const {
+          BedrockClient,
+          ListFoundationModelsCommand,
+          paginateListInferenceProfiles,
+        } = require("@aws-sdk/client-bedrock");
+        const { normalizeBedrockCatalog } = require("./bedrockCatalog");
+
+        const region = runtime.enterprise.bedrockRegion || "us-east-1";
+        let credentials;
+        if (runtime.enterprise.managedCredentialProvider) {
+          credentials = runtime.enterprise.managedCredentialProvider;
+        } else if (runtime.enterprise.bedrockProfile) {
+          const { fromNodeProviderChain } = require("@aws-sdk/credential-providers");
+          credentials = fromNodeProviderChain({ profile: runtime.enterprise.bedrockProfile });
+        } else if (
+          runtime.enterprise.bedrockAccessKeyId &&
+          runtime.enterprise.bedrockSecretAccessKey
+        ) {
+          credentials = {
+            accessKeyId: runtime.enterprise.bedrockAccessKeyId,
+            secretAccessKey: runtime.enterprise.bedrockSecretAccessKey,
+            sessionToken: runtime.enterprise.bedrockSessionToken || undefined,
+          };
+        }
+        const client = new BedrockClient({ region, ...(credentials ? { credentials } : {}) });
+
+        const [foundationModels, profileSummaries] = await Promise.all([
+          client.send(new ListFoundationModelsCommand({ byOutputModality: "TEXT" }), {
+            abortSignal: signal,
+          }),
+          (async () => {
+            const summaries = [];
+            const paginator = paginateListInferenceProfiles(
+              { client },
+              { typeEquals: "SYSTEM_DEFINED" },
+              { abortSignal: signal }
+            );
+            for await (const page of paginator) {
+              summaries.push(...(page.inferenceProfileSummaries || []));
+            }
+            return summaries;
+          })(),
+        ]);
+
+        return {
+          success: true,
+          models: normalizeBedrockCatalog(foundationModels.modelSummaries, profileSummaries),
+        };
+      } catch (err) {
+        debugLogger.error("Bedrock model listing error:", err);
+        const mapped = mapEnterpriseError("bedrock", err, config || {});
+        return { success: false, error: mapped.message };
+      }
+    });
+
+    ipcMain.handle("get-dictation-key", async () => {
+      return this.environmentManager.getDictationKey();
+    });
+
+    ipcMain.handle("save-dictation-key", async (event, key) => {
+      return this.environmentManager.saveDictationKey(key);
+    });
+
+    ipcMain.handle("get-active-dictation-key", async () => {
+      const hotkeys = this.windowManager?.hotkeyManager?.getSlotHotkeys?.("dictation") ?? [];
+      return hotkeys.length > 0 ? hotkeys.join(",") : null;
+    });
+
+    ipcMain.handle("get-effective-default-hotkey", async () => {
+      return this.windowManager?.hotkeyManager?.getEffectiveDefaultHotkey() ?? null;
+    });
+
+    // The mode in effect: startup can fall back to Tap for this session while
+    // the saved preference stays Hold for the next launch.
+    ipcMain.handle("get-activation-mode", async () => {
+      return this.windowManager.getActivationMode();
+    });
+
+    ipcMain.handle("save-activation-mode", async (event, mode) => {
+      return this.environmentManager.saveActivationMode(mode);
+    });
+
+    ipcMain.handle("get-ui-language", async () => {
+      return this.environmentManager.getUiLanguage();
+    });
+
+    ipcMain.handle("save-ui-language", async (event, language) => {
+      return this.environmentManager.saveUiLanguage(language);
+    });
+
+    ipcMain.handle("set-ui-language", async (event, language) => {
+      const result = this.environmentManager.saveUiLanguage(language);
+      process.env.UI_LANGUAGE = result.language;
+      changeLanguage(result.language);
+      this.windowManager?.refreshLocalizedUi?.();
+      this.getTrayManager?.()?.updateTrayMenu?.();
+      return { success: true, language: result.language };
+    });
+
+    ipcMain.handle("save-all-keys-to-env", async () => {
+      return this.environmentManager.saveAllKeysToEnvFile();
+    });
+
+    let lastDictationSpeechEngine;
+    ipcMain.handle("sync-startup-preferences", async (event, prefs) => {
+      const setVars = {};
+      const clearVars = [];
+      let speechEngine = null;
+
+      if (prefs.useLocalWhisper && prefs.model) {
+        setVars.LOCAL_TRANSCRIPTION_PROVIDER = prefs.localTranscriptionProvider;
+        if (prefs.language) setVars.DICTATION_LANGUAGE = prefs.language;
+        if (isSherpaLocalProvider(prefs.localTranscriptionProvider)) {
+          speechEngine = "parakeet";
+          setVars.PARAKEET_MODEL = prefs.model;
+          clearVars.push("LOCAL_WHISPER_MODEL");
+        } else {
+          speechEngine = "whisper";
+          setVars.LOCAL_WHISPER_MODEL = prefs.model;
+          clearVars.push("PARAKEET_MODEL");
+        }
+      } else {
+        clearVars.push("LOCAL_TRANSCRIPTION_PROVIDER", "PARAKEET_MODEL", "LOCAL_WHISPER_MODEL");
+        if (!prefs.useLocalWhisper) speechEngine = "cloud";
+      }
+
+      // All windows resend these preferences on LLM route changes. A meeting
+      // can be decoding on either speech server while the dictation route stays put.
+      if (speechEngine !== lastDictationSpeechEngine) {
+        lastDictationSpeechEngine = speechEngine;
+        if (speechEngine === "cloud" || speechEngine === "parakeet") {
+          this.whisperManager.stopServer().catch((err) => {
+            debugLogger.error("Failed to stop whisper-server on dictation switch", {
+              error: err.message,
+            });
+          });
+        }
+        if (speechEngine === "cloud" || speechEngine === "whisper") {
+          this.parakeetManager.stopServer().catch((err) => {
+            debugLogger.error("Failed to stop parakeet-server on dictation switch", {
+              error: err.message,
+            });
+          });
+        }
+      }
+
+      // TODO: drop legacy REASONING_PROVIDER / LOCAL_REASONING_MODEL clears once
+      // the read fallback is removed (~2 releases after this lands).
+      clearVars.push("REASONING_PROVIDER", "LOCAL_REASONING_MODEL");
+
+      // No workspace policy governs this, so it applies before the policy settles.
+      const modelManager = require("./modelManagerBridge").default;
+      modelManager.serverManager.setKeepResident(prefs.keepLocalModelLoaded === true);
+
+      // A signed-in window whose workspace policy is still loading reports
+      // unclamped modes, so it neither pre-warms nor stops the shared
+      // llama-server; signed out, the policy never loads.
+      if (prefs.policySettled || !this._hasActiveAccountScope()) {
+        const localServer = resolveLocalServerNeeds(prefs);
+        this.dictationCleanupPrewarm.setModel(localServer.cleanup);
+
+        if (localServer.cleanup) {
+          setVars.CLEANUP_PROVIDER = "local";
+          setVars.LOCAL_CLEANUP_MODEL = localServer.cleanup;
+        } else {
+          clearVars.push("CLEANUP_PROVIDER", "LOCAL_CLEANUP_MODEL");
+        }
+
+        if (localServer.dictationAgent) {
+          setVars.DICTATION_AGENT_PROVIDER = "local";
+          setVars.LOCAL_DICTATION_AGENT_MODEL = localServer.dictationAgent;
+        } else {
+          clearVars.push("DICTATION_AGENT_PROVIDER", "LOCAL_DICTATION_AGENT_MODEL");
+        }
+
+        // Stop the shared llama-server only when no scope still needs the model
+        // it holds, so the active scopes keep their server when another leaves.
+        if (shouldStopLocalServer(localServer, modelManager.currentServerModelId)) {
+          if (modelManager.getServerStatus().running) {
+            debugLogger.debug("Stopping llama-server: no scope needs its model", {
+              loadedModel: modelManager.currentServerModelId,
+              neededModels: localServer.models,
+            });
+          }
+          // A background chat answer may still be streaming from it.
+          modelManager.stopServerWhenIdle().catch((err) => {
+            debugLogger.error("Failed to stop llama-server", { error: err.message });
+          });
+        } else {
+          modelManager.serverManager.cancelDeferredStop();
+        }
+      }
+
+      this._syncStartupEnv(setVars, clearVars);
+    });
+
+    handleProduct("process-local-reasoning", async (event, text, modelId, _agentName, config) => {
+      const LocalReasoningService = require("../services/localReasoningBridge").default;
+      const signal = this._productRequestContext.getStore().signal;
+      const requestId = config?.requestId ?? crypto.randomUUID();
+      const cancel = () => LocalReasoningService.cancel(requestId);
+      signal.addEventListener("abort", cancel, { once: true });
+      try {
+        signal.throwIfAborted();
+        const result = await LocalReasoningService.processText(text, modelId, {
+          ...config,
+          requestId,
+          signal,
+        });
+        signal.throwIfAborted();
+        return { success: true, text: result };
+      } catch (error) {
+        // code/details carry the machine-readable failure across to the
+        // renderer, which owns the translation keys. Flattening to a bare
+        // string is how llama.cpp JSON used to reach users (#2142).
+        return {
+          success: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        };
+      } finally {
+        signal.removeEventListener("abort", cancel);
+      }
+    });
+
+    ipcMain.handle("cancel-local-reasoning", (event, requestId) => {
+      require("../services/localReasoningBridge").default.cancel(requestId);
+    });
+
+    // After a local refusal, the renderer plans a note's parts against this
+    // number (#2142 part 3). It is the same ceiling runInference sizes against,
+    // so a part the renderer judges to fit is one the main process will accept
+    // without a restart it cannot afford.
+    ipcMain.handle("get-local-context-budget", async (event, modelId) => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        modelManager.ensureInitialized();
+        const modelInfo = modelManager.findModelById(modelId);
+        if (!modelInfo) {
+          return { success: false, error: `Model "${modelId}" not found` };
+        }
+        const modelPath = require("path").join(modelManager.modelsDir, modelInfo.model.fileName);
+        const { ceiling } = await modelManager.contextCeiling(modelInfo, modelPath);
+        return { success: true, maxContextTokens: ceiling, modelName: modelInfo.model.name };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleRemoteProduct(
+      "process-anthropic-reasoning",
+      async (event, text, modelId, _agentName, config) => {
+        const timeoutSeconds = getLlmRequestTimeoutSeconds({ scope: config?.inferenceScope });
+        const timeoutSignal = AbortSignal.timeout(timeoutSeconds * 1000);
+        try {
+          const apiKey = this.environmentManager.getAnthropicKey();
+
+          if (!apiKey) {
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: "Anthropic",
+              surface: "llm",
+            });
+          }
+
+          const systemPrompt = config?.systemPrompt || "";
+          const userPrompt = text;
+
+          if (!modelId) {
+            throw new Error("No model specified for Anthropic API call");
+          }
+
+          const screenContext = config?.screenContext;
+          const userContent = screenContext
+            ? [
+                { type: "text", text: userPrompt },
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: screenContext.mediaType,
+                    data: screenContext.data,
+                  },
+                },
+              ]
+            : userPrompt;
+
+          // Claude models from Opus 4.7 onward reject `temperature` with a 400;
+          // the renderer derives support from the model registry.
+          const useTemperature = config?.supportsTemperature === true;
+          // Thinking counts toward max_tokens; the catalog names the value that turns it off.
+          const thinking =
+            config?.disableThinking === true
+              ? modelRegistryData.cloudProviders
+                  .find((provider) => provider.id === "anthropic")
+                  ?.models.find((model) => model.id === modelId)?.thinkingOff
+              : undefined;
+          const requestBody = {
+            model: modelId,
+            messages: [{ role: "user", content: userContent }],
+            system: systemPrompt,
+            max_tokens: config?.maxTokens || 4096,
+            ...(useTemperature ? { temperature: config?.temperature ?? 0.3 } : {}),
+            ...(thinking ? { thinking } : {}),
+          };
+
+          const response = await proxyFetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-API-Key": apiKey,
+              "anthropic-version": "2023-06-01",
+            },
+            body: JSON.stringify(requestBody),
+            signal: timeoutSignal,
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            debugLogger.warn("Anthropic API error", {
+              status: response.status,
+              body: redactProviderBody(errorText),
+            });
+            return {
+              success: false,
+              ...ipcErrorFields(
+                providerHttpError({
+                  provider: "Anthropic",
+                  model: modelId,
+                  status: response.status,
+                  body: errorText,
+                  headers: response.headers,
+                  surface: "llm",
+                })
+              ),
+            };
+          }
+
+          const data = await response.json();
+          if (config?.requireCompleteOutput && data.stop_reason === "max_tokens") {
+            throw Object.assign(new Error("Model output was truncated"), {
+              messageKey: CLEANUP_TRUNCATED_MESSAGE_KEY,
+            });
+          }
+          let outputText = extractAnthropicText(data);
+          // With thinking turned off, Claude can open its text with a <thinking> block.
+          // A reply that is only that block has no answer, like one with no text at all.
+          if (thinking && outputText) {
+            outputText = outputText.replace(/^<thinking>[\s\S]*?<\/thinking>\s*/i, "") || null;
+          }
+          if (outputText === null) {
+            throw Object.assign(new Error(describeMissingAnthropicText(data)), {
+              messageKey: CLEANUP_EMPTY_REPLY_MESSAGE_KEY,
+            });
+          }
+          return { success: true, text: outputText };
+        } catch (error) {
+          // proxyFetch also aborts on device-policy signals, so only our own
+          // deadline counts as a timeout.
+          const failure = timeoutSignal.aborted ? llmRequestTimeoutError(timeoutSeconds) : error;
+          debugLogger.error("Anthropic reasoning error:", failure);
+          // A network failure rejects proxyFetch before any response.
+          return {
+            success: false,
+            ...ipcErrorFields(
+              asProviderError(failure, { provider: "Anthropic", model: modelId, surface: "llm" })
+            ),
+          };
+        }
+      }
+    );
+
+    ipcMain.handle("check-local-reasoning-available", async () => {
+      try {
+        const LocalReasoningService = require("../services/localReasoningBridge").default;
+        return await LocalReasoningService.isAvailable();
+      } catch (error) {
+        return false;
+      }
+    });
+
+    ipcMain.handle("llama-cpp-check", async () => {
+      try {
+        const llamaCppInstaller = require("./llamaCppInstaller").default;
+        const isInstalled = await llamaCppInstaller.isInstalled();
+        const version = isInstalled ? await llamaCppInstaller.getVersion() : null;
+        return { isInstalled, version };
+      } catch (error) {
+        return { isInstalled: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("llama-cpp-install", async () => {
+      try {
+        const llamaCppInstaller = require("./llamaCppInstaller").default;
+        const result = await llamaCppInstaller.install();
+        return result;
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("llama-cpp-uninstall", async () => {
+      try {
+        const llamaCppInstaller = require("./llamaCppInstaller").default;
+        const result = await llamaCppInstaller.uninstall();
+        return result;
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    // A chat turn cancelled while start() waits out another model's answer must
+    // not swap its model in afterwards.
+    this.llamaServerStartAborts = new Map();
+    ipcMain.handle("llama-server-start", async (event, modelId, requestId) => {
+      const abortController = new AbortController();
+      if (requestId) this.llamaServerStartAborts.set(requestId, abortController);
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        modelManager.ensureInitialized();
+        const modelInfo = modelManager.findModelById(modelId);
+        if (!modelInfo) {
+          return { success: false, error: `Model "${modelId}" not found` };
+        }
+
+        const modelPath = require("path").join(modelManager.modelsDir, modelInfo.model.fileName);
+
+        await modelManager.serverManager.start(
+          modelPath,
+          await modelManager.serverStartOptions(modelInfo, { signal: abortController.signal })
+        );
+        modelManager.currentServerModelId = modelId;
+
+        return { success: true, port: modelManager.serverManager.port };
+      } catch (error) {
+        return { success: false, error: error.message, code: error.code };
+      } finally {
+        if (requestId) this.llamaServerStartAborts.delete(requestId);
+      }
+    });
+
+    ipcMain.handle("llama-server-cancel-start", (event, requestId) => {
+      this.llamaServerStartAborts.get(requestId)?.abort();
+    });
+
+    ipcMain.handle("llama-server-status", async () => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        return modelManager.getServerStatus();
+      } catch (error) {
+        return { available: false, running: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("llama-gpu-reset", async () => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        const previousModelId = modelManager.currentServerModelId;
+        modelManager.serverManager.resetGpuDetection();
+        await modelManager.stopServer();
+
+        // Restart server with previous model so Vulkan binary is picked up
+        if (previousModelId) {
+          modelManager.prewarmServer(previousModelId).catch(() => {});
+        }
+
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("detect-vulkan-gpu", async () => {
+      try {
+        const { detectVulkanGpu } = require("../utils/vulkanDetection");
+        return await detectVulkanGpu();
+      } catch (error) {
+        return { available: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("get-computer-profile", () =>
+      require("./computerProfile").readComputerProfile()
+    );
+
+    ipcMain.handle("get-local-setup-space", () => readLocalSetupSpace());
+
+    ipcMain.handle("get-llama-vulkan-status", async () => {
+      try {
+        if (!this._llamaVulkanManager) {
+          const LlamaVulkanManager = require("./llamaVulkanManager");
+          this._llamaVulkanManager = new LlamaVulkanManager();
+        }
+        return this._llamaVulkanManager.getStatus();
+      } catch (error) {
+        return { supported: false, downloaded: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("download-llama-vulkan-binary", async (event) => {
+      try {
+        if (!this._llamaVulkanManager) {
+          const LlamaVulkanManager = require("./llamaVulkanManager");
+          this._llamaVulkanManager = new LlamaVulkanManager();
+        }
+
+        // Stop Vulkan server before downloading to release file locks on DLLs (Windows EBUSY)
+        const modelManager = require("./modelManagerBridge").default;
+        if (modelManager.serverManager.activeBackend === "vulkan") {
+          await modelManager.stopServer().catch((err) => {
+            debugLogger.warn("Failed to stop Vulkan server before download", {
+              error: err.message,
+            });
+          });
+        }
+
+        const result = await this._llamaVulkanManager.download((downloaded, total) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("llama-vulkan-download-progress", {
+              downloaded,
+              total,
+              percentage: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+            });
+          }
+        });
+
+        if (result.success) {
+          process.env.LLAMA_VULKAN_ENABLED = "true";
+          delete process.env.LLAMA_GPU_BACKEND;
+          modelManager.serverManager.cachedServerBinaryPaths = null;
+          await this.environmentManager.saveAllKeysToEnvFile().catch(() => {});
+          // The next inference picks up the new Vulkan binary. The pack can land in
+          // the background after onboarding, so an answer in progress finishes first.
+          modelManager.stopServerWhenIdle({ cancelOnReuse: false }).catch(() => {});
+        }
+
+        return result;
+      } catch (error) {
+        debugLogger.error("Vulkan binary download failed", {
+          error: error.message,
+          stack: error.stack,
+        });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("cancel-llama-vulkan-download", async () => {
+      if (this._llamaVulkanManager) {
+        return { success: this._llamaVulkanManager.cancelDownload() };
+      }
+      return { success: false };
+    });
+
+    ipcMain.handle("delete-llama-vulkan-binary", async () => {
+      try {
+        if (!this._llamaVulkanManager) {
+          const LlamaVulkanManager = require("./llamaVulkanManager");
+          this._llamaVulkanManager = new LlamaVulkanManager();
+        }
+
+        const modelManager = require("./modelManagerBridge").default;
+        if (modelManager.serverManager.activeBackend === "vulkan") {
+          await modelManager.stopServer();
+        }
+
+        const result = await this._llamaVulkanManager.deleteBinary();
+
+        delete process.env.LLAMA_VULKAN_ENABLED;
+        delete process.env.LLAMA_GPU_BACKEND;
+        modelManager.serverManager.cachedServerBinaryPaths = null;
+        this.environmentManager.saveAllKeysToEnvFile().catch(() => {});
+
+        return result;
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("get-log-level", async () => {
+      return debugLogger.getLevel();
+    });
+
+    ipcMain.handle("app-log", async (event, entry) => {
+      debugLogger.logEntry(entry);
+      return { success: true };
+    });
+
+    const SYSTEM_SETTINGS_URLS = {
+      darwin: {
+        microphone: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+        sound: "x-apple.systempreferences:com.apple.preference.sound?input",
+        accessibility:
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        systemAudio:
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        screenRecording:
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        calendars: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
+        loginItems: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+      },
+      win32: {
+        microphone: "ms-settings:privacy-microphone",
+        sound: "ms-settings:sound",
+        loginItems: "ms-settings:startupapps",
+      },
+    };
+
+    const openSystemSettings = async (settingType) => {
+      const platform = process.platform;
+      const urls = SYSTEM_SETTINGS_URLS[platform];
+      const useAppPicker =
+        platform === "darwin" && settingType === "accessibility" && usesAppControlPicker();
+      const url = useAppPicker ? PRIVACY_SETTINGS_URL : urls?.[settingType];
+
+      if (!url) {
+        // Platform doesn't support this settings URL
+        const messages = {
+          microphone: i18nMain.t("systemSettings.microphone"),
+          sound: i18nMain.t("systemSettings.sound"),
+          accessibility: i18nMain.t("systemSettings.accessibility"),
+          systemAudio: i18nMain.t("systemSettings.systemAudio"),
+          screenRecording: i18nMain.t("systemSettings.screenRecording"),
+          loginItems: i18nMain.t("systemSettings.loginItems"),
+        };
+        return {
+          success: false,
+          error:
+            messages[settingType] || `${settingType} settings are not available on this platform.`,
+        };
+      }
+
+      try {
+        await shell.openExternal(url);
+        if (useAppPicker) void this.clipboardManager.requestPostEventAccess();
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(`Failed to open ${settingType} settings:`, error);
+        return { success: false, error: error.message };
+      }
+    };
+
+    ipcMain.handle("open-microphone-settings", () => openSystemSettings("microphone"));
+    ipcMain.handle("open-sound-input-settings", () => openSystemSettings("sound"));
+    ipcMain.handle("get-system-default-microphone", (_event, options = {}) =>
+      resolveSystemDefaultMicrophone({
+        refresh: options?.refresh === true,
+        wait: options?.wait !== false,
+      })
+    );
+    ipcMain.handle("open-accessibility-settings", () => openSystemSettings("accessibility"));
+    ipcMain.handle("open-system-audio-settings", () => openSystemSettings("systemAudio"));
+    ipcMain.handle("open-screen-recording-settings", () => openSystemSettings("screenRecording"));
+    ipcMain.handle("open-login-items-settings", () => openSystemSettings("loginItems"));
+
+    ipcMain.handle("capture-screen-context", async (event) => {
+      // A verdict still on its way is waited for below.
+      const held = this.effectivePolicyManager.getCurrent();
+      if (held.status === "error" || isScreenContextBlocked(held)) return null;
+      const panel = this.windowManager.controlPanelWindow;
+      const hidePanel = isFromWindow(event, panel) && panel.isVisible() && !panel.isMinimized();
+      const focused = hidePanel && panel.isFocused();
+      const panelBounds = hidePanel ? panel.getBounds() : null;
+      let restorePanel = hidePanel;
+      const closed = () => {
+        restorePanel = false;
+      };
+      if (hidePanel) {
+        panel.once("close", closed);
+        panel.hide();
+      }
+      try {
+        if (hidePanel) await new Promise((resolve) => setTimeout(resolve, 80));
+        // Outside the Control Panel, capture immediately at the invocation moment;
+        // the policy verdict resolves concurrently and decides whether to
+        // return it. null matches capture's contract — a screenshot must never
+        // break the dictation it accompanies.
+        // The target's window rect picks the display it is on rather than the one
+        // under the cursor, and the panel reposition has normally cached it already.
+        // A failed rect read falls back to the cursor rather than rejecting: the
+        // policy branch below can abandon this promise, and capture's contract is
+        // to yield null, never to throw.
+        const targetPid = this.textEditMonitor?.lastTargetPid;
+        const capturePromise = Promise.resolve(
+          panelBounds ??
+            (targetPid ? this.textEditMonitor.getTargetWindowBounds?.(targetPid) : null)
+        )
+          .catch(() => null)
+          .then((targetBounds) => screenContextCapture.captureActiveDisplay(targetBounds));
+        let timer;
+        try {
+          const snapshot = await Promise.race([
+            this.refreshEffectivePolicy(event),
+            new Promise((resolve) => {
+              timer = setTimeout(
+                () => resolve(this.effectivePolicyManager.getCurrent()),
+                POLICY_TIMEOUT_MS
+              );
+            }),
+          ]);
+          if (!snapshot.success || isScreenContextBlocked(snapshot)) return null;
+        } finally {
+          clearTimeout(timer);
+        }
+        return await capturePromise;
+      } finally {
+        if (hidePanel) panel.removeListener("close", closed);
+        if (
+          restorePanel &&
+          this.windowManager.controlPanelWindow === panel &&
+          !panel.isDestroyed()
+        ) {
+          if (focused) {
+            panel.show();
+            panel.focus();
+          } else panel.showInactive();
+        }
+      }
+    });
+
+    // Snapshot the launch-time TCC status so a mid-session grant (which macOS
+    // only honors after a relaunch) is detectable even if the renderer never
+    // checked before the user granted.
+    screenContextCapture.getAccessStatus();
+
+    ipcMain.handle("check-screen-recording-access", () => screenContextCapture.getAccessResult());
+
+    ipcMain.handle("request-screen-recording-access", async () => {
+      const status = await screenContextCapture.requestAccess();
+      if (process.platform === "darwin" && status !== "granted") {
+        await openSystemSettings("screenRecording");
+      }
+      return screenContextCapture.getAccessResult();
+    });
+
+    // Preserve the renderer setting while app-wide content protection is
+    // temporarily disabled for screen recording.
+    ipcMain.handle("screen-context-set-enabled", (event, enabled) => {
+      this.windowManager?.setScreenContextProtection(enabled);
+      return { success: true };
+    });
+
+    ipcMain.handle("open-calendar-privacy-settings", () => openSystemSettings("calendars"));
+
+    ipcMain.handle("toggle-media-playback", () => {
+      const mediaPlayer = require("./mediaPlayer");
+      return mediaPlayer.toggleMedia();
+    });
+
+    ipcMain.handle("pause-media-playback", () => {
+      const mediaPlayer = require("./mediaPlayer");
+      return mediaPlayer.pauseMedia();
+    });
+
+    ipcMain.handle("resume-media-playback", () => {
+      const mediaPlayer = require("./mediaPlayer");
+      return mediaPlayer.resumeMedia();
+    });
+
+    ipcMain.handle("request-microphone-access", async () => {
+      if (process.platform !== "darwin") {
+        return { granted: true, status: "granted" };
+      }
+      const granted = await systemPreferences.askForMediaAccess("microphone");
+      return { granted };
+    });
+
+    ipcMain.handle("check-microphone-access", () => {
+      if (process.platform !== "darwin") {
+        return { granted: true, status: "granted" };
+      }
+      const status = systemPreferences.getMediaAccessStatus("microphone");
+      return { granted: status === "granted", status };
+    });
+
+    const buildSystemAudioAccess = (partial = {}) => ({
+      granted: false,
+      status: "unsupported",
+      mode: "unsupported",
+      supportsPersistentGrant: false,
+      supportsPersistentPortalGrant: false,
+      supportsNativeCapture: false,
+      supportsOnboardingGrant: false,
+      requiresRuntimeSharePrompt: false,
+      strategy: "unsupported",
+      restoreTokenAvailable: false,
+      portalVersion: null,
+      ...partial,
+    });
+
+    const getLinuxSystemAudioAccess = async () => {
+      const capability = await this.linuxPortalAudioManager?.getCapability().catch((error) => ({
+        available: false,
+        supportsPersistentGrant: false,
+        supportsPersistentPortalGrant: false,
+        supportsSystemAudio: false,
+        supportsNativeCapture: false,
+        portalVersion: null,
+        error: error.message,
+      }));
+      const available = !!capability?.available;
+      const supportsSystemAudio = !!capability?.supportsSystemAudio;
+      const supportsNativeCapture = !!capability?.supportsNativeCapture;
+      const granted = available && supportsSystemAudio && supportsNativeCapture;
+      const helperError =
+        typeof capability?.error === "string" &&
+        !capability.error.includes("helper binary not found")
+          ? capability.error
+          : undefined;
+
+      return buildSystemAudioAccess({
+        granted,
+        status: granted ? "granted" : "unknown",
+        mode: granted ? "loopback" : "unsupported",
+        supportsNativeCapture,
+        strategy: granted ? "pipewire-loopback" : "unsupported",
+        portalVersion: capability?.portalVersion ?? null,
+        error: helperError,
+      });
+    };
+
+    // System audio is always capturable on Windows: via the native WASAPI
+    // process-loopback helper when available (hears every output device),
+    // otherwise via Chromium's default-device loopback in the renderer.
+    const getWindowsSystemAudioAccess = async ({ refreshCapability = false } = {}) => {
+      const capability = await this.windowsLoopbackAudioManager
+        ?.getCapability({ force: refreshCapability })
+        .catch(() => ({
+          available: false,
+        }));
+      const helperAvailable = !!capability?.available;
+
+      return buildSystemAudioAccess({
+        granted: true,
+        status: "granted",
+        mode: "loopback",
+        supportsNativeCapture: helperAvailable,
+        strategy: helperAvailable ? "wasapi-loopback" : "loopback",
+      });
+    };
+
+    const getSystemAudioAccess = async () => {
+      if (process.platform === "win32") {
+        return getWindowsSystemAudioAccess();
+      }
+
+      if (process.platform === "linux") {
+        return getLinuxSystemAudioAccess();
+      }
+
+      if (!this.audioTapManager?.isSupported()) {
+        return buildSystemAudioAccess();
+      }
+
+      const result = this.audioTapManager.checkAccess();
+      return buildSystemAudioAccess({
+        granted: result.granted,
+        status: result.status,
+        mode: "native",
+        strategy: "native",
+      });
+    };
+
+    ipcMain.handle("check-system-audio-access", () => getSystemAudioAccess());
+
+    ipcMain.handle("permission-guide-verify-system-audio", async () => {
+      if (!this.audioTapManager?.isSupported()) return buildSystemAudioAccess();
+      const result = await this.audioTapManager.requestAccess();
+      return buildSystemAudioAccess({ ...result, mode: "native", strategy: "native" });
+    });
+
+    ipcMain.handle("request-system-audio-access", async () => {
+      if (process.platform === "win32") {
+        return getWindowsSystemAudioAccess();
+      }
+
+      if (process.platform === "linux") {
+        return getLinuxSystemAudioAccess();
+      }
+
+      if (!this.audioTapManager?.isSupported()) {
+        return buildSystemAudioAccess();
+      }
+
+      try {
+        const result = await this.audioTapManager.requestAccess();
+        if (result.granted) {
+          return buildSystemAudioAccess({
+            granted: true,
+            status: "granted",
+            mode: "native",
+            strategy: "native",
+          });
+        }
+      } catch {
+        // Falls through to opening System Settings
+      }
+
+      await openSystemSettings("systemAudio");
+      const status = this.audioTapManager.getPermissionStatus();
+      return buildSystemAudioAccess({
+        granted: false,
+        status,
+        mode: "native",
+        strategy: "native",
+      });
+    });
+
+    ipcMain.handle("auth-clear-session", async (event) => {
+      try {
+        await Promise.race([
+          this.metaActivation?.close(),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]).catch(() => {});
+        let tokenState;
+        try {
+          const win = BrowserWindow.fromWebContents(event.sender);
+          if (win) {
+            await win.webContents.session.clearStorageData({ storages: ["cookies"] });
+          }
+        } finally {
+          // Retire cookie-authorized requests after cookie storage has settled.
+          tokenState = tokenStore.clear();
+        }
+        return {
+          success: tokenState.success,
+          tokenState,
+          ...(tokenState.success ? {} : { error: "Could not clear persisted bearer token" }),
+        };
+      } catch (error) {
+        debugLogger.error("Failed to clear auth session:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("auth-get-token", () => tokenStore.get());
+    ipcMain.handle("auth-get-token-state", () => tokenStore.getState());
+    ipcMain.handle("auth-set-token", (_event, token, expectedGeneration) => {
+      if (typeof token !== "string" || !token) {
+        // Surface silent rotation-to-empty so we can spot regressions where the
+        // renderer thinks it's persisting a token but the value never lands.
+        debugLogger.debug("auth-set-token ignored: empty or non-string token", {
+          type: typeof token,
+        });
+        return {
+          success: false,
+          code: "AUTH_CONTEXT_UNVALIDATED",
+          ...tokenStore.getState(),
+        };
+      }
+      return tokenStore.setIfGeneration(token, expectedGeneration);
+    });
+
+    // In production, VITE_* env vars aren't available in the main process because
+    // Vite only inlines them into the renderer bundle at build time. Load the
+    // runtime-env.json that the Vite build writes to src/dist/ as a fallback.
+    const runtimeEnv = (() => {
+      const fs = require("fs");
+      const envPath = path.join(__dirname, "..", "dist", "runtime-env.json");
+      try {
+        if (fs.existsSync(envPath)) return JSON.parse(fs.readFileSync(envPath, "utf8"));
+      } catch {}
+      return {};
+    })();
+
+    const getApiUrl = () =>
+      process.env.OPENWHISPR_API_URL ||
+      process.env.VITE_OPENWHISPR_API_URL ||
+      runtimeEnv.VITE_OPENWHISPR_API_URL ||
+      "";
+
+    const getAuthUrl = () =>
+      process.env.AUTH_URL ||
+      process.env.VITE_AUTH_URL ||
+      runtimeEnv.VITE_AUTH_URL ||
+      "https://auth.openwhispr.com";
+
+    const getSessionCookiesFromWindow = async (win) => {
+      const scopedUrls = [getAuthUrl(), getApiUrl()].filter(Boolean);
+      const cookiesByName = new Map();
+
+      for (const url of scopedUrls) {
+        try {
+          const scopedCookies = await win.webContents.session.cookies.get({ url });
+          for (const cookie of scopedCookies) {
+            if (!cookiesByName.has(cookie.name)) {
+              cookiesByName.set(cookie.name, cookie.value);
+            }
+          }
+        } catch (error) {
+          debugLogger.warn("Failed to read scoped auth cookies", {
+            url,
+            error: error.message,
+          });
+        }
+      }
+
+      // Fallback for older sessions where cookies are not URL-scoped as expected.
+      if (cookiesByName.size === 0) {
+        const allCookies = await win.webContents.session.cookies.get({});
+        for (const cookie of allCookies) {
+          if (!cookiesByName.has(cookie.name)) {
+            cookiesByName.set(cookie.name, cookie.value);
+          }
+        }
+      }
+
+      const cookieHeader = [...cookiesByName.entries()]
+        .map(([name, value]) => `${name}=${value}`)
+        .join("; ");
+
+      debugLogger.debug(
+        "Resolved auth cookies for cloud request",
+        {
+          cookieCount: cookiesByName.size,
+          scopedUrls,
+        },
+        "auth"
+      );
+
+      return cookieHeader;
+    };
+
+    const getSessionCookies = async (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!win) return "";
+      return getSessionCookiesFromWindow(win);
+    };
+
+    // Bearer auth is preferred. Cookie fallback covers the brief window before
+    // main.js's startup migration bridge runs (or if it failed for this user).
+    const getAuthHeaderFromWindow = async (win) => {
+      const token = tokenStore.get();
+      if (token) return { Authorization: `Bearer ${token}` };
+      const cookieHeader = win ? await getSessionCookiesFromWindow(win) : "";
+      return cookieHeader ? { Cookie: cookieHeader } : {};
+    };
+
+    const getAuthHeader = async (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return getAuthHeaderFromWindow(win);
+    };
+
+    // Honors system proxy via Electron's net stack. useSessionCookies:false so
+    // Electron doesn't auto-attach jar cookies on top of our explicit headers.
+    const controlOrigins = () =>
+      [getApiUrl(), getAuthUrl()].filter(Boolean).map((url) => new URL(url).origin);
+    const networkAllowed = (url) =>
+      devicePolicyNetworkAllowed(this.effectivePolicyManager.getCurrent(), url, controlOrigins());
+    this.isProductNetworkAllowed = networkAllowed;
+    const proxyFetch = async (url, init = {}) => {
+      const operation = this._productRequestContext.getStore();
+      const assertAllowed = () => {
+        if (
+          !networkAllowed(url) ||
+          (operation &&
+            !runningOperationAllowed(
+              this.effectivePolicyManager.getCurrent(),
+              operation.accountId,
+              app.getVersion(),
+              operation.channel,
+              operation.args
+            ))
+        )
+          throw Object.assign(new Error("Blocked by device policy"), {
+            code: "DEVICE_POLICY_BLOCKED",
+          });
+      };
+      assertAllowed();
+      const signals = [
+        init.signal,
+        operation?.signal,
+        this._remoteProductRetirement?.signal,
+      ].filter(Boolean);
+      const response = await net.fetch(url, {
+        ...init,
+        useSessionCookies: false,
+        signal: signals.length ? AbortSignal.any(signals) : undefined,
+      });
+      if (!operation?.preserveCreateReceipt || !response.ok) assertAllowed();
+      return response;
+    };
+    const withPolicyHeaders = (headers) => withPolicyRequestHeaders(headers, app.getVersion());
+    const handleCloudApiRequest = createCloudApiRequestHandler({
+      getApiUrl,
+      getAppVersion: () => app.getVersion(),
+      proxyFetch,
+      tokenStore,
+      logger: debugLogger,
+    });
+    const backgroundCloudApiRequest = createCloudApiRequestHandler({
+      getApiUrl,
+      getAppVersion: () => app.getVersion(),
+      tokenStore,
+      proxyFetch: (url, init) => proxyFetch(url, { ...init, signal: AbortSignal.timeout(10_000) }),
+    });
+    // Collectors have no renderer IPC operation to own their policy checks or
+    // cancellation, but their uploads follow the same backup rules as sync.
+    const requestBackgroundCloudApi = createProductHandler(
+      "cloud-api-request",
+      (_event, opts) => backgroundCloudApiRequest(opts),
+      true
+    );
+    const handleBackgroundCloudApiRequest = async (opts) => {
+      const origin = this.effectivePolicyManager.getCurrent();
+      const result = await requestBackgroundCloudApi(undefined, opts);
+      if (result?.code !== "DEVICE_POLICY_BLOCKED") return result;
+      const current = this.effectivePolicyManager.getCurrent();
+      // A settled backup denial has the API's discard semantics. Loading or a
+      // replacement identity only delays the original account's pending facts.
+      if (
+        current.success &&
+        current.policy?.dataRetention.cloudBackupAllowed === false &&
+        current.accountId === origin.accountId &&
+        current.authGeneration === opts.expectedAuthGeneration &&
+        origin.authGeneration === opts.expectedAuthGeneration
+      ) {
+        return { ...result, status: 403, code: "POLICY_CLOUD_BACKUP_BLOCKED" };
+      }
+      return result;
+    };
+    try {
+      const ActivationDatabase = require("better-sqlite3");
+      const activationDb = new ActivationDatabase(
+        path.join(app.getPath("userData"), "meta-activation.db")
+      );
+      activationDb.pragma("foreign_keys = ON");
+      this.metaActivation = new MetaActivation({
+        db: activationDb,
+        getScope: () =>
+          accountScopeBinding.resolveActiveAccountScope({
+            ...tokenStore.getState(),
+            binding: accountScopeBinding.read(),
+          }),
+        request: handleBackgroundCloudApiRequest,
+        logger: debugLogger,
+      });
+      this.metaActivation.start();
+      // A machine that slept through the hourly re-sync takes server time
+      // again on wake, before its next batch.
+      powerMonitor.on("resume", () => void this.metaActivation?.resync());
+    } catch {
+      // Marketing bookkeeping must never prevent ordinary dictation/startup.
+      debugLogger.warn("Activation storage unavailable");
+    }
+    // Dashboard funnel milestones (app sign-in, onboarding completion). Like
+    // activation, it must never stand in the way of dictation or startup.
+    try {
+      this.productEvents = new ProductEvents({
+        store: createProductEventsStore(productEventsFile()),
+        getScope: () =>
+          accountScopeBinding.resolveActiveAccountScope({
+            ...tokenStore.getState(),
+            binding: accountScopeBinding.read(),
+          }),
+        request: handleBackgroundCloudApiRequest,
+        getAppVersion: () => app.getVersion(),
+        logger: debugLogger,
+      });
+      void this.productEvents.flush();
+    } catch {
+      debugLogger.warn("Product events storage unavailable");
+    }
+    ipcMain.handle("product-events-record-app-session", (_event, context) =>
+      this.productEvents?.recordAppSession(context)
+    );
+    ipcMain.handle("product-events-record-onboarding-completed", (_event, completion) =>
+      this.productEvents?.recordOnboardingCompleted(completion)
+    );
+    ipcMain.handle("product-events-record-dictation", (_event, dictation) => {
+      const startedAt = Date.parse(dictation?.startedAt);
+      // History's recovery fallback uses the current account. A funnel fact
+      // needs a proven live origin instead, including an explicitly guest one.
+      if (
+        !Number.isFinite(startedAt) ||
+        startedAt < this.databaseManager._accountTrackedSince ||
+        startedAt > Date.now()
+      ) {
+        return;
+      }
+      const accountId = this.databaseManager._accountSpokenUnder(dictation.startedAt);
+      if (!accountId) return;
+      return this.productEvents?.recordDictationCompleted(
+        {
+          ...dictation,
+          // While onboarding holds the app only its try-it dictation can run.
+          practice: this.windowManager?.isOnboardingActive() !== false,
+        },
+        { accountId, authGeneration: null }
+      );
+    });
+    ipcMain.handle("activation-close", async () => {
+      await Promise.race([
+        this.metaActivation?.close(),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]).catch(() => {});
+    });
+    ipcMain.handle("activation-begin", () => this.metaActivation?.begin() ?? null);
+    ipcMain.handle("activation-stop", (_event, id) => {
+      if (typeof id === "string") this.metaActivation?.stopCapture(id);
+    });
+    ipcMain.handle("activation-finish", (_event, id, words) =>
+      this.metaActivation?.finish(id, words)
+    );
+    ipcMain.handle("activation-cancel", (_event, id) => this.metaActivation?.cancel(id));
+    const workspacePolicyManager = createWorkspacePolicyManager({
+      cachePath: path.join(app.getPath("userData"), "workspace-policy.json"),
+      getApiUrl,
+      getAppVersion: () => app.getVersion(),
+      proxyFetch,
+      tokenStore,
+      // Only the binding main validated may hand a verdict to a rotated credential.
+      getValidatedAccountId: () =>
+        accountScopeBinding.resolveActiveAccountScope({
+          ...tokenStore.getState(),
+          binding: accountScopeBinding.read(),
+        })?.accountId ?? null,
+      broadcast: (snapshot) => this.effectivePolicyManager?.updateWorkspace(snapshot),
+      logger: debugLogger,
+    });
+    let cookieGeneration = null;
+    // The credential generation whose session was last read. Until it is, no
+    // bearer doesn't prove a guest: a cookie session may await its migration.
+    let credentialsGeneration = null;
+    const getScope = () => {
+      const state = tokenStore.getState();
+      const active = accountScopeBinding.resolveActiveAccountScope({
+        ...state,
+        binding: accountScopeBinding.read(),
+      });
+      return {
+        // A binding the credential doesn't match names no account (see
+        // accountScopeBinding), so a guest or cookie session has none.
+        accountId:
+          active?.accountId ??
+          (typeof this.databaseManager.activeAccountId === "string"
+            ? this.databaseManager.activeAccountId
+            : null),
+        authGeneration: state.generation,
+        authenticated:
+          Boolean(state.token) ||
+          typeof this.databaseManager.activeAccountId === "string" ||
+          cookieGeneration === state.generation,
+      };
+    };
+    this.effectivePolicyManager = createEffectivePolicyManager({
+      devicePolicy: this.managedDevicePolicy,
+      workspacePolicyManager: {
+        heldPolicy: (request) => workspacePolicyManager.heldPolicy(request),
+        // A session cookie the API rejects has expired: with no bearer and no
+        // account this is a guest, not an identity waiting on its policy.
+        getPolicy: async (request) => {
+          const policy = await workspacePolicyManager.getPolicy(request);
+          if (
+            !request.authHeaders?.Authorization &&
+            typeof this.databaseManager.activeAccountId !== "string" &&
+            policy.code !== "POLICY_UNRESOLVABLE" &&
+            policy.httpStatus === 401
+          )
+            cookieGeneration = null;
+          return policy;
+        },
+      },
+      getScope,
+      broadcast: (snapshot, updatePolicy) => {
+        // Known restrictions still apply while the workspace decision is pending.
+        if (snapshot.status !== "loading" || !snapshot.deviceReady || snapshot.policy)
+          this._audioFeaturePolicy?.update(snapshot);
+        if (snapshot.success || snapshot.policy) this._meetingAdmission?.recheck();
+        if (snapshot.workspaceRequired || snapshot.authGeneration === credentialsGeneration)
+          this._localModelPolicy?.update(snapshot);
+        // The updater would take a verdict still loading for a failed lookup.
+        if (updatePolicy.status !== "loading") this.updateManager?.updatePolicy?.(updatePolicy);
+        if (
+          !snapshot.deviceReady ||
+          snapshot.localOnly ||
+          (snapshot.status === "error" && snapshot.managed)
+        )
+          this._stopRemoteProductWork();
+        else if (snapshot.success || snapshot.policy) {
+          this._retireDisallowedProductWork(snapshot);
+          if (snapshot.success) this._startRemoteProductWork();
+        }
+        broadcastToWindows("effective-policy-changed", snapshot);
+      },
+    });
+    this.refreshEffectivePolicy = async (event, { refresh = false, held = false } = {}) => {
+      const scope = getScope();
+      if (this.managedDevicePolicy.getSnapshot().status === "loading")
+        return this.effectivePolicyManager.getCurrent();
+      let authHeaders;
+      try {
+        authHeaders = event?.sender
+          ? await getAuthHeader(event)
+          : await getAuthHeaderFromWindow(
+              [this.windowManager.controlPanelWindow, this.windowManager.mainWindow].find(
+                (win) => win && !win.isDestroyed()
+              ) ??
+                // With no window yet, a cookie session is in the default session.
+                (session.defaultSession && { webContents: { session: session.defaultSession } })
+            );
+      } catch (error) {
+        debugLogger.warn("Policy credentials could not be read", { error: error.message });
+        if (scope.authGeneration !== tokenStore.getState().generation)
+          return this.effectivePolicyManager.getCurrent();
+        cookieGeneration = scope.authGeneration;
+        credentialsGeneration = scope.authGeneration;
+        // Not the server's verdict: only an account last seen managed fails closed.
+        this.effectivePolicyManager.updateWorkspace({
+          success: false,
+          code: "POLICY_CREDENTIALS_UNREADABLE",
+          accountId: scope.accountId,
+          authGeneration: scope.authGeneration,
+          managed: workspacePolicyManager.accountWasManaged(scope.accountId),
+        });
+        return this.effectivePolicyManager.getCurrent();
+      }
+      if (scope.authGeneration !== tokenStore.getState().generation)
+        return this.effectivePolicyManager.getCurrent();
+      // Other cookies in the jar say nothing about who this is, so none is sent.
+      const sessionCookie = SESSION_COOKIE_PATTERN.test(authHeaders.Cookie ?? "");
+      cookieGeneration = sessionCookie ? scope.authGeneration : null;
+      credentialsGeneration = scope.authGeneration;
+      const currentScope = getScope();
+      return this.effectivePolicyManager.getPolicy({
+        accountId: currentScope.accountId,
+        expectedAuthGeneration: scope.authGeneration,
+        authHeaders: authHeaders.Authorization || sessionCookie ? authHeaders : {},
+        refresh,
+        held,
+      });
+    };
+    this.getUpdatePolicy = async (options) => {
+      await this.refreshEffectivePolicy(undefined, options);
+      return this.effectivePolicyManager.getUpdatePolicy();
+    };
+    const { createAudioFeaturePolicy } = require("./audioFeaturePolicy");
+    // CLI and tray-only sessions also refresh while a native server stays loaded.
+    this._localModelPolicyRefreshTimer = this._localModelPolicy?.startPeriodicRefresh(
+      5 * 60 * 1000
+    );
+    this._audioFeaturePolicy = createAudioFeaturePolicy({
+      getPolicy: (event, options) => this.refreshEffectivePolicy(event, options),
+      onBlocked: (purpose, code) => {
+        if (purpose === "meeting") this._stopMeetingForPolicy?.(code);
+      },
+      onChange: () => this._syncMeetingDetectorPolicy?.(),
+      logger: debugLogger,
+    });
+    this._meetingAdmission = createMeetingRecordingAdmission({
+      getPolicy: () => this._audioFeaturePolicy.activeMeetingPolicy(),
+      resolveFeature: () =>
+        this.managedMeetingPolicy.isMeetingRecordingDisabled()
+          ? { success: false, code: "POLICY_MEETING_RECORDING_DISABLED" }
+          : this._audioFeaturePolicy.resolve("meeting"),
+      getNote: (id) => this.databaseManager.getNote(id),
+      getEvent: (id) => this.databaseManager.getCalendarEventById(id),
+      generation: () => tokenStore.getState().generation,
+      confirmInternal: async (owner, signal) => {
+        const parent = BrowserWindow.fromWebContents(owner);
+        if (!parent || parent.isDestroyed() || signal.aborted) return false;
+        // A meeting hotkey leaves the panel behind the call; the question must be seen.
+        if (parent === this.windowManager.controlPanelWindow) this.windowManager.showControlPanel();
+        const { response } = await require("electron").dialog.showMessageBox(parent, {
+          type: "question",
+          message: i18nMain.t("notes.meeting.internalAttendeesQuestion"),
+          buttons: [
+            i18nMain.t("notes.meeting.internalAttendeesConfirm"),
+            i18nMain.t("common.cancel"),
+          ],
+          defaultId: 1,
+          cancelId: 1,
+          signal,
+        });
+        return response === 0;
+      },
+      onRevoked: ({ owner, sessionId }, code, active) => {
+        if (active) this._stopMeetingForPolicy(code, sessionId);
+        if (!owner?.isDestroyed?.()) {
+          try {
+            owner?.send?.("meeting-recording-admission-revoked", { sessionId, code });
+          } catch (error) {
+            debugLogger.warn("Meeting admission owner unavailable", { error: error.message });
+          }
+        }
+      },
+    });
+    this.databaseManager.onCalendarEventsUpdated = (noteId) =>
+      this._meetingAdmission.recheck(noteId);
+    ipcMain.handle("check-meeting-recording-start", (event, options) =>
+      this._meetingAdmission.prepare(event.sender, options)
+    );
+    ipcMain.on("release-meeting-recording-start", (event, sessionId) =>
+      this._meetingAdmission.release(event.sender, sessionId)
+    );
+
+    this.windowManager.getMeetingAttendeePolicy = () =>
+      this._audioFeaturePolicy.activeMeetingPolicy();
+    this.windowManager.getMeetingRecordingRefusal = () =>
+      this._audioFeaturePolicy.failure("meeting");
+    this.windowManager.resolveMeetingRecordingRefusal = () =>
+      this._audioFeaturePolicy.resolve("meeting");
+
+    // Signed in, load the policy now (from cache when offline): an app started
+    // to the tray has no control panel to fetch it, and the tray item, the
+    // meeting hotkey, and calendar reminders all read this snapshot.
+    this._audioFeaturePolicy.update(this.effectivePolicyManager.getCurrent());
+
+    registerProductHelpIpc({
+      ipcMain,
+      fetch: proxyFetch,
+      canLookup: createConnectorPolicyResolver({
+        getAuthHeader: createConnectorAuthLookup({
+          hasBearerToken: () => Boolean(tokenStore.get()),
+          windowFor: (event) => BrowserWindow.fromWebContents(event.sender),
+          authHeaderFor: getAuthHeaderFromWindow,
+        }),
+        getPolicy: (options) =>
+          this.effectivePolicyManager.getPolicy({ ...options, accountId: getScope().accountId }),
+        peekPolicy: (options) =>
+          this.effectivePolicyManager.peekPolicy({ ...options, accountId: getScope().accountId }),
+        getAuthGeneration: () => tokenStore.getState().generation,
+        classifySnapshot: (snapshot) => remoteHelpPolicyState(snapshot, app.getVersion()),
+        fallbackOnUnavailable: true,
+      }),
+      getBasics: async () => ({
+        // checkAccess reads the cached permission verdict; it never requests access.
+        systemAudioPermission:
+          process.platform === "darwin"
+            ? this.audioTapManager?.checkAccess()?.status || "unknown"
+            : "unknown",
+        platform: process.platform,
+        version: app.getVersion(),
+        microphonePermission:
+          process.platform === "linux"
+            ? "unknown"
+            : systemPreferences.getMediaAccessStatus("microphone"),
+        accessibilityPermission:
+          process.platform === "darwin"
+            ? (await this.clipboardManager.checkAccessibilityPermissions(true))
+              ? "granted"
+              : "not-granted"
+            : "not-applicable",
+      }),
+    });
+    if (this.connectorManager) {
+      registerConnectorIpc({
+        ipcMain,
+        manager: this.connectorManager,
+        getPolicyState: createConnectorPolicyResolver({
+          getAuthHeader: createConnectorAuthLookup({
+            hasBearerToken: () => Boolean(tokenStore.get()),
+            windowFor: (event) => BrowserWindow.fromWebContents(event.sender),
+            authHeaderFor: getAuthHeaderFromWindow,
+          }),
+          getPolicy: (options) =>
+            this.effectivePolicyManager.getPolicy({ ...options, accountId: getScope().accountId }),
+          peekPolicy: (options) =>
+            this.effectivePolicyManager.peekPolicy({ ...options, accountId: getScope().accountId }),
+          getAuthGeneration: () => tokenStore.getState().generation,
+        }),
+        // The account bound to the credential in use, the same binding
+        // get-active-account-scope serves (not the separately synced
+        // database scope, which lags a sign-in or account switch).
+        getAccountScope: () =>
+          accountScopeBinding.resolveActiveAccountScope({
+            ...tokenStore.getState(),
+            binding: accountScopeBinding.read(),
+          }),
+        findContacts: (query) =>
+          searchContacts(this.databaseManager.getContactLookupSources(), query),
+        noteAttendees: createNoteAttendeesLookup({
+          getContactLookupSources: () => this.databaseManager.getContactLookupSources(),
+          getCalendarEventById: (id) => this.databaseManager.getCalendarEventById(id),
+          getSpeakerMappings: (noteId) => this.databaseManager.getSpeakerMappings(noteId),
+          getSpeakerProfiles: () => this.databaseManager.getSpeakerProfiles(),
+          getGmailAddress: async () =>
+            (await this.connectorManager.connectorStatus("gmail"))?.accountLabel ?? null,
+        }),
+      });
+    }
+    registerSkillsIpc({
+      ipcMain,
+      library: this.skillLibrary,
+      shell,
+      broadcast: broadcastToWindows,
+    });
+    const { createEnterpriseAudioCredentials } = require("./enterpriseAudioCredentials");
+    const {
+      createEnterpriseAudioTransport,
+      requiresEnterpriseTransport,
+    } = require("./enterpriseAudioTransport");
+    const {
+      createEnterpriseAudioRuntime,
+      createEnterpriseAudioRequestResolver,
+      createEnterpriseAudioConfigChangedError,
+      enforcesEnterpriseTranscription,
+    } = require("./enterpriseAudioRuntime");
+    let audioRetirement = new AbortController();
+    this._retireEnterpriseAudio = (required = false, reason = undefined) => {
+      audioRetirement.abort(createEnterpriseAudioConfigChangedError());
+      audioRetirement = new AbortController();
+      if (required || this._activeEnterpriseAudioMeeting) void this._stopMeetingForPolicy?.(reason);
+    };
+    // _enterpriseAudioOwner is the last binding enterprise audio ran under. A
+    // token rotation drops the binding (its auth generation is stale) but keeps
+    // the owner, so a snapshot for the same account, workspace and config
+    // doesn't retire the running work.
+    const sameEnterpriseAudioScope = (previous, next) =>
+      previous?.accountId === next.accountId && previous?.workspaceId === next.workspaceId;
+    // Personal uploads also have a workspace owner, even without an enterprise
+    // audio binding. Reconfirming the same personal workspace keeps them alive.
+    let dictationWorkspaceBinding;
+    const observeDictationWorkspace = (scope) => {
+      if (
+        !dictationWorkspaceBinding ||
+        !sameEnterpriseAudioScope(dictationWorkspaceBinding, scope)
+      ) {
+        dictationWorkspaceBinding?.controller.abort(createEnterpriseAudioConfigChangedError());
+        dictationWorkspaceBinding = { ...scope, controller: new AbortController() };
+      }
+      return dictationWorkspaceBinding.controller.signal;
+    };
+    const enterpriseAudioStopReason = (previous, next) =>
+      !previous
+        ? undefined
+        : previous.accountId !== next.accountId
+          ? "accountChanged"
+          : previous.workspaceId !== next.workspaceId
+            ? "workspaceChanged"
+            : undefined;
+    // The binding a snapshot continues: the current one or, after a token
+    // rotation, the owner when the snapshot keeps its account and workspace.
+    const continuedEnterpriseAudioBinding = (snapshot) =>
+      this._enterpriseAudioBinding ??
+      (sameEnterpriseAudioScope(this._enterpriseAudioOwner, snapshot)
+        ? this._enterpriseAudioOwner
+        : null);
+    const bindEnterpriseAudio = (binding) => {
+      this._enterpriseAudioBinding = binding;
+      if (binding?.config) this._enterpriseAudioOwner = binding;
+    };
+    this.enterpriseAudioCredentials = createEnterpriseAudioCredentials({
+      directory: path.join(app.getPath("userData"), "enterprise-audio-keys"),
+      onChanged: () => this._retireEnterpriseAudio(),
+    });
+    const enterpriseAudioTransport = createEnterpriseAudioTransport({
+      resolveProxy: (url) => require("electron").session.defaultSession.resolveProxy(url),
+    });
+    const getEnterpriseAudioRequest = createEnterpriseAudioRequestResolver({
+      getScopeRevision: () => this._enterpriseAudioScopeRevision ?? 0,
+      getIdentity: () => {
+        const state = tokenStore.getState();
+        const scope = accountScopeBinding.resolveActiveAccountScope({
+          ...state,
+          binding: accountScopeBinding.read(),
+        });
+        return {
+          accountId: scope?.accountId ?? null,
+          authGeneration: state.generation,
+          signedIn: Boolean(state.token || this.databaseManager.activeAccountId),
+        };
+      },
+      getBinding: () => this._enterpriseAudioBinding,
+      setBinding: bindEnterpriseAudio,
+      getAuthHeaders: getAuthHeader,
+      getWorkspaces: async (authHeaders) => {
+        const response = await proxyFetch(`${getApiUrl()}/api/workspaces`, {
+          headers: { ...authHeaders, "x-openwhispr-version": app.getVersion() },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!response.ok) throw new Error("Enterprise workspace lookup failed");
+        const workspaces = (await response.json()).data;
+        if (!Array.isArray(workspaces)) throw new Error("Enterprise workspace response is invalid");
+        return workspaces;
+      },
+      getConfig: (request) => {
+        this._enterpriseAudioScope = {
+          accountId: request.accountId,
+          workspaceId: request.workspaceId,
+          authGeneration: request.expectedAuthGeneration,
+        };
+        observeDictationWorkspace(this._enterpriseAudioScope);
+        return this.enterpriseIdentityManager.getConfig(request);
+      },
+    });
+    const matchesEnterpriseAudioScope = (snapshot) => {
+      const scope = this._enterpriseAudioScope;
+      return (
+        scope &&
+        scope.accountId === snapshot.accountId &&
+        scope.workspaceId === snapshot.workspaceId &&
+        scope.authGeneration === snapshot.authGeneration
+      );
+    };
+    // Give a confirmed personal scope the same freshness window as an enterprise config.
+    let personalDictationScope;
+    const rememberPersonalDictationScope = (scope) => {
+      personalDictationScope = {
+        ...scope,
+        revision: this._enterpriseAudioScopeRevision,
+        expiresAt: Date.now() + CONFIG_REFRESH_MS,
+      };
+    };
+    this.enterpriseIdentityManager = createEnterpriseIdentityManager({
+      cachePath: path.join(app.getPath("userData"), "managed-enterprise-config.json"),
+      getApiUrl,
+      getAppVersion: () => app.getVersion(),
+      proxyFetch,
+      tokenStore,
+      enterpriseFetch: (url, init, network, bundles, identity) => {
+        if (!requiresEnterpriseTransport(network)) return proxyFetch(url, init);
+        const caPem = network.caBundleId
+          ? bundles?.find((bundle) => bundle.id === network.caBundleId)?.pem
+          : undefined;
+        if (network.caBundleId && !caPem)
+          throw Object.assign(new Error("Certificate bundle is unavailable"), {
+            code: "MANAGED_CA_UNAVAILABLE",
+          });
+        return enterpriseAudioTransport.request(url, {
+          ...init,
+          network,
+          caPem,
+          readCredential: (slot) =>
+            this.enterpriseAudioCredentials.read(identity.accountId, identity.workspaceId, slot),
+        });
+      },
+      broadcast: (snapshot) => {
+        if (!matchesEnterpriseAudioScope(snapshot)) return;
+        if (snapshot.code === "ENTERPRISE_REQUIRED") rememberPersonalDictationScope(snapshot);
+        else {
+          if (
+            personalDictationScope &&
+            sameEnterpriseAudioScope(personalDictationScope, snapshot)
+          ) {
+            dictationWorkspaceBinding?.controller.abort(createEnterpriseAudioConfigChangedError());
+            dictationWorkspaceBinding = undefined;
+          }
+          personalDictationScope = null;
+        }
+        const old = continuedEnterpriseAudioBinding(snapshot);
+        const required = enforcesEnterpriseTranscription(snapshot);
+        if (
+          old &&
+          (!sameEnterpriseAudioScope(old, snapshot) ||
+            old.generation !== snapshot.config?.generation)
+        )
+          this._retireEnterpriseAudio(required, enterpriseAudioStopReason(old, snapshot));
+        else if (!old && required) this._retireEnterpriseAudio(true);
+        if (snapshot.config)
+          bindEnterpriseAudio({ ...snapshot, generation: snapshot.config.generation });
+        else {
+          // A known enforced workspace whose config was evicted keeps failing closed.
+          this._enterpriseAudioBinding = required ? snapshot : null;
+          this._retireEnterpriseAudio(required);
+        }
+        broadcastToWindows("managed-enterprise-config-changed", snapshot);
+      },
+      logger: debugLogger,
+    });
+    // Even callers that only use verbatim text cause this endpoint to run cleanup.
+    const dictationWorkspace = () => {
+      const databaseWorkspace = this.databaseManager.activeWorkspaceId;
+      const enterpriseWorkspace = this._enterpriseAudioScope?.workspaceId;
+      if (databaseWorkspace && enterpriseWorkspace && databaseWorkspace !== enterpriseWorkspace)
+        throw createEnterpriseAudioConfigChangedError();
+      return databaseWorkspace ?? enterpriseWorkspace ?? null;
+    };
+    const captureDictationWorkspace = () => {
+      try {
+        return observeDictationWorkspace({
+          accountId: getScope().accountId,
+          workspaceId: dictationWorkspace(),
+        });
+      } catch (error) {
+        // A disagreement at dispatch stays a refusal even if the scopes later agree.
+        return AbortSignal.abort(error);
+      }
+    };
+    const getDictationCleanupSignal = async (event, workspaceSignal) => {
+      workspaceSignal.throwIfAborted();
+      const { accountId, authGeneration, authenticated } = getScope();
+      const workspaceId = dictationWorkspace();
+      if (workspaceSignal !== observeDictationWorkspace({ accountId, workspaceId }))
+        throw createEnterpriseAudioConfigChangedError();
+      const revision = this._enterpriseAudioScopeRevision;
+      if (!authenticated && !workspaceId) return workspaceSignal;
+      if (!accountId) throw createEnterpriseAudioConfigChangedError();
+      if (
+        personalDictationScope &&
+        personalDictationScope.accountId === accountId &&
+        personalDictationScope.authGeneration === authGeneration &&
+        personalDictationScope.workspaceId === workspaceId &&
+        personalDictationScope.revision === revision &&
+        personalDictationScope.expiresAt > Date.now()
+      )
+        return workspaceSignal;
+
+      let personal = true;
+      if (workspaceId) {
+        try {
+          const cleanup = await this.enterpriseIdentityManager.resolveProvider({
+            accountId,
+            workspaceId,
+            expectedAuthGeneration: authGeneration,
+            authHeaders: await getAuthHeader(event),
+            inferenceScope: "dictationCleanup",
+            setupMode: "manual",
+          });
+          if (cleanup.managed)
+            throw Object.assign(new Error(i18nMain.t("common.managedPolicyConflict")), {
+              code: "PROVIDER_POLICY_CONFLICT",
+              messageKey: "common.managedPolicyConflict",
+            });
+          personal = false;
+        } catch (error) {
+          if (error.code !== "ENTERPRISE_REQUIRED") throw error;
+        }
+      } else {
+        // At sign-in and during a switch, a missing workspace can still be resolving.
+        if (await getEnterpriseAudioRequest(event, undefined, "load"))
+          throw createEnterpriseAudioConfigChangedError();
+      }
+      workspaceSignal.throwIfAborted();
+      const current = getScope();
+      if (
+        revision !== this._enterpriseAudioScopeRevision ||
+        workspaceId !== dictationWorkspace() ||
+        current.accountId !== accountId ||
+        current.authGeneration !== authGeneration ||
+        current.authenticated !== authenticated
+      )
+        throw createEnterpriseAudioConfigChangedError();
+      if (personal) {
+        rememberPersonalDictationScope({ accountId, workspaceId, authGeneration });
+        return workspaceSignal;
+      }
+      return AbortSignal.any([workspaceSignal, audioRetirement.signal]);
+    };
+    const transcribeAssemblyAiDictation = async (event, options) => {
+      options.signal.throwIfAborted();
+      const operation = this._productRequestContext.getStore();
+      const cleanupSignal = await getDictationCleanupSignal(
+        event,
+        operation.dictationWorkspaceAtDispatch
+      );
+      operation.dictationCleanupSignal = cleanupSignal;
+      const signal = AbortSignal.any([options.signal, cleanupSignal]);
+      signal.throwIfAborted();
+      try {
+        return await transcribeAssemblyAiRecording(
+          { ...options, signal, split: require("./ffmpegUtils").splitAudioFile },
+          proxyFetch
+        );
+      } finally {
+        // A transport can finish reading an already-buffered response after retirement.
+        signal.throwIfAborted();
+      }
+    };
+    this.getEnterpriseAudioRequest = getEnterpriseAudioRequest;
+    this.enterpriseAudioTransport = enterpriseAudioTransport;
+    this.enterpriseAudioRuntime = createEnterpriseAudioRuntime({
+      resolveProvider: async (request) => {
+        const resolved = await this.enterpriseIdentityManager.resolveProvider(request);
+        if (!resolved.managed) return resolved;
+        const snapshot = await this.effectivePolicyManager.getPolicy(request);
+        if (!snapshot.success || (snapshot.managed && !snapshot.policy))
+          throw Object.assign(new Error(i18nMain.t("common.policyUnresolved")), {
+            code: "POLICY_UNRESOLVABLE",
+          });
+        const { isTranscriptionSelectionAllowed } = await import("../stores/policyRules.ts");
+        if (
+          !isTranscriptionSelectionAllowed(
+            {
+              status: snapshot.managed ? "managed" : "unmanaged",
+              policy: snapshot.policy ?? null,
+              appVersion: app.getVersion(),
+            },
+            { mode: "enterprise", provider: resolved.provider }
+          )
+        ) {
+          if (resolved.mode !== "managed_required" && resolved.allowManualSetup)
+            return { ...resolved, managed: false };
+          throw Object.assign(new Error(i18nMain.t("common.managedPolicyConflict")), {
+            code: "PROVIDER_POLICY_CONFLICT",
+            messageKey: "common.managedPolicyConflict",
+          });
+        }
+        return resolved;
+      },
+      transport: enterpriseAudioTransport,
+      credentials: this.enterpriseAudioCredentials,
+      systemFetch: proxyFetch,
+      getRetirementSignal: () => audioRetirement.signal,
+    });
+    registerEnterpriseAudioSetup({
+      ipcMain,
+      getRequest: getEnterpriseAudioRequest,
+      credentials: this.enterpriseAudioCredentials,
+      runtime: this.enterpriseAudioRuntime,
+      transport: enterpriseAudioTransport,
+      getVersion: () => app.getVersion(),
+      bootstrapDirectory: app.getPath("userData"),
+      getRetirementSignal: () => audioRetirement.signal,
+      systemFetch: proxyFetch,
+      fetchApi: async (request, endpoint, { method = "GET", body } = {}) => {
+        const response = await proxyFetch(`${getApiUrl()}${endpoint}`, {
+          method,
+          headers: {
+            ...request.authHeaders,
+            "x-openwhispr-version": app.getVersion(),
+            ...(body ? { "Content-Type": "application/json" } : {}),
+          },
+          ...(body ? { body: JSON.stringify(body) } : {}),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!response.ok) {
+          const detail = await response.json().catch(() => null);
+          throw Object.assign(new Error(`Enterprise setup request failed (${response.status})`), {
+            status: response.status,
+            code: typeof detail?.code === "string" ? detail.code : undefined,
+          });
+        }
+        return (await response.json()).data;
+      },
+    });
+    const resolveEnterpriseRuntime = async (event, provider, model, config = {}) => {
+      const manual = {
+        provider,
+        model,
+        apiKey: config.apiKey || "",
+        enterprise: require("./enterpriseProviderErrors").pickEnterpriseConfig(config),
+      };
+      const context = config.managedContext;
+      if (!context) return manual;
+      const authHeaders = await getAuthHeader(event);
+      const resolved = await this.enterpriseIdentityManager.resolveProvider({
+        accountId: context.accountId,
+        workspaceId: context.workspaceId,
+        expectedAuthGeneration: context.authGeneration,
+        inferenceScope: context.inferenceScope,
+        setupMode: context.setupMode,
+        authHeaders,
+      });
+      if (!resolved.managed) {
+        throw Object.assign(
+          new Error("Managed enterprise configuration changed. Retry the request."),
+          { code: "MANAGED_CONFIG_CHANGED" }
+        );
+      }
+      if (
+        resolved.provider !== context.provider ||
+        resolved.generation !== context.generation ||
+        resolved.version !== context.providerVersion
+      ) {
+        throw Object.assign(
+          new Error("Managed enterprise configuration changed. Retry the request."),
+          { code: "MANAGED_CONFIG_CHANGED" }
+        );
+      }
+      if (context.inferenceScope === "transcription") {
+        const audio = await this.enterpriseAudioRuntime.resolve(
+          await getEnterpriseAudioRequest(event, context),
+          "batch"
+        );
+        if (
+          !audio ||
+          audio.generation !== context.generation ||
+          audio.providerVersion !== context.providerVersion ||
+          audio.provider !== context.provider
+        )
+          throw Object.assign(new Error("Enterprise audio configuration changed"), {
+            code: "MANAGED_CONFIG_CHANGED",
+          });
+        return {
+          provider: audio.provider,
+          model: audio.model,
+          apiKey: "",
+          enterprise: { audioProfile: audio },
+        };
+      }
+      if (resolved.provider === "bedrock") {
+        return {
+          provider: resolved.provider,
+          model: resolved.model,
+          apiKey: "",
+          enterprise: {
+            bedrockRegion: resolved.config.region,
+            managedCredentialProvider: resolved.credentialProvider,
+          },
+        };
+      }
+      return {
+        provider: resolved.provider,
+        model: resolved.model,
+        apiKey: "",
+        enterprise: {
+          azureEndpoint: resolved.config.endpoint,
+          azureApiVersion: resolved.config.apiVersion,
+          managedTokenProvider: resolved.tokenProvider,
+        },
+      };
+    };
+    const { createManagedTranscriptionExecutor } = require("./managedTranscriptionExecutor");
+    const executeManagedTranscription = createManagedTranscriptionExecutor({
+      resolveEnterpriseRuntime,
+      proxyFetch,
+      buildUrl: async (endpoint, deployment, apiVersion) => {
+        const { buildManagedAzureTranscriptionUrl } = await import("../utils/urlUtils.ts");
+        return buildManagedAzureTranscriptionUrl(endpoint, deployment, apiVersion);
+      },
+    });
+    this.executeManagedTranscription = executeManagedTranscription;
+    const transcribeManagedAudio = async (event, route, input) => {
+      const { runAbortableOperation } = require("./enterpriseProviderErrors");
+      const runtime = await runAbortableOperation(
+        () =>
+          resolveEnterpriseRuntime(event, route.provider, null, {
+            managedContext: route.context,
+          }),
+        input.signal
+      );
+      const signal = AbortSignal.any(
+        [input.signal, runtime.enterprise.audioProfile.signal].filter(Boolean)
+      );
+      const { transcribeManagedAudioFile } = require("./managedAudioFileTranscription");
+      const result = await transcribeManagedAudioFile({
+        ...input,
+        signal,
+        maxUploadBytes:
+          route.provider === "azure"
+            ? 25 * 1024 * 1024
+            : Math.min(
+                runtime.enterprise.audioProfile.section.maxUploadBytes ?? 25 * 1024 * 1024,
+                100 * 1024 * 1024
+              ),
+        transcribe: (audioBuffer, fileName, contentType) =>
+          executeManagedTranscription(event, route, {
+            audioBuffer,
+            fileName,
+            contentType,
+            prompt: input.prompt,
+            signal,
+          }),
+      });
+      return {
+        ...result,
+        ...(result.failedChunks
+          ? {
+              warning: i18nMain.t("enterprise.audio.partialUpload", { count: result.failedChunks }),
+            }
+          : {}),
+      };
+    };
+
+    handleRemoteProduct(
+      "managed-transcribe",
+      serializeIpcError(
+        async (event, { audioBuffer, fileName, mimeType, language, prompt, managed }) => {
+          return transcribeManagedAudio(
+            event,
+            { provider: managed.provider, context: managed.context, language },
+            {
+              audioBuffer: Buffer.from(audioBuffer),
+              fileName: fileName || "audio.webm",
+              contentType: mimeType || "audio/webm",
+              prompt,
+              signal: await trackTranscriptionRoute({
+                transport: "managed",
+                provider: managed.provider,
+              }),
+            }
+          );
+        }
+      )
+    );
+    const handleSttConfigRequest = createCloudConfigRequestHandler({
+      getApiUrl,
+      getAuthHeader,
+      proxyFetch,
+      withPolicyHeaders,
+      logger: debugLogger,
+      configPath: "stt-config",
+    });
+    const handleNoteRecordingConfigRequest = createCloudConfigRequestHandler({
+      getApiUrl,
+      getAuthHeader,
+      proxyFetch,
+      withPolicyHeaders,
+      logger: debugLogger,
+      configPath: "note-recording-config",
+    });
+
+    handleRemoteProduct("cloud-transcribe", async (event, audioBuffer, opts = {}) => {
+      const sender = event.sender;
+      const senderId = sender.id;
+      const requestId = crypto.randomUUID();
+      const controller = this._cloudTranscriptionRequests.begin(senderId, requestId);
+      const cancelSenderRequests = () => this._cloudTranscriptionRequests.cancelSender(senderId);
+      sender.once("destroyed", cancelSenderRequests);
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        const audioData = Buffer.from(audioBuffer);
+        // Reused for the local SQLite row so SyncService upserts the existing
+        // cloud row (filling in text) instead of creating a duplicate.
+        const clientTranscriptionId = crypto.randomUUID();
+        const multipartFields = {
+          source: "dictation",
+          language: opts.language,
+          prompt: opts.prompt,
+          sendLogs: opts.sendLogs,
+          clientType: "desktop",
+          appVersion: app.getVersion(),
+          clientVersion: app.getVersion(),
+          sessionId: this.sessionId,
+          clientTranscriptionId,
+          localDate: opts.localDate,
+          analyticsOccurredAt: opts.analyticsOccurredAt,
+          streamingFallbackReason: opts.streamingFallbackReason,
+          sttDetectedLanguage: opts.sttDetectedLanguage,
+          sttDetectedLanguageConfidence: opts.sttDetectedLanguageConfidence,
+          sttDetectedLanguageAudioSeconds: opts.sttDetectedLanguageAudioSeconds,
+          sttDetectedLanguageStatus: opts.sttDetectedLanguageStatus,
+          orukeetLanguageRouting: opts.orukeetLanguageRouting
+            ? JSON.stringify(opts.orukeetLanguageRouting)
+            : undefined,
+          orukeetCleanup: opts.orukeetCleanup ? JSON.stringify(opts.orukeetCleanup) : undefined,
+        };
+
+        debugLogger.debug("Cloud transcribe request", { audioSize: audioData.length }, "cloud-api");
+
+        if (audioData.length > CLOUD_INLINE_LIMIT) {
+          const { text, responses, lastResponse, warning } = await chunkedCloudTranscribe({
+            buffer: audioData,
+            apiUrl,
+            policyHeaders: withPolicyHeaders(authHeader),
+            multipartFields,
+            signal: controller.signal,
+          });
+          const sum = (field) => responses.reduce((s, r) => s + (r?.[field] || 0), 0);
+          return {
+            success: true,
+            text,
+            ...(warning ? { warning } : {}),
+            clientTranscriptionId,
+            wordsUsed: lastResponse?.wordsUsed,
+            wordsRemaining: lastResponse?.wordsRemaining,
+            plan: lastResponse?.plan,
+            limitReached: lastResponse?.limitReached || false,
+            sttProvider: lastResponse?.sttProvider,
+            sttModel: lastResponse?.sttModel,
+            sttProcessingMs: sum("sttProcessingMs"),
+            sttWordCount: sum("sttWordCount"),
+            sttLanguage: lastResponse?.sttLanguage,
+            audioDurationMs: sum("audioDurationMs"),
+          };
+        }
+
+        const { body, boundary } = buildMultipartBody(
+          audioData,
+          "audio.webm",
+          "audio/webm",
+          multipartFields
+        );
+        const url = new URL(`${apiUrl}/api/transcribe`);
+        const data = await postMultipart(url, body, boundary, withPolicyHeaders(authHeader), {
+          signal: AbortSignal.any([
+            controller.signal,
+            AbortSignal.timeout(CLOUD_UPLOAD_TIMEOUT_MS),
+          ]),
+          session: getInlineCloudUploadSession(),
+        });
+
+        debugLogger.debug(
+          "Cloud transcribe response",
+          { statusCode: data.statusCode },
+          "cloud-api"
+        );
+
+        const result = interpretTranscribeResponse(data);
+        return {
+          success: true,
+          text: result.text,
+          clientTranscriptionId,
+          wordsUsed: result.wordsUsed,
+          wordsRemaining: result.wordsRemaining,
+          plan: result.plan,
+          limitReached: result.limitReached || false,
+          sttProvider: result.sttProvider,
+          sttModel: result.sttModel,
+          sttProcessingMs: result.sttProcessingMs,
+          sttWordCount: result.sttWordCount,
+          sttLanguage: result.sttLanguage,
+          audioDurationMs: result.audioDurationMs,
+        };
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return { success: false, error: "Cancelled", code: "TRANSCRIPTION_CANCELLED" };
+        }
+        debugLogger.error("Cloud transcription error", { error: error.message }, "cloud-api");
+        return toPolicyFailure(error);
+      } finally {
+        sender.removeListener("destroyed", cancelSenderRequests);
+        this._cloudTranscriptionRequests.complete(senderId, requestId, controller);
+      }
+    });
+
+    ipcMain.on("cloud-transcribe-cancel", (event) => {
+      elevenLabsDictations.cancelSender(event.sender.id);
+      this._cloudTranscriptionRequests.cancelSender(event.sender.id);
+      for (const [controller, operation] of this._productRequests) {
+        if (
+          Number.isInteger(operation.liveDictationSenderId) &&
+          operation.liveDictationSenderId === event.sender.id
+        )
+          controller.abort(
+            Object.assign(createAbortError("Cancelled"), { code: "TRANSCRIPTION_CANCELLED" })
+          );
+      }
+    });
+
+    handleRemoteProduct("cloud-health-check", async () => {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        return {
+          ok: false,
+          code: "NO_API_URL",
+          messageKey: "streaming.errors.cloudUnreachable.generic",
+        };
+      }
+      const url = `${apiUrl}/api/health`;
+      try {
+        const res = await proxyFetch(url, {
+          method: "GET",
+          signal: AbortSignal.timeout(3000),
+        });
+        return { ok: res.ok, status: res.status };
+      } catch (err) {
+        const classified = classifyAndLog(err, url);
+        if (classified.isNetworkError) {
+          return { ok: false, code: classified.code, messageKey: classified.messageKey };
+        }
+        return {
+          ok: false,
+          code: "UNKNOWN",
+          messageKey: "streaming.errors.cloudUnreachable.generic",
+        };
+      }
+    });
+
+    handleProduct("retry-transcription", async (event, id, settings) => {
+      // The account, not its token: a rotated token is the same owner, and a
+      // local retry needs no sign-in at all.
+      const accountId = this.databaseManager.activeAccountId;
+      const assertRetryCurrent = () => {
+        if (this.databaseManager.activeAccountId !== accountId) {
+          throw Object.assign(
+            new Error("Authentication context changed during transcription retry"),
+            {
+              code: "AUTH_CONTEXT_CHANGED",
+            }
+          );
+        }
+      };
+      const recording = this.databaseManager.getTranscriptionById(id);
+      if (!recording) {
+        return { success: false, error: "Audio file not found" };
+      }
+      const buffer = this.audioStorageManager.getAudioBuffer(id);
+      if (!buffer) return { success: false, error: "Audio file not found" };
+      let providerErrorContext = null;
+      try {
+        let result;
+        const preferredLanguage =
+          recording.route_kind === "translation"
+            ? settings?.translationSourceLanguage
+            : settings?.preferredLanguage;
+        const language =
+          preferredLanguage && preferredLanguage !== "auto"
+            ? preferredLanguage.split("-")[0]
+            : undefined;
+        const { resolveTranscriptionRoute, batchTranscriptionHttpError } =
+          await import("./transcriptionRoute.ts");
+        assertRetryCurrent();
+        const { convertBufferToWav, isWavFormat } = require("./ffmpegUtils");
+        // Renderer pre-flight owns policy; retry re-routes stored audio through
+        // whatever is selected NOW.
+        const route = resolveTranscriptionRoute({
+          settings: { ...settings, preferredLanguage },
+          policy: productPolicyState(this.effectivePolicyManager.getCurrent(), app.getVersion()),
+          providers: transcriptionProviderBaseUrls(),
+          managed: settings?.managed,
+        });
+        const usesCloud =
+          route.transport !== "managed" &&
+          route.transport !== "local" &&
+          route.provider !== "self-hosted" &&
+          settings?.cloudTranscriptionMode === "openwhispr";
+        const signal = await trackTranscriptionRoute(
+          usesCloud ? { transport: "cloud" } : route,
+          settings?.transcriptionMode
+        );
+
+        // An error route is fatal unless OpenWhispr cloud is selected — a
+        // leftover BYOK misconfiguration must not block the cloud pipeline.
+        if (
+          route.transport === "error" &&
+          (settings?.transcriptionMode === "self-hosted" ||
+            settings?.cloudTranscriptionMode !== "openwhispr")
+        ) {
+          const err = new Error(route.message);
+          if (route.code) err.code = route.code;
+          if (route.messageKey) err.messageKey = route.messageKey;
+          throw err;
+        }
+
+        // Mirrors the branch order below: self-hosted wins over OpenWhispr
+        // cloud, which wins over the BYOK providers. Managed, local and cloud
+        // failures keep their own shape.
+        if (
+          (route.transport === "http-batch" && route.provider === "self-hosted") ||
+          ((route.transport === "http-batch" || route.transport === "proxied") &&
+            settings?.cloudTranscriptionMode !== "openwhispr")
+        ) {
+          providerErrorContext = {
+            provider: transcriptionProviderName(route.provider),
+            selfHosted: route.provider === "self-hosted" || route.provider === "custom",
+            model: route.model,
+            surface: "transcription",
+          };
+        }
+
+        if (route.transport === "managed") {
+          const transcription = await transcribeManagedAudio(event, route, {
+            signal,
+            audioBuffer: buffer,
+            fileName: "audio.webm",
+            contentType: "audio/webm",
+          });
+          result = {
+            ...transcription,
+            source: `${route.provider}-managed`,
+            model: route.deployment,
+          };
+        } else if (route.transport === "http-batch" && route.provider === "self-hosted") {
+          const formData = new FormData();
+          formData.append("file", new Blob([buffer], { type: "audio/webm" }), "audio.webm");
+          if (route.model) {
+            formData.append("model", route.model);
+          }
+          if (route.language) {
+            formData.append("language", route.language);
+          }
+
+          // Retries re-run dictation audio through dictation's server.
+          const response = await proxyFetch(route.endpoint, {
+            method: "POST",
+            ...selfHostedRequest("dictation", route),
+            body: formData,
+          });
+          if (!response.ok) {
+            const errorText = await response.text();
+            debugLogger.warn("Self-hosted retry failed", {
+              status: response.status,
+              body: redactProviderBody(errorText),
+            });
+            throw providerHttpError({
+              ...providerErrorContext,
+              status: response.status,
+              body: errorText,
+              headers: response.headers,
+            });
+          }
+          const data = await response.json();
+          result = {
+            text: data?.text,
+            source: "self-hosted",
+            model: route.model,
+          };
+        } else if (route.transport === "local") {
+          if (isSherpaLocalProvider(settings.localTranscriptionProvider)) {
+            const model =
+              (settings.localTranscriptionProvider === "cohere"
+                ? settings.cohereModel
+                : settings.parakeetModel) ||
+              process.env.PARAKEET_MODEL ||
+              "parakeet-tdt-0.6b-v3";
+            result = await this.parakeetManager.transcribeLocalParakeet(buffer, {
+              model,
+              language,
+              signal,
+            });
+          } else if (this.whisperManager?.serverManager?.isAvailable?.()) {
+            const vadOptions = this._resolveWhisperVadOptions("noteRecording");
+            result = await this.whisperManager.transcribeLocalWhisper(buffer, {
+              model: settings.whisperModel,
+              language,
+              ...vadOptions,
+              signal,
+            });
+          }
+        } else if (usesCloud) {
+          const win = BrowserWindow.fromWebContents(event.sender);
+          if (win) {
+            const authHeader = await getAuthHeaderFromWindow(win);
+            assertRetryCurrent();
+            if (Object.keys(authHeader).length) {
+              const apiUrl = getApiUrl();
+              if (apiUrl) {
+                const multipartFields = {
+                  language,
+                  clientType: "desktop",
+                  source: "dictation",
+                  appVersion: app.getVersion(),
+                  sessionId: this.sessionId,
+                };
+                if (buffer.length > CLOUD_INLINE_LIMIT) {
+                  const { text, warning } = await chunkedCloudTranscribe({
+                    signal,
+                    buffer,
+                    apiUrl,
+                    policyHeaders: withPolicyHeaders(authHeader),
+                    multipartFields,
+                  });
+                  result = { text, source: "openwhispr", model: "cloud", warning };
+                } else {
+                  const { body, boundary } = buildMultipartBody(
+                    buffer,
+                    "audio.webm",
+                    "audio/webm",
+                    multipartFields
+                  );
+                  const url = new URL(`${apiUrl}/api/transcribe`);
+                  const data = await postMultipart(
+                    url,
+                    body,
+                    boundary,
+                    withPolicyHeaders(authHeader),
+                    {
+                      signal: AbortSignal.any(
+                        [signal, AbortSignal.timeout(CLOUD_UPLOAD_TIMEOUT_MS)].filter(Boolean)
+                      ),
+                      session: getInlineCloudUploadSession(),
+                    }
+                  );
+                  const responseData = interpretTranscribeResponse(data);
+                  result = {
+                    text: responseData.text,
+                    source: "openwhispr",
+                    model: "cloud",
+                  };
+                }
+              }
+            }
+          }
+        } else if (route.transport === "proxied" && route.provider === "tinfoil") {
+          // Attested transport, so this can't reuse the generic fetch below.
+          const { text, model } = await transcribeWithTinfoil({
+            signal,
+            audioBuffer: buffer,
+            fileName: "audio.webm",
+            contentType: "audio/webm",
+            language: route.language,
+            apiKey: this.environmentManager.getTinfoilKey(),
+          });
+          result = { text, source: "tinfoil", model };
+        } else if (route.transport === "proxied" && route.provider === "corti") {
+          // Corti uses OAuth + an interaction-based REST flow, so it can't use
+          // the generic fetch below.
+          const clientId = this.environmentManager.getCortiClientId();
+          const clientSecret = this.environmentManager.getCortiClientSecret();
+          if (!clientId || !clientSecret) {
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: "Corti",
+              surface: "transcription",
+            });
+          }
+          const { transcribeAudio } = require("./cortiTranscription");
+          const { text } = await transcribeAudio({
+            signal,
+            environment: route.cortiEnvironment,
+            tenant: route.cortiTenant,
+            clientId,
+            clientSecret,
+            audioBuffer: buffer,
+            language: route.language,
+          });
+          result = { text, source: "corti", model: route.model };
+        } else if (route.transport === "proxied" && route.provider === "gemini") {
+          if (route.sizeCapBytes && buffer.byteLength > route.sizeCapBytes) {
+            throw new Error(byokSizeCapError(route.sizeCapBytes));
+          }
+          const { text } = await transcribeWithGemini({
+            signal,
+            audioBuffer: buffer,
+            model: route.model,
+            contentType: "audio/webm",
+            language: route.language,
+            apiKey: this.environmentManager.getGeminiKey(),
+          });
+          result = { text, source: "gemini", model: route.model };
+        } else if (route.transport === "proxied" && route.provider === "assemblyai") {
+          const { text, cleanedText } = await transcribeAssemblyAiDictation(event, {
+            signal,
+            audioBuffer: buffer,
+            durationSeconds: recording.audio_duration_ms / 1000,
+            contentType: isWavFormat(buffer) ? "audio/wav" : "audio/webm",
+            language: route.language,
+            keyterms: settings?.keyterms,
+            apiKey: this.environmentManager.getAssemblyAIKey(),
+          });
+          result = { text, cleanedText, source: "assemblyai", model: route.model };
+        } else if (route.transport === "proxied" && route.provider === "elevenlabs") {
+          // No size check: the cap is the upload screen's, not ElevenLabs', and dictation
+          // already sent this recording once at this size.
+          const { text } = await transcribeElevenLabsSpeech({
+            signal,
+            audioBuffer: buffer,
+            model: route.model,
+            fileName: "audio.webm",
+            contentType: "audio/webm",
+            language: route.language,
+            apiKey: this.environmentManager.getElevenlabsKey(),
+          });
+          result = { text, source: "elevenlabs", model: route.model };
+        } else {
+          // mistral/xai have no OpenAI-compatible endpoint — main talks to them
+          // directly; everything else consumes the route endpoint as-is.
+          const provider = route.provider;
+          const endpoint =
+            provider === "mistral"
+              ? MISTRAL_TRANSCRIPTION_URL
+              : provider === "xai"
+                ? XAI_STT_URL
+                : route.endpoint;
+          const apiKey =
+            provider === "mistral"
+              ? this.environmentManager.getMistralKey()
+              : provider === "xai"
+                ? this.environmentManager.getXaiKey()
+                : route.auth.keyRef === "custom"
+                  ? this.environmentManager.getCustomTranscriptionKey()
+                  : route.auth.keyRef === "groq"
+                    ? this.environmentManager.getGroqKey()
+                    : route.auth.keyRef === "openrouter"
+                      ? this.environmentManager.getOpenrouterKey()
+                      : this.environmentManager.getOpenAIKey();
+          if (!apiKey && provider !== "custom") {
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: transcriptionProviderName(provider),
+              surface: "transcription",
+            });
+          }
+
+          // The renderer re-encodes WebM before uploading to a Custom endpoint
+          // (src/utils/audioContainer.ts); retries re-upload stored audio from
+          // the main process, so without the same step here every retry of a
+          // dictation that failed for that reason fails again -- which is the
+          // exact recovery a user reaches for after hitting it.
+          let uploadBuffer = buffer;
+          let uploadType = "audio/webm";
+          let uploadName = "audio.webm";
+          if (provider === "custom" && buffer.length && !isWavFormat(buffer)) {
+            try {
+              const wavBuffer = await convertBufferToWav(buffer, { signal });
+              // Match fresh dictation: PCM expansion must not break an upload
+              // that the endpoint could accept in its original container.
+              if (wavBuffer.length <= route.sizeCapBytes) {
+                uploadBuffer = wavBuffer;
+                uploadType = "audio/wav";
+                uploadName = "audio.wav";
+              }
+            } catch (conversionError) {
+              // Fail open, matching the renderer: an unconverted retry is no
+              // worse than today's behaviour.
+              debugLogger.warn("WAV re-encode failed on retry; uploading stored container", {
+                error: conversionError?.message,
+              });
+            }
+          }
+
+          assertRetryCurrent();
+          const formData = new FormData();
+          formData.append("file", new Blob([uploadBuffer], { type: uploadType }), uploadName);
+          if (provider === "xai") {
+            // xAI STT does not accept a model field; the route pre-filters language
+            if (route.language) {
+              formData.append("language", route.language);
+              formData.append("format", "true");
+            }
+          } else {
+            formData.append("model", route.model);
+            if (route.language) formData.append("language", route.language);
+          }
+          const requestsSegments = supportsWhisperSegments(provider, route.model);
+          if (requestsSegments) formData.append("response_format", "verbose_json");
+          const headers = {};
+          if (provider === "mistral") {
+            headers["x-api-key"] = apiKey;
+          } else if (apiKey) {
+            if (route.transport === "http-batch" && route.auth.scheme === "azure-api-key") {
+              headers["api-key"] = apiKey;
+            } else {
+              headers.Authorization = `Bearer ${apiKey}`;
+            }
+          }
+
+          const response = await proxyFetch(endpoint, { method: "POST", headers, body: formData });
+          if (!response.ok) {
+            const errorText = await response.text();
+            debugLogger.warn("Retry transcription provider failed", {
+              provider,
+              status: response.status,
+              body: redactProviderBody(errorText),
+            });
+            throw Object.assign(
+              providerHttpError({
+                ...providerErrorContext,
+                status: response.status,
+                body: errorText,
+                headers: response.headers,
+              }),
+              batchTranscriptionHttpError(response.status, endpoint)
+            );
+          }
+          const data = await response.json();
+          result = {
+            text: requestsSegments ? dropNoSpeechSegments(data) : data?.text,
+            source: provider,
+            model: route.model,
+          };
+        }
+
+        assertRetryCurrent();
+        if (result?.success === false) {
+          throw localTranscriptionFailure(result);
+        }
+        if (!result) {
+          return { success: false, error: "No transcription engine available" };
+        }
+        // ElevenLabs Scribe answers silence with "[pause]" instead of nothing.
+        if (!result.text || result.text.trim() === "[pause]") {
+          throw Object.assign(new Error("No speech detected in audio"), {
+            code: "NO_SPEECH_DETECTED",
+          });
+        }
+
+        const operation = this._productRequestContext.getStore();
+        operation.signal.throwIfAborted();
+        // A token rotated mid-decode leaves the verdict loading until its own lands.
+        let snapshot = this.effectivePolicyManager.getCurrent();
+        if (snapshot.status === "loading") {
+          snapshot = await this.refreshEffectivePolicy(event);
+          operation.signal.throwIfAborted();
+          assertRetryCurrent();
+        }
+        if (!productOperationAllowed(snapshot, app.getVersion(), operation.channel, operation.args))
+          throw Object.assign(new Error("Blocked by device policy"), {
+            code: "DEVICE_POLICY_BLOCKED",
+          });
+        operation.dictationCleanupSignal?.throwIfAborted();
+        this.databaseManager.updateTranscriptionText(id, result.text, result.text);
+        this.databaseManager.updateTranscriptionStatus(id, "completed");
+        const providerName = result.source || "local";
+        const modelName = result.model || null;
+        const existingRow = this.databaseManager.getTranscriptionById(id);
+        this.databaseManager.updateTranscriptionAudio(id, {
+          hasAudio: 1,
+          audioDurationMs: existingRow?.audio_duration_ms ?? null,
+          provider: providerName,
+          model: modelName,
+        });
+        const updated = this.databaseManager.getTranscriptionById(id);
+        if (updated) {
+          setImmediate(() => {
+            if (
+              this.databaseManager.activeAccountId !== accountId ||
+              operation.dictationCleanupSignal?.aborted
+            )
+              return;
+            const transcription = this.databaseManager.getTranscriptionById(id);
+            if (!transcription) return;
+            broadcastToWindows("transcription-updated", transcription);
+            // A row that just reached "completed" is newly eligible.
+            void this._ensureAnalyticsHistoryBackfilled();
+          });
+        }
+        // A partial result (local truncation, lost cloud chunks) still replaces the
+        // row, as dictation keeps it, but the renderer must say so.
+        return {
+          success: true,
+          transcription: updated,
+          ...(result.warning ? { warning: result.warning } : {}),
+          ...(result.cleanedText ? { cleanedText: result.cleanedText } : {}),
+        };
+      } catch (rawError) {
+        const error = providerErrorContext
+          ? asProviderError(rawError, providerErrorContext)
+          : rawError;
+        debugLogger.error(
+          "Retry transcription failed",
+          { id, error: error.message, code: error.code },
+          "audio-storage"
+        );
+        if (error.code === "NO_SPEECH_DETECTED" && !error.messageKey) {
+          // Every engine reports silence with this code, so it is translated
+          // here once rather than per route.
+          error.messageKey = "notes.upload.noSpeechDetected";
+        }
+        if (error.code) {
+          return { success: false, ...ipcErrorFields(error) };
+        }
+        return { success: false, error: error.message };
+      }
+    });
+
+    let meetingTranscriptionStartInProgress = false;
+    let meetingTranscriptionPrepareInProgress = false;
+    let meetingTranscriptionPreparePromise = null;
+
+    const DUPLICATE_TRANSCRIPT_WINDOW_MS = 6000;
+    const DUPLICATE_TRANSCRIPT_MERGE_LIMIT = 3;
+    const STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS = 3000;
+    const LOCAL_MEETING_CHUNK_INTERVAL_MS = 5000;
+    // Must outlast one local transcription cycle so a straddling remote
+    // utterance's next-cycle system transcript can confirm buffered echo.
+    const LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS = LOCAL_MEETING_CHUNK_INTERVAL_MS + 1000;
+    const RACING_MIC_RETRACT_WINDOW_MS = 4000;
+
+    const buildNearbyTranscriptCandidates = (
+      targetSource,
+      timestamp,
+      { extraSegment = null } = {}
+    ) => {
+      const relevant = meetingDiarizationSegments.filter(
+        (candidate) =>
+          candidate.source === targetSource && candidate.timestamp != null && candidate.text
+      );
+
+      return buildMergedCandidates({
+        segments: relevant,
+        timestamp,
+        windowMs: DUPLICATE_TRANSCRIPT_WINDOW_MS,
+        mergeLimit: DUPLICATE_TRANSCRIPT_MERGE_LIMIT,
+        extraSegment,
+      });
+    };
+
+    const hasNearbyTranscriptMatch = (targetSource, text, timestamp, options = {}) => {
+      if (!text) return false;
+
+      const matcher = options.relaxed ? transcriptsLooselyOverlap : transcriptsOverlap;
+      const candidates = buildNearbyTranscriptCandidates(targetSource, timestamp, options);
+      for (const candidateText of candidates) {
+        if (matcher(text, candidateText)) {
+          return true;
+        }
+      }
+
+      return false;
+    };
+
+    const shouldSkipDuplicateMicSegment = (text, timestamp, suppression = null) =>
+      isDuplicateMicSegment({ text, timestamp, suppression, hasNearbyTranscriptMatch });
+
+    const isWithinMeetingStartupWarmup = () =>
+      meetingStartedAt != null && Date.now() - meetingStartedAt < MEETING_STARTUP_WARMUP_MS;
+
+    const hasRiskyMicDuplicateProfile = (suppression = null) =>
+      isRiskyMicDuplicateProfile({
+        suppression,
+        inStartupWarmup: isWithinMeetingStartupWarmup(),
+      });
+
+    const removeRacingMicEntriesFor = (systemText, systemTimestamp) => {
+      const indices = selectRacingMicEntryIndices({
+        segments: meetingDiarizationSegments,
+        systemText,
+        systemTimestamp,
+        hasNearbyTranscriptMatch,
+        duplicateWindowMs: DUPLICATE_TRANSCRIPT_WINDOW_MS,
+        retractWindowMs: RACING_MIC_RETRACT_WINDOW_MS,
+      });
+      const removed = [];
+      // Indices are descending, so splicing in order never shifts a later index.
+      for (const index of indices) {
+        removed.push(meetingDiarizationSegments[index]);
+        meetingDiarizationSegments.splice(index, 1);
+      }
+      // The renderer stops applying retracts once a stop begins, so the
+      // diarization result must name them for its persisted copy (#2781).
+      meetingRetractedMicSegments.push(...removed);
+      return removed;
+    };
+
+    const appendMeetingLocalTranscript = (text) => {
+      if (!text) return;
+      meetingLocalTranscript += `${meetingLocalTranscript ? " " : ""}${text}`;
+    };
+
+    // Held-back mic segments are appended at release time, so insertion order
+    // is not spoken order.
+    const buildOrderedTranscriptText = (segments) =>
+      segments
+        .slice()
+        .sort((left, right) => (left.timestamp ?? 0) - (right.timestamp ?? 0))
+        .map((segment) => segment.text)
+        .join(" ")
+        .trim();
+
+    const storeMeetingDiarizationSegment = (
+      text,
+      source,
+      timestamp,
+      micSuppression = null,
+      timestampIsSpeechStart = true
+    ) => {
+      meetingDiarizationSegments.push({
+        text,
+        source,
+        timestamp,
+        ...(timestampIsSpeechStart === false ? { timestampIsSpeechStart: false } : {}),
+        committedAt: Date.now(),
+        suppressionReason: source === "mic" ? micSuppression?.reason || null : null,
+        hasBleedEvidence: source === "mic" ? !!micSuppression?.hasBleedEvidence : false,
+        likelyRenderBleed: source === "mic" ? !!micSuppression?.likelyRenderBleed : false,
+      });
+    };
+
+    const sendMeetingFinalSegment = ({
+      text,
+      source,
+      timestamp,
+      timestampIsSpeechStart = true,
+      micSuppression = null,
+      send = null,
+      includeInLocalTranscript = false,
+    }) => {
+      if (includeInLocalTranscript) {
+        appendMeetingLocalTranscript(text);
+      }
+
+      storeMeetingDiarizationSegment(
+        text,
+        source,
+        timestamp,
+        micSuppression,
+        timestampIsSpeechStart
+      );
+
+      if (send) {
+        send("meeting-transcription-segment", {
+          text,
+          source,
+          type: "final",
+          timestamp,
+        });
+      }
+    };
+
+    function flushPendingMicFinals(force = false) {
+      if (meetingPendingMicFinals.length === 0) {
+        if (meetingPendingMicFinalTimer) {
+          clearTimeout(meetingPendingMicFinalTimer);
+          meetingPendingMicFinalTimer = null;
+        }
+        return;
+      }
+
+      const { deferred, duplicates, releases } = partitionPendingMicFinals({
+        pending: meetingPendingMicFinals,
+        now: Date.now(),
+        force,
+        isDuplicate: (entry) =>
+          shouldSkipDuplicateMicSegment(entry.text, entry.timestamp, entry.micSuppression),
+      });
+
+      meetingPendingMicFinals = deferred;
+      schedulePendingMicFinalFlush();
+
+      for (const pending of duplicates) {
+        debugLogger.debug(
+          "Dropping buffered mic segment after system context confirmed duplicate",
+          {
+            text: pending.text.slice(0, 80),
+            averageCorrelation: pending.micSuppression?.averageCorrelation?.toFixed(3),
+            averageResidual: pending.micSuppression?.averageResidual?.toFixed(3),
+          }
+        );
+      }
+
+      for (const pending of releases) {
+        debugLogger.debug(
+          pending.micSuppression?.hasBleedEvidence
+            ? "Releasing bleed-flagged mic segment after holdback (no transcript match)"
+            : "Releasing buffered mic segment after duplicate holdback",
+          {
+            text: pending.text.slice(0, 80),
+            holdbackMs: pending.holdbackMs,
+            reason: pending.micSuppression?.reason,
+            averageCorrelation: pending.micSuppression?.averageCorrelation?.toFixed(3),
+            averageResidual: pending.micSuppression?.averageResidual?.toFixed(3),
+          }
+        );
+        pending.emit();
+      }
+    }
+
+    const schedulePendingMicFinalFlush = () => {
+      if (meetingPendingMicFinalTimer) {
+        clearTimeout(meetingPendingMicFinalTimer);
+        meetingPendingMicFinalTimer = null;
+      }
+
+      if (meetingPendingMicFinals.length === 0) {
+        return;
+      }
+
+      const nextDelay = Math.max(0, meetingPendingMicFinals[0].releaseAt - Date.now());
+      meetingPendingMicFinalTimer = setTimeout(() => {
+        meetingPendingMicFinalTimer = null;
+        flushPendingMicFinals();
+      }, nextDelay);
+    };
+
+    const resetPendingMicFinals = () => {
+      meetingPendingMicFinals = [];
+      if (meetingPendingMicFinalTimer) {
+        clearTimeout(meetingPendingMicFinalTimer);
+        meetingPendingMicFinalTimer = null;
+      }
+    };
+
+    const removePendingMicFinalsFor = (systemText, systemTimestamp) => {
+      const { kept, removed } = partitionOverlappingPendingMicFinals({
+        pending: meetingPendingMicFinals,
+        systemText,
+        systemTimestamp,
+        hasNearbyTranscriptMatch,
+      });
+      meetingPendingMicFinals = kept;
+      schedulePendingMicFinalFlush();
+      return removed;
+    };
+
+    const queuePendingMicFinal = ({ text, timestamp, micSuppression, holdbackMs, emit }) => {
+      meetingPendingMicFinals.push({
+        text,
+        timestamp,
+        micSuppression,
+        holdbackMs,
+        releaseAt: Date.now() + holdbackMs,
+        emit,
+      });
+      meetingPendingMicFinals.sort((left, right) => left.releaseAt - right.releaseAt);
+      schedulePendingMicFinalFlush();
+    };
+
+    const captureMeetingDiarizationState = async () => {
+      const systemPcmPath = meetingDiarizationPath;
+      const systemStartedAt = meetingDiarizationStartedAt;
+      const micPcmPath = meetingMicDiarizationPath;
+      const micStartedAt = meetingMicDiarizationStartedAt;
+      const systemAudioHeard = meetingSystemAudioHeard;
+      const diarizationSegments = meetingDiarizationSegments;
+      const retractedSegments = meetingRetractedMicSegments;
+      if (meetingDiarizationStream) {
+        await new Promise((resolve) => meetingDiarizationStream.end(resolve));
+        meetingDiarizationStream = null;
+      }
+      if (meetingMicDiarizationStream) {
+        await new Promise((resolve) => meetingMicDiarizationStream.end(resolve));
+        meetingMicDiarizationStream = null;
+      }
+      meetingDiarizationPath = null;
+      meetingDiarizationStartedAt = null;
+      meetingMicDiarizationPath = null;
+      meetingMicDiarizationStartedAt = null;
+      meetingSystemAudioHeard = false;
+      meetingSystemAudioHandover.reset();
+      meetingDiarizationSegments = [];
+      meetingRetractedMicSegments = [];
+      const { pcmPath, startedAt, diarizedSource, cleanupPcmPaths } = resolveDiarizationInput({
+        systemPcmPath,
+        micPcmPath,
+        systemAudioHeard,
+        systemStartedAt,
+        micStartedAt,
+      });
+      for (const stalePath of cleanupPcmPaths) {
+        fs.unlink(stalePath, () => {});
+      }
+      return {
+        diarizationPcmPath: pcmPath,
+        diarizationSegments,
+        retractedSegments,
+        diarizationStartedAt: startedAt,
+        diarizedSource,
+      };
+    };
+
+    const attachMeetingStreamingHandlers = (streaming, win, source) => {
+      // Deepgram's audio range can begin before its first spoken word.
+      const timestampIsSpeechStart = !(streaming instanceof DeepgramStreaming);
+      const send = (channel, data) => {
+        if (!win || win.isDestroyed()) {
+          debugLogger.error("Meeting segment send failed: window unavailable", {
+            channel,
+            source,
+            winExists: !!win,
+          });
+          return;
+        }
+        win.webContents.send(channel, data);
+      };
+
+      streaming.onPartialTranscript = (text) => {
+        if (source === "mic" && meetingEchoLeakDetector.isMicProbablyRenderBleed()) {
+          send("meeting-transcription-segment", { text: "", source, type: "partial" });
+          return;
+        }
+
+        send("meeting-transcription-segment", { text, source, type: "partial" });
+      };
+      streaming.onFinalTranscript = (text, timestamp) => {
+        const segments = streaming.completedSegments;
+        const latestSegment = segments.length > 0 ? segments[segments.length - 1] : text;
+        if (
+          isWrongScriptFragment(latestSegment, fragmentFilterLanguages(meetingConnectionOptions))
+        ) {
+          debugLogger.debug("Dropping wrong-script meeting fragment", { source });
+          send("meeting-transcription-segment", { text: "", source, type: "partial" });
+          return;
+        }
+        let micSuppression = null;
+        if (source === "mic") {
+          micSuppression = shouldSuppressMicTranscriptSegment(timestamp, Date.now());
+          if (micSuppression.suppress) {
+            debugLogger.debug("Suppressing contaminated mic segment", {
+              reason: micSuppression.reason,
+              averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
+              averageResidual: micSuppression.averageResidual?.toFixed(3),
+              text: latestSegment.slice(0, 80),
+            });
+            send("meeting-transcription-segment", { text: "", source, type: "partial" });
+            return;
+          }
+
+          if (shouldSkipDuplicateMicSegment(latestSegment, timestamp, micSuppression)) {
+            debugLogger.debug("Skipping duplicate mic segment that matches recent system audio", {
+              text: latestSegment.slice(0, 80),
+              averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
+              averageResidual: micSuppression.averageResidual?.toFixed(3),
+            });
+            send("meeting-transcription-segment", { text: "", source, type: "partial" });
+            return;
+          }
+        }
+
+        if (source === "system") {
+          const pending = removePendingMicFinalsFor(latestSegment, timestamp);
+          if (pending.length > 0) {
+            debugLogger.debug("Dropping buffered mic segments after system transcript arrived", {
+              count: pending.length,
+              text: latestSegment.slice(0, 80),
+            });
+          }
+
+          const retracted = removeRacingMicEntriesFor(latestSegment, timestamp);
+          for (const stale of retracted) {
+            send("meeting-transcription-segment", {
+              text: stale.text,
+              source: "mic",
+              type: "retract",
+              timestamp: stale.timestamp,
+            });
+          }
+        }
+
+        debugLogger.debug("Meeting segment sending to renderer", {
+          source,
+          text: latestSegment.slice(0, 80),
+          segmentCount: segments.length,
+          micCorrelation: micSuppression?.averageCorrelation?.toFixed(3),
+          micSuppressionReason: micSuppression?.reason,
+          micHasBleedEvidence: micSuppression?.hasBleedEvidence,
+          micLikelyRenderBleed: micSuppression?.likelyRenderBleed,
+          systemSpeaking: micSuppression?.systemSpeaking,
+        });
+        if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {
+          debugLogger.debug("Buffering risky mic segment before renderer commit", {
+            text: latestSegment.slice(0, 80),
+            holdbackMs: STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS,
+            reason: micSuppression?.reason,
+            hasBleedEvidence: micSuppression?.hasBleedEvidence,
+          });
+          send("meeting-transcription-segment", { text: "", source, type: "partial" });
+          queuePendingMicFinal({
+            text: latestSegment,
+            timestamp,
+            micSuppression,
+            holdbackMs: STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS,
+            emit: () =>
+              sendMeetingFinalSegment({
+                text: latestSegment,
+                source,
+                timestamp,
+                timestampIsSpeechStart,
+                micSuppression,
+                send,
+              }),
+          });
+          return;
+        }
+
+        sendMeetingFinalSegment({
+          text: latestSegment,
+          source,
+          timestamp,
+          timestampIsSpeechStart,
+          micSuppression,
+          send,
+        });
+      };
+      streaming.onError = (error) => {
+        send("meeting-transcription-error", error.message);
+      };
+      const recoverConnection = async (error, restoreOldOnFailure) => {
+        let recovered = false;
+        // A fatal provider error (refused key, used-up quota) fails every reconnect
+        // the same way, and each successful handshake would reset the retry count.
+        if (!error?.fatal) {
+          try {
+            recovered = await reconnectMeetingStreams({ restoreOldOnFailure });
+          } catch (reconnectError) {
+            debugLogger.error("Meeting stream recovery failed unexpectedly", {
+              error: reconnectError.message,
+            });
+          }
+        }
+        if (!recovered && !meetingFatalErrorSent) {
+          meetingFatalErrorSent = true;
+          send(
+            "meeting-transcription-fatal-error",
+            error?.message || "Meeting transcription connection could not be restored."
+          );
+        }
+      };
+      streaming.onConnectionLost = (error) => {
+        void recoverConnection(error, false);
+      };
+      streaming.onSessionExpired = ({ proactive = false } = {}) => {
+        void recoverConnection(
+          new Error("Meeting transcription session could not be renewed."),
+          proactive
+        );
+      };
+    };
+
+    const resetMeetingReconnectAudio = () => {
+      meetingReconnectAudioBuffers = { mic: [], system: [] };
+      meetingReconnectAudioBytes = { mic: 0, system: 0 };
+      meetingReconnectReplaySources = new Set();
+    };
+
+    const sendMeetingStreamingAudio = (streaming, buffer, capturedAt = null) => {
+      const firstSampleAt = streaming.audioBytesSent === 0 ? capturedAt : null;
+      const sent = streaming.sendAudio(buffer, capturedAt);
+      if (
+        sent &&
+        streaming.isConnected &&
+        firstSampleAt !== null &&
+        streaming.sessionStartedAt != null
+      ) {
+        // Deepgram/Corti time segments from the first PCM sample, which can
+        // precede a replacement socket's creation when replaying recovery audio.
+        streaming.sessionStartedAt = firstSampleAt;
+      }
+      return sent;
+    };
+
+    const queueMeetingReconnectAudio = (source, buffer, capturedAt = null) => {
+      if (!meetingReconnectReplaySources.has(source)) return;
+      const copy = Buffer.from(buffer);
+      const queue = meetingReconnectAudioBuffers[source];
+      queue.push({ buffer: copy, capturedAt });
+      meetingReconnectAudioBytes[source] += copy.length;
+      while (
+        meetingReconnectAudioBytes[source] > MEETING_RECONNECT_BUFFER_MAX_BYTES &&
+        queue.length > 1
+      ) {
+        meetingReconnectAudioBytes[source] -= queue.shift().buffer.length;
+      }
+    };
+
+    const replayMeetingReconnectAudio = (source, streaming) => {
+      if (!meetingReconnectReplaySources.has(source)) return true;
+      const queue = meetingReconnectAudioBuffers[source];
+      const replayed = queue.every(({ buffer, capturedAt }) =>
+        sendMeetingStreamingAudio(streaming, buffer, capturedAt)
+      );
+      debugLogger.info("Replayed meeting audio after reconnect", {
+        source,
+        chunks: queue.length,
+        bytes: meetingReconnectAudioBytes[source],
+      });
+      return replayed;
+    };
+
+    // Labels the socket for field logs and, for system, swaps in the more
+    // sensitive threshold (see MEETING_SYSTEM_VAD_THRESHOLD).
+    const withMeetingSourceConnectOpts = (connectOpts, source) => ({
+      ...connectOpts,
+      streamLabel: source,
+      ...(source === "system" ? { vadThreshold: MEETING_SYSTEM_VAD_THRESHOLD } : {}),
+    });
+
+    const reconnectMeetingStreams = ({ restoreOldOnFailure = false } = {}) => {
+      if (meetingReconnectPromise) return meetingReconnectPromise;
+
+      const pending = (async () => {
+        if (meetingLocalMode) return false;
+
+        const options = meetingConnectionOptions;
+        const win = meetingConnectionWin;
+        if (!options || !win || win.isDestroyed()) {
+          debugLogger.error("Cannot reconnect meeting streams: missing connection context");
+          return false;
+        }
+
+        // A reconnect clears the count only once its sockets have stayed up: a provider
+        // that accepts every handshake and then fails again would otherwise reconnect forever.
+        if (
+          meetingReconnectedAt &&
+          Date.now() - meetingReconnectedAt >= MEETING_RECONNECT_STABLE_MS
+        ) {
+          meetingReconnectCount = 0;
+          meetingReconnectedAt = 0;
+        }
+        if (meetingReconnectCount >= MAX_MEETING_RECONNECTS) {
+          debugLogger.error("Meeting reconnect limit reached", { count: meetingReconnectCount });
+          return false;
+        }
+
+        meetingReconnectCount++;
+
+        const oldMic = this._meetingMicStreaming;
+        const oldSystem = this._meetingSystemStreaming;
+        meetingReconnectReplaySources = new Set([
+          ...(!oldMic?.isConnected ? ["mic"] : []),
+          ...(oldSystem && !oldSystem.isConnected ? ["system"] : []),
+        ]);
+        let newMic = null;
+        let newSystem = null;
+
+        try {
+          const tokenEvent = { sender: win.webContents };
+          const currentOptions = await resolveEnterpriseMeetingOptions(tokenEvent, options);
+          if (
+            getMeetingConnectionKey(currentOptions, credentialGeneration) !==
+            getMeetingConnectionKey(options, credentialGeneration)
+          ) {
+            this._stopMeetingForPolicy();
+            return true;
+          }
+          const StreamingClass = getMeetingStreamingClient(options.provider);
+          newMic = new StreamingClass();
+          attachMeetingStreamingHandlers(newMic, win, "mic");
+          if (oldSystem) {
+            newSystem = new StreamingClass();
+            attachMeetingStreamingHandlers(newSystem, win, "system");
+          }
+
+          debugLogger.info("Reconnecting meeting streams", {
+            attempt: meetingReconnectCount,
+            maxAttempts: MAX_MEETING_RECONNECTS,
+          });
+
+          const connectOpts = {
+            model: options.model,
+            language: options.language,
+            mode: options.mode,
+            preconfigured: options.mode !== "byok",
+            environment: options.environment,
+            tenant: options.tenant,
+            keyterms: options.keyterms,
+            sampleRate: MEETING_STREAM_SAMPLE_RATE,
+            ...(await enterpriseMeetingConnectOptions(tokenEvent, options)),
+          };
+
+          let pairs;
+          if (newSystem) {
+            const secrets = await fetchRealtimeToken(
+              tokenEvent,
+              { ...options, purpose: "meeting" },
+              { streams: 2 }
+            );
+            pairs = [
+              { streaming: newMic, secret: secrets[0], source: "mic" },
+              { streaming: newSystem, secret: secrets[1], source: "system" },
+            ];
+          } else {
+            pairs = [
+              {
+                streaming: newMic,
+                secret: await fetchRealtimeToken(tokenEvent, { ...options, purpose: "meeting" }),
+                source: "mic",
+              },
+            ];
+          }
+
+          await Promise.all(
+            pairs.map(({ streaming, secret, source }) =>
+              streaming.connect({
+                apiKey: secret,
+                token: secret,
+                ...withMeetingSourceConnectOpts(connectOpts, source),
+              })
+            )
+          );
+
+          assertMeetingAllowed();
+          if (pairs.some(({ streaming }) => !streaming.isConnected)) {
+            throw new Error("Meeting transcription connection closed during reconnect.");
+          }
+
+          if (meetingConnectionOptions !== options) {
+            for (const { streaming } of pairs) streaming.disconnect().catch(() => {});
+            oldMic?.disconnect().catch(() => {});
+            oldSystem?.disconnect().catch(() => {});
+            resetMeetingReconnectAudio();
+            return true;
+          }
+
+          const replayedMic = replayMeetingReconnectAudio("mic", newMic);
+          const replayedSystem = !newSystem || replayMeetingReconnectAudio("system", newSystem);
+          if (!replayedMic || !replayedSystem) {
+            throw new Error("Meeting audio could not be restored after reconnect.");
+          }
+          this._meetingMicStreaming = newMic;
+          this._meetingSystemStreaming = newSystem;
+          resetMeetingReconnectAudio();
+          oldMic?.disconnect().catch(() => {});
+          oldSystem?.disconnect().catch(() => {});
+          meetingConnectionKey = getMeetingConnectionKey(options, credentialGeneration);
+
+          debugLogger.info("Meeting streams reconnected", { attempt: meetingReconnectCount });
+          meetingReconnectedAt = Date.now();
+          return true;
+        } catch (error) {
+          debugLogger.error("Meeting stream reconnect failed", {
+            error: error.message,
+            attempt: meetingReconnectCount,
+          });
+          newMic?.disconnect().catch(() => {});
+          newSystem?.disconnect().catch(() => {});
+          // An org refusal ends the recording instead of keeping the old
+          // sockets; the stop clears the connection options checked next.
+          if (isAudioPolicyRefusal(error)) this._stopMeetingForPolicy(error.code);
+          if (meetingConnectionOptions !== options) {
+            oldMic?.disconnect().catch(() => {});
+            oldSystem?.disconnect().catch(() => {});
+            resetMeetingReconnectAudio();
+            return true;
+          }
+
+          const canRestoreOld =
+            restoreOldOnFailure &&
+            !(
+              options.provider === "enterprise-realtime" &&
+              [
+                "PROVIDER_POLICY_CONFLICT",
+                "POLICY_UNRESOLVABLE",
+                "MANAGED_CONFIG_CHANGED",
+              ].includes(error.code)
+            ) &&
+            !!oldMic?.isConnected &&
+            (!oldSystem || oldSystem.isConnected);
+          if (canRestoreOld) {
+            this._meetingMicStreaming = oldMic;
+            this._meetingSystemStreaming = oldSystem;
+          } else {
+            oldMic?.disconnect().catch(() => {});
+            oldSystem?.disconnect().catch(() => {});
+            this._meetingMicStreaming = null;
+            this._meetingSystemStreaming = null;
+            meetingConnectionKey = null;
+          }
+          resetMeetingReconnectAudio();
+          if (!win.isDestroyed()) {
+            // A renewal refused for the session gets a sentinel the renderer explains,
+            // instead of the API's bare "Invalid session" (#2427).
+            win.webContents.send(
+              "meeting-transcription-error",
+              isSignInRefusal(error) ? "signInExpired" : error.message
+            );
+          }
+          return canRestoreOld;
+        }
+      })();
+
+      meetingReconnectPromise = pending;
+      return pending.finally(() => {
+        if (meetingReconnectPromise === pending) meetingReconnectPromise = null;
+      });
+    };
+
+    // Runs inside a start the policy already allowed, or a live meeting.
+    const assertMeetingAllowed = () => {
+      const denied = this._audioFeaturePolicy.activeFailure("meeting");
+      if (denied) throw Object.assign(new Error(denied.error), { code: denied.code });
+      const attendeeRefusal = this._meetingAdmission?.activeRefusal();
+      if (attendeeRefusal)
+        throw Object.assign(new Error(attendeeRefusal), { code: attendeeRefusal });
+      if (this._activeLocalMeetingLease)
+        this._localModelPolicy.assertCurrent(this._activeLocalMeetingLease);
+    };
+
+    const resolveEnterpriseMeetingOptions = async (event, options) => {
+      const policy = this.effectivePolicyManager.getCurrent();
+      const state = productPolicyState(policy, app.getVersion());
+      if (state.status === "error" || (policy.localOnly && options.provider !== "local")) {
+        throw Object.assign(new Error(policyBlockedMessage(policy)), {
+          code: "DEVICE_POLICY_BLOCKED",
+        });
+      }
+      const {
+        isTranscriptionSelectionAllowed,
+        isModeAllowedByPolicy,
+      } = require("../stores/policyRules.ts");
+      const selection = realtimeSelection(options);
+      // The local model gate checks a local meeting's model.
+      const allowed =
+        selection.mode === "enterprise" || selection.mode === "local"
+          ? isModeAllowedByPolicy(state, "transcription", selection.mode)
+          : isTranscriptionSelectionAllowed(state, selection);
+      if (!allowed)
+        throw Object.assign(new Error(i18nMain.t("common.managedPolicyConflict")), {
+          code: "DEVICE_POLICY_BLOCKED",
+        });
+      if (policy.localOnly) return options;
+      const request = await getEnterpriseAudioRequest(
+        event,
+        options.managedContext ?? options.enterpriseIdentity,
+        options.provider === "enterprise-realtime" || options.managedContext ? "load" : "personal"
+      );
+      if (!request) {
+        if (options.provider === "enterprise-realtime" || options.managedContext)
+          throw Object.assign(new Error("Enterprise audio configuration is unavailable"), {
+            code: "MANAGED_CONFIG_CHANGED",
+            messageKey: "common.managedConfigUnavailable",
+          });
+        this._activeEnterpriseAudioMeeting = false;
+        return options;
+      }
+      if (!options.managedContext && options.enterpriseSetupMode === "manual")
+        request.setupMode = "manual";
+      const runtime = await this.enterpriseAudioRuntime.resolve(request, "realtime");
+      this._activeEnterpriseAudioMeeting = Boolean(runtime);
+      if (!runtime) return options;
+      return {
+        ...options,
+        provider: "enterprise-realtime",
+        mode: "enterprise",
+        model: runtime.model,
+        managedContext: {
+          accountId: request.accountId,
+          workspaceId: request.workspaceId,
+          authGeneration: request.expectedAuthGeneration,
+          setupMode: request.setupMode,
+          inferenceScope: "transcription",
+          operation: "realtime",
+          provider: runtime.provider,
+          generation: runtime.generation,
+          providerVersion: runtime.providerVersion,
+        },
+        enterpriseConnection: {
+          endpoint: runtime.endpoint,
+          protocol: runtime.protocol,
+          generation: runtime.generation,
+          credentialGeneration: runtime.credentialGeneration,
+        },
+      };
+    };
+    const enterpriseMeetingConnectOptions = async (event, options) => {
+      if (options.provider !== "enterprise-realtime") return {};
+      const runtime = await this.enterpriseAudioRuntime.resolve(
+        await getEnterpriseAudioRequest(event, options.managedContext),
+        "realtime"
+      );
+      const context = options.managedContext;
+      if (
+        !runtime ||
+        runtime.generation !== context?.generation ||
+        runtime.providerVersion !== context?.providerVersion ||
+        runtime.provider !== context?.provider
+      )
+        throw Object.assign(new Error("Enterprise audio configuration changed"), {
+          code: "MANAGED_CONFIG_CHANGED",
+        });
+      return {
+        preconfigured: false,
+        protocol: runtime.protocol,
+        inputRate: runtime.section.sampleRate,
+        connectTimeoutMs: runtime.network.connectTimeoutMs,
+        sessionMaxMs: runtime.network.sessionMaxMs,
+        idleTimeoutMs: runtime.network.idleTimeoutMs,
+        createSocket: () => runtime.createSocket(),
+      };
+    };
+    const fetchRealtimeToken = async (event, options, { streams } = {}) => {
+      if (options.purpose === "meeting") assertMeetingAllowed();
+      if (options.provider === "enterprise-realtime") {
+        await enterpriseMeetingConnectOptions(event, options);
+        assertMeetingAllowed();
+        return streams
+          ? Array.from({ length: streams }, () => "enterprise-device-credential")
+          : "enterprise-device-credential";
+      }
+      const postServerToken = createServerTokenPoster({
+        getApiUrl,
+        getAuthHeader: () => getAuthHeader(event),
+        proxyFetch,
+        withPolicyHeaders,
+        classifyAndLog,
+      });
+
+      const token = await fetchRealtimeTokenForProvider(
+        options.provider,
+        {
+          environmentManager: this.environmentManager,
+          proxyFetch,
+          postServerToken,
+          mintCortiToken: (tokenOptions) => this._mintStoredCortiToken(tokenOptions),
+        },
+        options,
+        { streams }
+      ).catch((error) => {
+        this._audioFeaturePolicy.refreshOnRefusal(event, error);
+        throw error;
+      });
+      const effective = this.effectivePolicyManager.getCurrent();
+      if (
+        effective.localOnly ||
+        !productOperationAllowed(effective, app.getVersion(), "meeting-transcription", [options])
+      )
+        throw Object.assign(new Error(policyBlockedMessage(effective)), {
+          code: "DEVICE_POLICY_BLOCKED",
+        });
+      if (options.purpose === "meeting") assertMeetingAllowed();
+      return token;
+    };
+
+    const getMeetingSystemAudioCapabilityMode = () => {
+      if (this.audioTapManager?.isSupported()) return "native";
+      if (process.platform === "win32") return "loopback";
+      if (process.platform === "linux") return "loopback";
+      return "unsupported";
+    };
+
+    const getMeetingSystemAudioMode = () => getMeetingSystemAudioCapabilityMode();
+
+    const getMeetingSystemAudioPlan = async ({ refreshWindowsCapability = false } = {}) => {
+      const mode = getMeetingSystemAudioMode();
+      if (mode === "unsupported") {
+        return { mode, strategy: "unsupported" };
+      }
+
+      if (mode === "native") {
+        return { mode, strategy: "native" };
+      }
+
+      if (process.platform === "linux") {
+        const linuxAccess = await getLinuxSystemAudioAccess();
+        return {
+          mode: linuxAccess.mode,
+          strategy: linuxAccess.strategy || "unsupported",
+        };
+      }
+
+      if (process.platform === "win32") {
+        const windowsAccess = await getWindowsSystemAudioAccess({
+          refreshCapability: refreshWindowsCapability,
+        });
+        return { mode: windowsAccess.mode, strategy: windowsAccess.strategy };
+      }
+
+      // Unreachable today (loopback implies win32 or linux, both handled
+      // above), but callers destructure the result, so never return undefined.
+      return { mode, strategy: "unsupported" };
+    };
+
+    const isMeetingStreamingConnected = (systemAudioMode = getMeetingSystemAudioCapabilityMode()) =>
+      !!this._meetingMicStreaming?.isConnected &&
+      (systemAudioMode === "unsupported" || !!this._meetingSystemStreaming?.isConnected);
+
+    // `signal` ends a prepare whose account went away: it must not leave warm
+    // connections minted for that account behind for the next one to reuse.
+    const connectRealtimeStreaming = async (event, options, signal) => {
+      // Read before the key is, so a save during the token fetch marks these connections stale.
+      const connectionKey = getMeetingConnectionKey(options, credentialGeneration);
+      const StreamingClass = getMeetingStreamingClient(options.provider);
+      if (this._meetingMicStreaming?.isConnected) {
+        await this._meetingMicStreaming.disconnect();
+      }
+      if (this._meetingSystemStreaming?.isConnected) {
+        await this._meetingSystemStreaming.disconnect();
+      }
+      this._meetingMicStreaming = null;
+      this._meetingSystemStreaming = null;
+      meetingConnectionOptions = options;
+      const win = BrowserWindow.fromWebContents(event.sender);
+
+      const connectOpts = {
+        model: options.model,
+        language: options.language,
+        mode: options.mode,
+        preconfigured: options.mode !== "byok",
+        environment: options.environment,
+        tenant: options.tenant,
+        keyterms: options.keyterms,
+        sampleRate: MEETING_STREAM_SAMPLE_RATE,
+        ...(await enterpriseMeetingConnectOptions(event, options)),
+      };
+      const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
+      let pairs;
+      if (systemAudioMode !== "unsupported") {
+        const secrets = await fetchRealtimeToken(
+          event,
+          { ...options, purpose: "meeting" },
+          { streams: 2 }
+        );
+        pairs = [
+          { ref: "_meetingMicStreaming", secret: secrets[0], source: "mic" },
+          { ref: "_meetingSystemStreaming", secret: secrets[1], source: "system" },
+        ];
+      } else {
+        pairs = [
+          {
+            ref: "_meetingMicStreaming",
+            secret: await fetchRealtimeToken(event, { ...options, purpose: "meeting" }),
+            source: "mic",
+          },
+        ];
+      }
+      signal?.throwIfAborted();
+
+      for (const { ref, source } of pairs) {
+        this[ref] = new StreamingClass();
+        attachMeetingStreamingHandlers(this[ref], win, source);
+      }
+
+      try {
+        await Promise.all(
+          pairs.map(({ ref, secret, source }) =>
+            this[ref].connect({
+              apiKey: secret,
+              token: secret,
+              ...withMeetingSourceConnectOpts(connectOpts, source),
+            })
+          )
+        );
+        assertMeetingAllowed();
+        signal?.throwIfAborted();
+        if (pairs.some(({ ref }) => !this[ref]?.isConnected)) {
+          throw new Error("Meeting transcription connection closed during startup.");
+        }
+        meetingConnectionKey = connectionKey;
+      } catch (error) {
+        await Promise.all(
+          pairs.map(({ ref }) => this[ref]?.disconnect().catch(() => ({ text: "" })))
+        );
+        this._meetingMicStreaming = null;
+        this._meetingSystemStreaming = null;
+        meetingConnectionKey = null;
+        throw error;
+      }
+
+      return win;
+    };
+
+    // System audio captured in main (the macOS tap, the Windows and Linux
+    // helpers) arrives on its own schedule, unsynchronized with the renderer's
+    // mic, so mic chunks wait for that reference before echo analysis. Each
+    // waits only as long as its reference lags: the echo detector searches
+    // 500 ms back, and every millisecond held comes out of what's left for
+    // speaker latency.
+    const MEETING_MIC_REFERENCE_ALIGNMENT_MS = {
+      native: 320,
+      "wasapi-loopback": 100,
+      "pipewire-loopback": 100,
+    };
+    // Only a reference chunk received this recently holds the mic, so a capture
+    // that stopped or went idle doesn't delay it.
+    const MEETING_MIC_REFERENCE_RECENT_MS = 1000;
+    const MEETING_STARTUP_WARMUP_MS = 1500;
+    const MEETING_MIC_BLEED_LOOKBACK_MS = 500;
+    // Longest a start can hold mic audio: the enterprise connect timeout and then some.
+    const MEETING_STARTUP_AUDIO_MAX_AGE_MS = 180_000;
+    const MEETING_MIC_STATS_LOG_LIMIT = 200;
+    const MEETING_SYSTEM_AUDIO_SILENCE_WARNING_MS = 45000;
+    const MEETING_SYSTEM_AUDIO_TICK_MS = 2000;
+    let meetingMicStatsLogCount = 0;
+    let meetingSystemAudioStrategy = null;
+    let meetingSystemChunkReceivedAt = null;
+    let meetingSystemAudioSilenceTimer = null;
+    let meetingSystemAudioTicker = null;
+    let meetingSystemAudioWatchdogWin = null;
+
+    const meetingSystemAudioWatchdog = createMeetingSystemAudioWatchdog({
+      onResumed: () => {
+        const win = meetingSystemAudioWatchdogWin;
+        if (win && !win.isDestroyed()) {
+          win.webContents.send("meeting-system-audio-resumed");
+        }
+      },
+      onInterrupted: (payload) => {
+        // debugLogger.error flattens its arguments into one string, dropping
+        // both the meta and the scope, so the give-up event would vanish from a
+        // log filtered on "meeting", the one filter used to triage this bug.
+        if (payload.recovering) {
+          debugLogger.warn("Meeting system audio interrupted, restarting", payload, "meeting");
+        } else {
+          debugLogger.warn("Meeting system audio capture gave up", payload, "meeting");
+        }
+        const win = meetingSystemAudioWatchdogWin;
+        if (win && !win.isDestroyed()) {
+          win.webContents.send("meeting-system-audio-interrupted", payload);
+        }
+      },
+    });
+    let meetingStartedAt = null;
+    let meetingSendCounts = { mic: 0, system: 0 };
+    const meetingEchoLeakDetector = new MeetingEchoLeakDetector();
+    let meetingReconnectPromise = null;
+    let meetingFatalErrorSent = false;
+    let meetingReconnectCount = 0;
+    let meetingReconnectedAt = 0;
+    const MAX_MEETING_RECONNECTS = 5;
+    const MEETING_RECONNECT_STABLE_MS = 10000;
+    let meetingConnectionOptions = null;
+    this.getMeetingTranscriptionOptions = () => meetingConnectionOptions;
+    let meetingConnectionWin = null;
+    let meetingConnectionKey = null;
+    let policyMeetingStop = null;
+    let meetingReconnectAudioBuffers = { mic: [], system: [] };
+    let meetingReconnectAudioBytes = { mic: 0, system: 0 };
+    let meetingReconnectReplaySources = new Set();
+
+    const fs = require("fs");
+    let meetingDiarizationStream = null;
+    let meetingDiarizationPath = null;
+    let meetingDiarizationStartedAt = null;
+    // Parallel raw mic capture so an in-person session (no audible system
+    // audio) can be diarized; dropped as soon as the session proves to be a call.
+    let meetingMicDiarizationStream = null;
+    let meetingMicDiarizationPath = null;
+    let meetingMicDiarizationStartedAt = null;
+    let meetingSystemAudioHeard = false;
+    const meetingSystemAudioHandover = createMeetingSystemAudioHandover();
+    let meetingDiarizationSegments = [];
+    let meetingRetractedMicSegments = [];
+    let meetingLiveSpeakerActive = false;
+    let meetingLiveSpeakerState = null;
+    let meetingLiveSpeakerStartedAt = null;
+    let meetingReclusterTimer = null;
+
+    let meetingLocalMode = false;
+    let meetingLocalBuffers = { mic: [], system: [] };
+    let meetingLocalTimer = null;
+    let meetingLocalWin = null;
+    let meetingLocalTranscript = "";
+    let meetingLocalProvider = null;
+    let meetingLocalModel = null;
+    let meetingLocalLanguage = null;
+    // The pass that is transcribing buffered audio, if any. Stop and rollback
+    // await it: a pass that finished after the reset would push its finals into
+    // the next session and send them to no window.
+    let meetingLocalTranscribePromise = null;
+    let meetingPendingMicChunks = [];
+    let meetingPendingMicFinals = [];
+    let meetingPendingMicFinalTimer = null;
+    let meetingAecEnabled = false;
+    let meetingOneOnOneAttendee = null;
+    let meetingOneOnOneProfileBound = false;
+    let meetingNoteId = null;
+    // First speaker index this session may mint; past a resumed note's ids.
+    let meetingSpeakerIndexBase = 0;
+
+    const getLiveSpeakerProfiles = () => {
+      const attendees = this._getNoteNonSelfParticipants(meetingNoteId);
+      const attendeeEmails = new Set();
+      for (const p of attendees) {
+        const email = (p.email || "").toLowerCase().trim();
+        if (email) attendeeEmails.add(email);
+      }
+      if (attendeeEmails.size === 0) return [];
+      return this.databaseManager
+        .getSpeakerProfiles(true)
+        .filter((p) => p.email && attendeeEmails.has(p.email.toLowerCase()));
+    };
+    const shouldSuppressMicTranscriptSegment = (startedAt, endedAt = Date.now()) =>
+      meetingEchoLeakDetector.shouldSuppressMicSegment(startedAt, endedAt);
+
+    const resolveOneOnOneAttendeeForNote = (noteId) => {
+      if (!noteId) return null;
+      try {
+        const note = this.databaseManager.getNote(noteId);
+        return this._resolveOneOnOneOtherParticipant(note?.participants);
+      } catch (_) {
+        return null;
+      }
+    };
+
+    const resolveDiarizationEnabled = () =>
+      (this.activeMeetingSpeakerConfig?.enabled ?? this.speakerDiarizationEnabled) !== false;
+
+    const resolveSessionMaxSpeakers = () => {
+      const count = this.activeMeetingSpeakerConfig?.expectedCount;
+      const total = count ? Math.min(count, MAX_SPEAKER_COUNT) : DEFAULT_EXPECTED_SPEAKER_COUNT;
+      return Math.max(1, total - 1);
+    };
+
+    const bindOneOnOneAttendeeToSpeaker = (speakerId) => {
+      if (!meetingOneOnOneAttendee || meetingOneOnOneProfileBound || !speakerId) return;
+      if (!resolveDiarizationEnabled()) return;
+      const embedding = liveSpeakerIdentifier.getSpeakerEmbedding(speakerId);
+      if (!embedding) return;
+      try {
+        const buffer = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+        const profile = this.databaseManager.upsertSpeakerProfile(
+          meetingOneOnOneAttendee.displayName,
+          meetingOneOnOneAttendee.email,
+          buffer
+        );
+        liveSpeakerIdentifier.mapSpeaker(
+          speakerId,
+          profile.id,
+          meetingOneOnOneAttendee.displayName,
+          null
+        );
+        meetingOneOnOneProfileBound = true;
+      } catch (error) {
+        debugLogger.warn(
+          "1-on-1 attendee profile binding failed",
+          { error: error.message },
+          "speaker"
+        );
+      }
+    };
+
+    const dispatchMeetingAudioBuffer = (buffer, source, synthetic = false, capturedAt = null) => {
+      if (meetingLocalMode) {
+        // Local STT timestamps each batch with wall time, not a sample cursor.
+        // Large synthetic gaps would dilute speech and inflate the next batch.
+        if (synthetic) return;
+        meetingLocalBuffers[source].push(buffer);
+        return;
+      }
+
+      const streaming = source === "mic" ? this._meetingMicStreaming : this._meetingSystemStreaming;
+      if (!streaming) {
+        if (meetingSendCounts[source] === 0) {
+          debugLogger.error("Meeting audio send: no streaming instance", { source });
+        }
+        return;
+      }
+
+      let outbound = buffer;
+      if (source === "mic" && buffer.length >= 2) {
+        const { rms, peak, sampleCount } = computeChunkStats(buffer);
+        const at = capturedAt ?? Date.now();
+        // Evaluated eagerly (as before) because the stats log reports it.
+        const systemSpeaking = meetingEchoLeakDetector.isSystemSpeaking(
+          at - MEETING_MIC_BLEED_LOOKBACK_MS,
+          at
+        );
+        const verdict = resolveMicChunkAction({
+          mode: "streaming",
+          source,
+          rms,
+          peak,
+          sampleCount,
+          isSystemSpeaking: () => systemSpeaking,
+        });
+        if (verdict.action === "zero") {
+          outbound = Buffer.alloc(buffer.length);
+        }
+        if (
+          meetingMicStatsLogCount < MEETING_MIC_STATS_LOG_LIMIT &&
+          (systemSpeaking || rms > 0.02)
+        ) {
+          meetingMicStatsLogCount += 1;
+          debugLogger.debug("Meeting mic audio stats", {
+            rms: rms.toFixed(4),
+            peak: peak.toFixed(4),
+            systemSpeaking,
+            zeroed: outbound !== buffer,
+          });
+        }
+      } else if (source === "system" && buffer.length >= 2 && !synthetic) {
+        // System chunks stream verbatim (no gate), so a periodic level readout
+        // is the only way field logs can tell real audio from capture silence.
+        const chunkCount = meetingSendCounts.system + 1;
+        if (chunkCount === 1 || chunkCount % 200 === 0) {
+          const { rms, peak } = computeChunkStats(buffer);
+          debugLogger.debug("Meeting system audio stats", {
+            rms: rms.toFixed(4),
+            peak: peak.toFixed(4),
+            chunkCount,
+          });
+        }
+      }
+
+      // A stream that drops after a reconnect began (two sessions expiring together)
+      // joins that reconnect's replay, or its audio would go nowhere until the swap.
+      if (meetingReconnectPromise && !streaming.isConnected) {
+        meetingReconnectReplaySources.add(source);
+      }
+      queueMeetingReconnectAudio(source, outbound, capturedAt);
+      const sent = sendMeetingStreamingAudio(streaming, outbound, capturedAt);
+      if (synthetic) return;
+      meetingSendCounts[source]++;
+      if (meetingSendCounts[source] <= 5 || meetingSendCounts[source] % 100 === 0) {
+        debugLogger.debug("Meeting audio send", {
+          source,
+          bytes: buffer.length,
+          sent,
+          wsReady: streaming.ws?.readyState,
+          totalSent: streaming.audioBytesSent,
+          count: meetingSendCounts[source],
+        });
+      }
+    };
+
+    const stopMeetingAec = async () => {
+      meetingAecEnabled = false;
+      if (this.meetingAecManager) {
+        await this.meetingAecManager.stop().catch(() => {});
+      }
+    };
+
+    const startMeetingAec = async (systemAudioMode) => {
+      meetingAecEnabled = false;
+      if (meetingConnectionOptions.aecEnabled !== true) {
+        return false;
+      }
+      if (systemAudioMode === "unsupported" || !this.meetingAecManager?.isAvailable()) {
+        return false;
+      }
+
+      const started = await this.meetingAecManager
+        .start({
+          onMicChunk: (chunk) => {
+            dispatchMeetingAudioBuffer(chunk, "mic");
+          },
+          onError: (error) => {
+            debugLogger.warn("Meeting AEC helper disabled", { error: error.message }, "meeting");
+            meetingAecEnabled = false;
+            void this.meetingAecManager.stop().catch(() => {});
+          },
+          onWarning: (warning) => {
+            debugLogger.debug("Meeting AEC helper warning", warning, "meeting");
+          },
+        })
+        .catch((error) => {
+          debugLogger.warn("Meeting AEC helper start failed", { error: error.message }, "meeting");
+          return false;
+        });
+
+      meetingAecEnabled = !!started;
+      if (meetingAecEnabled) {
+        debugLogger.info("Meeting AEC helper started", { systemAudioMode }, "meeting");
+      }
+      return meetingAecEnabled;
+    };
+
+    const flushPendingMeetingMicChunks = (force = false) => {
+      if (!meetingPendingMicChunks.length) {
+        return;
+      }
+
+      const now = Date.now();
+      const holdMs =
+        force || !meetingMicNeedsReferenceAlignment()
+          ? 0
+          : MEETING_MIC_REFERENCE_ALIGNMENT_MS[meetingSystemAudioStrategy];
+      while (meetingPendingMicChunks.length > 0) {
+        const next = meetingPendingMicChunks[0];
+        // Buffered startup audio is timed by its capture: it isn't held for a
+        // reference that would have arrived long ago, and its analysis is
+        // recorded at that time. The detector still correlates it against the
+        // latest system audio it holds, not the audio of its own moment.
+        const capturedAt = next.capturedAt ?? null;
+        if (holdMs && now - (capturedAt ?? next.queuedAt) < holdMs) {
+          break;
+        }
+
+        meetingPendingMicChunks.shift();
+        const analysis = meetingEchoLeakDetector.analyzeMicChunk(next.buffer, capturedAt ?? now);
+        if (next.analysisOnly) {
+          continue;
+        }
+        if (analysis?.shouldMute && !meetingAecEnabled) {
+          if (!meetingLocalMode) {
+            dispatchMeetingAudioBuffer(Buffer.alloc(next.buffer.length), "mic", false, capturedAt);
+          }
+          continue;
+        }
+
+        dispatchMeetingAudioBuffer(next.buffer, "mic", false, capturedAt);
+      }
+    };
+
+    const meetingMicNeedsReferenceAlignment = () =>
+      Object.hasOwn(MEETING_MIC_REFERENCE_ALIGNMENT_MS, meetingSystemAudioStrategy) &&
+      meetingSystemChunkReceivedAt !== null &&
+      Date.now() - meetingSystemChunkReceivedAt < MEETING_MIC_REFERENCE_RECENT_MS;
+
+    const setMeetingSystemAudioStrategy = (strategy) => {
+      meetingSystemAudioStrategy = strategy;
+      // A capture that fell back no longer delivers the reference these
+      // chunks are waiting for, so release them now.
+      if (!meetingMicNeedsReferenceAlignment()) {
+        flushPendingMeetingMicChunks(true);
+      }
+    };
+
+    const processMeetingMicWithAec = (buffer) => {
+      if (!meetingAecEnabled) {
+        return false;
+      }
+
+      const sent = this.meetingAecManager?.processMicBuffer(buffer);
+      if (sent) {
+        meetingPendingMicChunks.push({
+          buffer,
+          queuedAt: Date.now(),
+          analysisOnly: true,
+        });
+        flushPendingMeetingMicChunks();
+        return true;
+      }
+
+      meetingAecEnabled = false;
+      return false;
+    };
+
+    const stopLiveSpeakerIdentification = async () => {
+      if (!meetingLiveSpeakerActive) {
+        return null;
+      }
+
+      if (meetingReclusterTimer) {
+        clearInterval(meetingReclusterTimer);
+        meetingReclusterTimer = null;
+      }
+
+      meetingLiveSpeakerActive = false;
+      meetingLiveSpeakerState = await liveSpeakerIdentifier.stop();
+      return meetingLiveSpeakerState;
+    };
+
+    const startLiveSpeakerIdentification = async (win, systemAudioMode) => {
+      await stopLiveSpeakerIdentification();
+
+      if (
+        !supportsLiveSpeakerIdentification(systemAudioMode) ||
+        !liveSpeakerIdentifier.isAvailable()
+      ) {
+        return false;
+      }
+
+      const diarizationEnabled = resolveDiarizationEnabled();
+      if (!diarizationEnabled) {
+        return false;
+      }
+
+      meetingLiveSpeakerState = null;
+      // Anchored on the first system chunk instead, in sendMeetingAudio.
+      meetingLiveSpeakerStartedAt = null;
+      const started = await liveSpeakerIdentifier
+        .start(
+          (identification) => {
+            if (!win || win.isDestroyed() || meetingLiveSpeakerStartedAt == null) {
+              return;
+            }
+
+            bindOneOnOneAttendeeToSpeaker(identification.speakerId);
+
+            const displayName = meetingOneOnOneAttendee
+              ? meetingOneOnOneAttendee.displayName
+              : identification.displayName;
+
+            const startTime = Math.max(
+              meetingLiveSpeakerStartedAt,
+              meetingLiveSpeakerStartedAt + identification.startTime * 1000
+            );
+            const endTime = Math.max(
+              startTime,
+              meetingLiveSpeakerStartedAt + identification.endTime * 1000
+            );
+            const enrichedIdentification = {
+              ...identification,
+              displayName,
+              startTime,
+              endTime,
+            };
+
+            win.webContents.send("meeting-speaker-identified", enrichedIdentification);
+
+            for (const seg of meetingDiarizationSegments) {
+              if (
+                seg.source === "system" &&
+                seg.timestamp != null &&
+                seg.timestamp >= startTime &&
+                seg.timestamp <= endTime &&
+                (!seg.speaker || seg.speakerIsPlaceholder)
+              ) {
+                applyConfirmedSpeaker(seg, {
+                  speaker: identification.speakerId,
+                  speakerName: displayName || seg.speakerName,
+                  speakerIsPlaceholder: false,
+                });
+              }
+            }
+          },
+          {
+            getSpeakerProfiles: getLiveSpeakerProfiles,
+            maxSpeakers: resolveSessionMaxSpeakers(),
+            enabled: true,
+            speakerIndexBase: meetingSpeakerIndexBase,
+          }
+        )
+        .catch((error) => {
+          // isAvailable() only stats the model file, so a corrupt model or an
+          // onnxruntime binding that won't load still throws here. Speaker labels
+          // are an enhancement — never let them take the recording down with them.
+          debugLogger.warn(
+            "Live speaker identification start failed",
+            { error: error.message },
+            "speaker"
+          );
+          return false;
+        });
+
+      if (started) {
+        meetingLiveSpeakerActive = true;
+        meetingReclusterTimer = setInterval(async () => {
+          if (!meetingLiveSpeakerActive || !win || win.isDestroyed()) return;
+
+          const merges = await liveSpeakerIdentifier.recluster();
+          if (!merges.length) return;
+
+          for (const { keep, remove, displayName } of merges) {
+            for (const seg of meetingDiarizationSegments) {
+              if (seg.speaker === remove) {
+                seg.speaker = keep;
+                if (displayName) seg.speakerName = displayName;
+              }
+            }
+          }
+
+          win.webContents.send("meeting-speakers-merged", merges);
+        }, 30_000);
+      } else {
+        meetingLiveSpeakerStartedAt = null;
+      }
+
+      return started;
+    };
+
+    const transcribeLocalMeetingChunk = async (source) => {
+      if (this._meetingAdmission?.activeRefusal()) return;
+      const chunks = meetingLocalBuffers[source];
+      if (!chunks.length) return;
+      const lease = this._activeLocalMeetingLease;
+
+      const pcm24k = Buffer.concat(chunks);
+      meetingLocalBuffers[source] = [];
+
+      const pcm16k = downsample24kTo16k(pcm24k);
+
+      const { rms, peak, sampleCount } = computeChunkStats(pcm16k);
+      const verdict = resolveMicChunkAction({
+        mode: "local",
+        source,
+        rms,
+        peak,
+        sampleCount,
+        isSystemSpeaking: () =>
+          meetingEchoLeakDetector.isSystemSpeaking(Date.now() - LOCAL_MEETING_CHUNK_INTERVAL_MS),
+      });
+      if (verdict.action === "skip") {
+        debugLogger.debug(
+          verdict.reason === "silence"
+            ? "Skipping silent meeting chunk"
+            : "Skipping system-dominant mic chunk",
+          {
+            source,
+            rms: rms.toFixed(4),
+            peak: peak.toFixed(4),
+          }
+        );
+        return;
+      }
+
+      const wav = pcm16ToWav(pcm16k);
+
+      const transcribeChunk = () => {
+        if (isSherpaLocalProvider(meetingLocalProvider)) {
+          return this.parakeetManager.transcribeLocalParakeet(wav, {
+            model: meetingLocalModel,
+            language: meetingLocalLanguage,
+          });
+        }
+        return this.whisperManager.transcribeLocalWhisper(wav, {
+          model: meetingLocalModel,
+          language: meetingLocalLanguage,
+          // Keep whisper.cpp's default decoder thresholds on this continuous
+          // load: the raised #1458 values multiply temperature-fallback
+          // re-decodes, and meeting chunks already have RMS-gate, VAD, and
+          // holdback/dedup hallucination protection.
+          skipDecoderThresholds: true,
+          ...this._resolveWhisperVadOptions("meeting"),
+        });
+      };
+
+      try {
+        // Chunks belong to the meeting's lease, so a token rotation can't refuse
+        // one and end the meeting while its verdict is still being re-resolved.
+        const result = await (this._activeLocalMeetingLease
+          ? this._localModelPolicy.runWithLease(this._activeLocalMeetingLease, transcribeChunk)
+          : transcribeChunk());
+        // A decode that outlives a revocation must not deliver its text, as
+        // the streaming path's uncommitted disconnect does not.
+        if (
+          this._audioFeaturePolicy.activeFailure("meeting") ||
+          this._meetingAdmission?.activeRefusal()
+        )
+          return;
+        assertMeetingAllowed();
+
+        if (result?.success && result.text?.trim()) {
+          const text = result.text.trim();
+          if (isWrongScriptFragment(text, fragmentFilterLanguages(meetingConnectionOptions))) {
+            debugLogger.debug("Dropping wrong-script local meeting fragment", { source });
+            return;
+          }
+          const segTimestamp = Date.now();
+          let micSuppression = null;
+          if (source === "mic") {
+            const chunkDurationMs = (pcm24k.length / 2 / 24000) * 1000;
+            micSuppression = shouldSuppressMicTranscriptSegment(
+              segTimestamp - chunkDurationMs,
+              segTimestamp
+            );
+            debugLogger.debug("Local meeting transcription candidate", {
+              source,
+              text: text.slice(0, 80),
+              suppress: micSuppression.suppress,
+              reason: micSuppression.reason,
+              hasBleedEvidence: micSuppression.hasBleedEvidence,
+              likelyRenderBleed: micSuppression.likelyRenderBleed,
+              averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
+              averageResidual: micSuppression.averageResidual?.toFixed(3),
+            });
+            if (micSuppression.suppress) {
+              debugLogger.debug("Suppressing contaminated local mic segment", {
+                reason: micSuppression.reason,
+                averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
+                averageResidual: micSuppression.averageResidual?.toFixed(3),
+                text: text.slice(0, 80),
+              });
+              return;
+            }
+
+            if (shouldSkipDuplicateMicSegment(text, segTimestamp, micSuppression)) {
+              debugLogger.debug("Skipping duplicate local mic segment that matches system audio", {
+                text: text.slice(0, 80),
+                averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
+                averageResidual: micSuppression.averageResidual?.toFixed(3),
+              });
+              return;
+            }
+          } else {
+            debugLogger.debug("Local meeting transcription candidate", {
+              source,
+              text: text.slice(0, 80),
+            });
+          }
+
+          if (source === "system") {
+            const pending = removePendingMicFinalsFor(text, segTimestamp);
+            if (pending.length > 0) {
+              debugLogger.debug(
+                "Dropping buffered local mic segments after system transcript arrived",
+                {
+                  count: pending.length,
+                  text: text.slice(0, 80),
+                }
+              );
+            }
+
+            const retracted = removeRacingMicEntriesFor(text, segTimestamp);
+            for (const stale of retracted) {
+              if (meetingLocalWin && !meetingLocalWin.isDestroyed()) {
+                meetingLocalWin.webContents.send("meeting-transcription-segment", {
+                  text: stale.text,
+                  source: "mic",
+                  type: "retract",
+                  timestamp: stale.timestamp,
+                });
+              }
+            }
+          }
+
+          const sendLocalSegment = (channel, payload) => {
+            if (channel !== "meeting-transcription-segment") {
+              return;
+            }
+
+            if (meetingLocalWin && !meetingLocalWin.isDestroyed()) {
+              meetingLocalWin.webContents.send(channel, payload);
+            }
+          };
+
+          if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {
+            debugLogger.debug("Buffering risky local mic segment before renderer commit", {
+              text: text.slice(0, 80),
+              holdbackMs: LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS,
+              reason: micSuppression?.reason,
+              hasBleedEvidence: micSuppression?.hasBleedEvidence,
+            });
+            queuePendingMicFinal({
+              text,
+              timestamp: segTimestamp,
+              micSuppression,
+              holdbackMs: LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS,
+              emit: () =>
+                sendMeetingFinalSegment({
+                  text,
+                  source,
+                  timestamp: segTimestamp,
+                  timestampIsSpeechStart: false,
+                  micSuppression,
+                  send: sendLocalSegment,
+                  includeInLocalTranscript: true,
+                }),
+            });
+            return;
+          }
+
+          sendMeetingFinalSegment({
+            text,
+            source,
+            timestamp: segTimestamp,
+            timestampIsSpeechStart: false,
+            micSuppression,
+            send: sendLocalSegment,
+            includeInLocalTranscript: true,
+          });
+        }
+      } catch (error) {
+        debugLogger.error("Local meeting transcription chunk failed", {
+          source,
+          error: error.message,
+        });
+        // The revocation that cut it off has already stopped the meeting, with its reason.
+        if (lease?.signal.aborted || this._meetingAdmission?.activeRefusal()) return;
+        if (meetingLocalWin && !meetingLocalWin.isDestroyed()) {
+          meetingLocalWin.webContents.send(
+            "meeting-transcription-error",
+            isLocalModelPolicyRefusal(error) ? error.code : error.message
+          );
+        }
+        if (isLocalModelPolicyRefusal(error)) this._stopMeetingForPolicy?.(error.code);
+      }
+    };
+
+    const transcribeAllLocalBuffers = () => {
+      if (this._audioFeaturePolicy.activeFailure("meeting")) return Promise.resolve();
+      if (meetingLocalTranscribePromise) return meetingLocalTranscribePromise;
+      meetingLocalTranscribePromise = (async () => {
+        try {
+          await transcribeLocalMeetingChunk("system");
+          if (!this._audioFeaturePolicy.activeFailure("meeting"))
+            await transcribeLocalMeetingChunk("mic");
+        } finally {
+          meetingLocalTranscribePromise = null;
+        }
+      })();
+      return meetingLocalTranscribePromise;
+    };
+
+    const settleLocalMeetingTranscription = async () => {
+      if (meetingLocalTimer) {
+        clearInterval(meetingLocalTimer);
+        meetingLocalTimer = null;
+      }
+      await meetingLocalTranscribePromise?.catch(() => {});
+    };
+
+    const dropMeetingMicDiarizationCapture = () => {
+      if (meetingMicDiarizationStream) {
+        meetingMicDiarizationStream.end();
+        meetingMicDiarizationStream = null;
+      }
+      if (meetingMicDiarizationPath) {
+        fs.unlink(meetingMicDiarizationPath, () => {});
+        meetingMicDiarizationPath = null;
+      }
+      meetingMicDiarizationStartedAt = null;
+    };
+
+    const resetMeetingLocalState = () => {
+      if (this._activeLocalMeetingLease) {
+        this._localModelPolicy.release(this._activeLocalMeetingLease);
+        this._activeLocalMeetingLease = null;
+      }
+      if (meetingLocalTimer) {
+        clearInterval(meetingLocalTimer);
+        meetingLocalTimer = null;
+      }
+      if (meetingReclusterTimer) {
+        clearInterval(meetingReclusterTimer);
+        meetingReclusterTimer = null;
+      }
+      void stopLiveSpeakerIdentification();
+      meetingLiveSpeakerState = null;
+      meetingLiveSpeakerStartedAt = null;
+      meetingOneOnOneAttendee = null;
+      meetingOneOnOneProfileBound = false;
+      meetingNoteId = null;
+      meetingSpeakerIndexBase = 0;
+      this._activeMeetingNoteId = null;
+      meetingLocalMode = false;
+      meetingLocalBuffers = { mic: [], system: [] };
+      if (meetingDiarizationStream) {
+        meetingDiarizationStream.end();
+        meetingDiarizationStream = null;
+      }
+      if (meetingDiarizationPath) {
+        fs.unlink(meetingDiarizationPath, () => {});
+        meetingDiarizationPath = null;
+      }
+      meetingDiarizationStartedAt = null;
+      dropMeetingMicDiarizationCapture();
+      meetingSystemAudioHeard = false;
+      meetingSystemAudioHandover.reset();
+      meetingDiarizationSegments = [];
+      meetingRetractedMicSegments = [];
+      meetingLocalWin = null;
+      meetingLocalTranscript = "";
+      meetingLocalProvider = null;
+      meetingLocalModel = null;
+      meetingLocalLanguage = null;
+      meetingPendingMicChunks = [];
+      meetingSystemChunkReceivedAt = null;
+      resetPendingMicFinals();
+      meetingAecEnabled = false;
+      meetingStartedAt = null;
+      meetingEchoLeakDetector.reset();
+    };
+
+    let dictationPreviewMode = false;
+    let dictationPreviewBuffer = [];
+    let dictationPreviewTimer = null;
+    let dictationPreviewTranscribing = false;
+    let dictationPreviewProvider = null;
+    let dictationPreviewModel = null;
+    let dictationPreviewLanguage = null;
+    let dictationPreviewSessionActive = false;
+    let dictationPreviewChunkCount = 0;
+    // Online-runtime models stream here instead of the 1.5s chunked path.
+    let dictationPreviewStream = null;
+    let dictationPreviewPolicyError = null;
+    // false = headless streaming session (commit-only, no preview window).
+    let dictationPreviewDisplay = true;
+    // Bumped on every reset so async preview work can detect a stale session.
+    let dictationPreviewGen = 0;
+    // Cloud partials can arrive faster than the preview window is created. Keep
+    // preview updates, completion, and dismissal ordered so a late partial can
+    // never overwrite the final result or reopen a dismissed window.
+    let dictationPreviewOperation = Promise.resolve();
+
+    const queueDictationPreviewOperation = (operation) => {
+      const result = dictationPreviewOperation.catch(() => {}).then(operation);
+      dictationPreviewOperation = result.then(
+        () => undefined,
+        () => undefined
+      );
+      return result;
+    };
+
+    const resetDictationPreviewState = ({ preserveSession = false } = {}) => {
+      dictationPreviewPolicyError = null;
+      dictationPreviewGen++;
+      if (dictationPreviewTimer) {
+        clearInterval(dictationPreviewTimer);
+        dictationPreviewTimer = null;
+      }
+      if (dictationPreviewStream) {
+        dictationPreviewStream.abort();
+        dictationPreviewStream = null;
+      }
+      dictationPreviewMode = false;
+      if (!preserveSession) {
+        dictationPreviewSessionActive = false;
+      }
+      dictationPreviewBuffer = [];
+      dictationPreviewTranscribing = false;
+      dictationPreviewProvider = null;
+      dictationPreviewModel = null;
+      dictationPreviewLanguage = null;
+      dictationPreviewDisplay = true;
+    };
+
+    this._stopLocalDictationPreview = () => {
+      if (!dictationPreviewMode) return;
+      resetDictationPreviewState();
+      this.windowManager.hideTranscriptionPreview();
+    };
+
+    const stopDictationPreviewForPolicy = (error) => {
+      resetDictationPreviewState();
+      dictationPreviewPolicyError = error;
+      this.windowManager.hideTranscriptionPreview();
+      return { success: false, error: error.message, code: error.code, streamed: false, text: "" };
+    };
+
+    const startDictationPreviewTimer = () => {
+      if (!dictationPreviewTimer) {
+        dictationPreviewTimer = setInterval(() => transcribeDictationPreviewChunk(), 1500);
+      }
+    };
+
+    const transcribeDictationPreviewChunk = async () => {
+      // The chunked path only feeds the preview window.
+      if (!dictationPreviewDisplay) return;
+      if (dictationPreviewTranscribing) return;
+      if (!dictationPreviewBuffer.length) return;
+
+      const gen = dictationPreviewGen;
+      const provider = dictationPreviewProvider;
+      const model = dictationPreviewModel;
+      const language = dictationPreviewLanguage;
+      dictationPreviewTranscribing = true;
+      try {
+        const pcm = Buffer.concat(dictationPreviewBuffer);
+        dictationPreviewBuffer = [];
+
+        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+        let sumSq = 0;
+        for (let i = 0; i < samples.length; i++) {
+          const n = samples[i] / 0x7fff;
+          sumSq += n * n;
+        }
+        const rms = Math.sqrt(sumSq / samples.length);
+        debugLogger.debug("Dictation preview chunk", {
+          pcmBytes: pcm.length,
+          rms: rms.toFixed(6),
+          samples: samples.length,
+        });
+        if (rms < 0.002) return;
+
+        const wav = pcm16ToWav(pcm);
+
+        let result;
+        if (isSherpaLocalProvider(provider)) {
+          result = await this.parakeetManager.transcribeLocalParakeet(wav, {
+            model,
+            language,
+          });
+        } else {
+          const vadOptions = this._resolveWhisperVadOptions("dictation");
+          result = await this.whisperManager.transcribeLocalWhisper(wav, {
+            model,
+            language,
+            ...vadOptions,
+          });
+        }
+
+        if (gen !== dictationPreviewGen) return;
+        if (result?.success && result.text?.trim()) {
+          this.windowManager.appendTranscriptionPreview(result.text.trim());
+        } else if (result && !result.success) {
+          if (isLocalModelPolicyRefusal(result)) {
+            stopDictationPreviewForPolicy(
+              Object.assign(new Error(result.error), { code: result.code })
+            );
+            return;
+          }
+          debugLogger.warn("Dictation preview chunk returned failure", {
+            error: result.error || result.message,
+            provider,
+          });
+        }
+      } catch (error) {
+        if (gen !== dictationPreviewGen) return;
+        if (isLocalModelPolicyRefusal(error)) {
+          stopDictationPreviewForPolicy(error);
+          return;
+        }
+        debugLogger.error("Dictation preview transcription chunk failed", {
+          error: error.message,
+          provider,
+        });
+      } finally {
+        if (gen === dictationPreviewGen) dictationPreviewTranscribing = false;
+      }
+    };
+
+    const resetMeetingStreamingState = () => {
+      this._meetingMicStreaming = null;
+      this._meetingSystemStreaming = null;
+      meetingSendCounts = { mic: 0, system: 0 };
+      meetingMicStatsLogCount = 0;
+      meetingLiveSpeakerStartedAt = null;
+      meetingPendingMicChunks = [];
+      meetingSystemChunkReceivedAt = null;
+      resetPendingMicFinals();
+      meetingAecEnabled = false;
+      meetingEchoLeakDetector.reset();
+      meetingReconnectPromise = null;
+      meetingFatalErrorSent = false;
+      meetingReconnectCount = 0;
+      meetingReconnectedAt = 0;
+      meetingConnectionOptions = null;
+      meetingConnectionWin = null;
+      meetingConnectionKey = null;
+      resetMeetingReconnectAudio();
+    };
+
+    const disconnectMeetingStreaming = async ({ flushPending = false } = {}) => {
+      await Promise.all([
+        this._meetingMicStreaming?.disconnect().catch(() => {}),
+        this._meetingSystemStreaming?.disconnect().catch(() => {}),
+      ]);
+
+      if (flushPending) {
+        flushPendingMicFinals(true);
+      }
+
+      resetMeetingStreamingState();
+    };
+
+    const clearMeetingSystemAudioSilenceTimer = () => {
+      if (meetingSystemAudioSilenceTimer) {
+        clearTimeout(meetingSystemAudioSilenceTimer);
+        meetingSystemAudioSilenceTimer = null;
+      }
+    };
+
+    // One-shot: system capture is active but nothing audible has arrived by the
+    // deadline, so tell the meeting window the remote side may be missing from
+    // the transcript. Audio arriving before the deadline cancels it outright;
+    // the toast itself is time-boxed by the renderer, not by later audio.
+    const armMeetingSystemAudioSilenceTimer = (win, systemAudioStrategy) => {
+      clearMeetingSystemAudioSilenceTimer();
+      meetingSystemAudioSilenceTimer = setTimeout(() => {
+        meetingSystemAudioSilenceTimer = null;
+        if (meetingSystemAudioHeard) return;
+        debugLogger.debug(
+          "Meeting system audio still silent past warning window",
+          { systemAudioStrategy, timeoutMs: MEETING_SYSTEM_AUDIO_SILENCE_WARNING_MS },
+          "meeting"
+        );
+        if (win && !win.isDestroyed()) {
+          win.webContents.send("meeting-system-audio-silent", { systemAudioStrategy });
+        }
+      }, MEETING_SYSTEM_AUDIO_SILENCE_WARNING_MS);
+    };
+
+    const clearMeetingSystemAudioTicker = () => {
+      if (meetingSystemAudioTicker) {
+        clearInterval(meetingSystemAudioTicker);
+        meetingSystemAudioTicker = null;
+      }
+    };
+
+    const stopMeetingSystemAudioWatchdog = () => {
+      clearMeetingSystemAudioTicker();
+      // Detaches the capture too, which strands any restart still in flight.
+      meetingSystemAudioWatchdog.stop();
+      meetingSystemAudioWatchdogWin = null;
+    };
+
+    // Rolling counterpart to the one-shot warning above, which only covers a
+    // session that never produced audio and stops watching once any arrives.
+    const startMeetingSystemAudioWatchdog = (win, systemAudioStrategy) => {
+      // Deliberately not stopMeetingSystemAudioWatchdog(): capture is already
+      // running and attached by this point, and detaching it here would leave a
+      // watchdog that reports stalls it cannot recover from.
+      clearMeetingSystemAudioTicker();
+      meetingSystemAudioWatchdogWin = win;
+      meetingSystemAudioWatchdog.start({
+        systemAudioStrategy,
+        // Only the macOS tap delivers a chunk every period regardless of what
+        // is playing; a gap from the loopback helpers proves nothing.
+        watchesDelivery: systemAudioStrategy === "native",
+      });
+      meetingSystemAudioTicker = setInterval(
+        () => meetingSystemAudioWatchdog.tick(),
+        MEETING_SYSTEM_AUDIO_TICK_MS
+      );
+    };
+
+    const rollbackMeetingTranscriptionStart = async () => {
+      clearMeetingSystemAudioSilenceTimer();
+      stopMeetingSystemAudioWatchdog();
+      if (this.audioTapManager) {
+        await this.audioTapManager.stop().catch(() => {});
+      }
+      if (this.linuxPortalAudioManager) {
+        await this.linuxPortalAudioManager.stop().catch(() => {});
+      }
+      if (this.windowsLoopbackAudioManager) {
+        await this.windowsLoopbackAudioManager.stop().catch(() => {});
+      }
+      await stopMeetingAec();
+      await stopLiveSpeakerIdentification().catch(() => {});
+      // Late finals from either path must land before the reset clears them.
+      await settleLocalMeetingTranscription();
+      await disconnectMeetingStreaming().catch(() => {});
+      resetMeetingLocalState();
+      this.activeMeetingSpeakerConfig = null;
+    };
+
+    const setupDictationCallbacks = (streaming, event) => {
+      const isOrukeet = streaming instanceof OrukeetStreaming;
+      const canNotify = () =>
+        !event.sender.isDestroyed?.() && (!isOrukeet || this._dictationStreaming === streaming);
+      if (isOrukeet) {
+        const ownerGone = () => {
+          streaming.disconnect().catch(() => {});
+          if (this._dictationStreaming === streaming) this._dictationStreaming = null;
+        };
+        event.sender.once?.("destroyed", ownerGone);
+        streaming.onClose = () => event.sender.removeListener?.("destroyed", ownerGone);
+      }
+      streaming.onPartialTranscript = (text) => {
+        event.sender.send("dictation-realtime-partial", text);
+        if (this._dictationPreviewEnabled && text) {
+          this.windowManager.showTranscriptionPreview(text);
+        }
+      };
+      streaming.onFinalTranscript = (text) => {
+        if (canNotify()) event.sender.send("dictation-realtime-final", text);
+      };
+      streaming.onLanguage = (metadata) => {
+        if (canNotify()) event.sender.send("dictation-realtime-language", metadata);
+      };
+      streaming.onError = (err) => {
+        if (!canNotify()) return;
+        event.sender.send("dictation-realtime-error", err.message);
+        if (this._dictationPreviewEnabled) this.windowManager.hideTranscriptionPreview();
+      };
+      streaming.onSessionEnd = (data) => {
+        event.sender.send("dictation-realtime-session-end", data || {});
+        if (this._dictationPreviewEnabled) this.windowManager.hideTranscriptionPreview();
+      };
+    };
+
+    const DICTATION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+    const ORUKEET_IDLE_TIMEOUT_MS = 60 * 1000;
+
+    // A managed Orukeet start owns the connection until its stop. Warmups are for
+    // the next recording, so they neither replace this one's connection nor expire
+    // it as idle. Other routes cue the user only once connected, so they keep
+    // redialling over a warmup.
+    let dictationRecordingActive = false;
+    // Only a cancel stops a start in progress: a tap to stop waits for it to settle.
+    let dictationStopGeneration = 0;
+    const watchedDictationRenderers = new WeakSet();
+    // A renderer that reloads or closes mid-recording never sends its stop.
+    const releaseRecordingWithRenderer = (sender) => {
+      if (watchedDictationRenderers.has(sender)) return;
+      watchedDictationRenderers.add(sender);
+      const release = () => {
+        dictationRecordingActive = false;
+      };
+      sender.on("did-start-loading", release);
+      sender.once("destroyed", release);
+    };
+
+    const clearDictationIdleTimer = () => {
+      if (this._dictationIdleTimer) {
+        clearTimeout(this._dictationIdleTimer);
+        this._dictationIdleTimer = null;
+      }
+    };
+
+    const startDictationIdleTimer = () => {
+      clearDictationIdleTimer();
+      if (dictationRecordingActive) return;
+      const idleTimeoutMs =
+        this._dictationStreaming instanceof OrukeetStreaming
+          ? ORUKEET_IDLE_TIMEOUT_MS
+          : DICTATION_IDLE_TIMEOUT_MS;
+      this._dictationIdleTimer = setTimeout(() => {
+        if (this._dictationStreaming) {
+          debugLogger.debug("Closing idle dictation warmup connection");
+          this._dictationStreaming.disconnect().catch(() => {});
+          this._dictationStreaming = null;
+        }
+      }, idleTimeoutMs);
+    };
+
+    // What a dictation connection was opened for; a start or warmup reuses one
+    // only when nothing about the route changed and, for a connection that reads
+    // a saved key, no key was saved since. OpenAI pins the language when the
+    // session is configured (BYOK session.update, or the cloud token request), so
+    // it is part of that route; the other providers never send it at connect.
+    const dictationConnectionKey = (options) => {
+      const provider = options.provider || "openai-realtime";
+      const readsSavedKey = options.mode === "byok" || provider === "tinfoil-realtime";
+      return JSON.stringify([
+        provider,
+        options.mode,
+        options.model,
+        options.baseUrl,
+        provider === "orukeet" ? options.transcriptionMode : null,
+        options.pipelineOptions,
+        readsSavedKey ? credentialGeneration : null,
+        provider === "openai-realtime"
+          ? OpenAIRealtimeStreaming.normalizeLanguage(options.language)
+          : null,
+      ]);
+    };
+
+    const connectDictationStreaming = async (event, options) => {
+      // Older renderers did not label the OpenAI dictation adapter. Dictation
+      // realtime was OpenAI-only before Tinfoil support, so preserve that
+      // established default while requiring new adapters to be explicit.
+      options = {
+        ...options,
+        provider: options?.provider || "openai-realtime",
+      };
+
+      if (this._dictationConnectPromise) {
+        await this._dictationConnectPromise.catch(() => {});
+      }
+      ownProductStream(this._dictationStreaming);
+
+      clearDictationIdleTimer();
+      this._dictationPreviewEnabled = !!options.preview;
+
+      // The renderer is already streaming frames when a start redials (it wires
+      // the worklet before calling start), so the old session is retired without
+      // a wait, and without a commit where the client supports skipping it: a
+      // commit would only surface its head as a final from the wrong session.
+      // Frames that reached the old session before the start are dropped with it.
+      if (this._dictationStreaming) {
+        retireStreaming(this._dictationStreaming);
+        this._dictationStreaming = null;
+      }
+
+      const connectInner = async () => {
+        const isCloud = options.mode !== "byok";
+        // Dictation renderers before 1.8.4 omit `provider` and mean OpenAI; the
+        // default lives here, at the boundary, so the token allowlist stays
+        // fail-closed for genuinely unknown providers (#1624).
+        const provider = options.provider ?? "openai-realtime";
+        const streaming =
+          provider === "orukeet"
+            ? new OrukeetStreaming(isCloud ? MANAGED_STREAM_OPTIONS : {})
+            : new OpenAIRealtimeStreaming();
+        if (provider === "orukeet")
+          streaming.onUsageError = (metadata) =>
+            debugLogger.error("Combined cleanup usage could not be recorded", metadata);
+        setupDictationCallbacks(streaming, event);
+        // Assign before the token fetch (a real network round trip) so
+        // dictation-realtime-send has a live instance to buffer into instead
+        // of silently dropping the start of the recording.
+        streaming.beginConnecting();
+        streaming.connectionKey = dictationConnectionKey(options);
+        this._dictationStreaming = streaming;
+        ownProductStream(streaming);
+        try {
+          if (provider === "orukeet") {
+            if (isCloud) {
+              await connectManagedOrukeet({
+                streaming,
+                getApiUrl,
+                proxyFetch,
+                tokenStore,
+                withPolicyHeaders,
+                pipelineOptions: options.pipelineOptions,
+              });
+            } else {
+              await streaming.connect({
+                apiKey: this.environmentManager.getCustomTranscriptionKey(),
+                headers:
+                  options.transcriptionMode === "self-hosted"
+                    ? selfHostedRequest("dictation").headers
+                    : {},
+                baseUrl: options.baseUrl,
+              });
+            }
+            return;
+          }
+          const apiKey = await fetchRealtimeToken(event, {
+            mode: options.mode,
+            provider,
+            purpose: "dictation",
+            // Cloud sessions are configured server-side when the secret is minted;
+            // the server also owns the managed model, so only the language is sent.
+            language: OpenAIRealtimeStreaming.normalizeLanguage(options.language) ?? undefined,
+          });
+          ownProductStream(streaming);
+          if (provider === "tinfoil-realtime") {
+            const model = options.model || TINFOIL_REALTIME_MODEL;
+            await streaming.connect({
+              apiKey,
+              model,
+              // The capture worklet emits 16kHz PCM; declare the true rate.
+              inputRate: 16000,
+              createSocket: (signal) => createTinfoilRealtimeSocket({ model, apiKey, signal }),
+            });
+          } else {
+            await streaming.connect({
+              apiKey,
+              model: options.model || "gpt-4o-mini-transcribe",
+              language: options.language,
+              // OpenAI rejects rates below 24kHz; the 16kHz capture is upsampled instead.
+              captureRate: 16000,
+              preconfigured: isCloud,
+            });
+          }
+        } catch (err) {
+          if (provider === "orukeet") await streaming.disconnect().catch(() => {});
+          if (this._dictationStreaming === streaming) this._dictationStreaming = null;
+          throw err;
+        }
+      };
+
+      this._dictationConnectPromise = connectInner();
+      try {
+        await this._dictationConnectPromise;
+      } finally {
+        this._dictationConnectPromise = null;
+      }
+    };
+
+    // Pre-warm: fetch tokens + connect WebSockets before user hits record
+    const prepareMeetingTranscription = async (event, options = {}, signal) => {
+      options = await resolveEnterpriseMeetingOptions(event, options);
+      if (meetingTranscriptionPrepareInProgress || meetingTranscriptionStartInProgress) {
+        debugLogger.debug("Meeting transcription prepare already in progress, ignoring");
+        return { success: false, error: "Operation in progress" };
+      }
+
+      if (!ALLOWED_MEETING_PROVIDERS.has(options.provider)) {
+        return { success: false, error: `Unsupported provider: ${options.provider}` };
+      }
+
+      if (options.provider === "local") {
+        return { success: true };
+      }
+
+      const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
+      const requestedConnectionKey = getMeetingConnectionKey(options, credentialGeneration);
+
+      if (
+        isMeetingStreamingConnected(systemAudioMode) &&
+        meetingConnectionKey === requestedConnectionKey
+      ) {
+        debugLogger.debug("Meeting transcription already prepared (warm connections)");
+        return { success: true, alreadyPrepared: true };
+      }
+
+      meetingTranscriptionPrepareInProgress = true;
+      meetingTranscriptionPreparePromise = (async () => {
+        let timeoutHandle;
+        try {
+          await Promise.race([
+            connectRealtimeStreaming(event, options, signal),
+            new Promise((_, reject) => {
+              timeoutHandle = setTimeout(() => reject(new Error("Prepare timed out")), 15000);
+            }),
+          ]);
+          debugLogger.debug("Meeting transcription prepared (meeting streams warm)");
+          return { success: true };
+        } catch (error) {
+          debugLogger.error("Meeting transcription prepare error", { error: error.message });
+          return toPolicyFailure(error);
+        } finally {
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          meetingTranscriptionPrepareInProgress = false;
+          meetingTranscriptionPreparePromise = null;
+        }
+      })();
+
+      return meetingTranscriptionPreparePromise;
+    };
+    handleAudioFeature("meeting-transcription-prepare", "meeting", prepareMeetingTranscription);
+
+    ipcMain.handle("meeting-transcription-cancel", async () => {
+      if (isMeetingStreamingConnected() || meetingLocalTimer) {
+        return { success: false, reason: "recording-active" };
+      }
+      meetingTranscriptionPrepareInProgress = false;
+      meetingTranscriptionStartInProgress = false;
+      meetingTranscriptionPreparePromise = null;
+      return { success: true };
+    });
+
+    const startMeetingTranscription = async (event, options = {}) => {
+      options = await resolveEnterpriseMeetingOptions(event, options);
+      // Wait for any in-flight prepare to finish before starting
+      if (meetingTranscriptionPreparePromise) {
+        debugLogger.debug("Meeting transcription start: waiting for in-flight prepare");
+        await meetingTranscriptionPreparePromise;
+      }
+
+      if (meetingTranscriptionStartInProgress) {
+        debugLogger.debug("Meeting transcription start already in progress, ignoring");
+        return { success: false, error: "Operation in progress" };
+      }
+
+      if (!ALLOWED_MEETING_PROVIDERS.has(options.provider)) {
+        return { success: false, error: `Unsupported provider: ${options.provider}` };
+      }
+
+      meetingTranscriptionStartInProgress = true;
+      if (options.provider === "local" && this._localModelPolicy) {
+        try {
+          this._activeLocalMeetingLease = await this._localModelPolicy.authorize(
+            "transcription",
+            options.localModel
+          );
+          this._localModelPolicy.assertCurrent(this._activeLocalMeetingLease);
+        } catch (error) {
+          if (this._activeLocalMeetingLease) {
+            this._localModelPolicy.release(this._activeLocalMeetingLease);
+            this._activeLocalMeetingLease = null;
+          }
+          meetingTranscriptionStartInProgress = false;
+          return toPolicyFailure(error);
+        }
+      }
+      // The lifecycle wrapper is the only caller and always injects the same
+      // sessionId it registered; re-deriving one here would silently break
+      // scoped stop/auto-end matching.
+      const recordingSessionId = options.sessionId;
+      meetingStartedAt = Date.now();
+      // Stop captures and clears the segments, but a stop that fails partway
+      // (the audio tap won't stop) never gets there.
+      meetingDiarizationSegments = [];
+      meetingConnectionWin = BrowserWindow.fromWebContents(event.sender);
+      meetingReconnectCount = 0;
+      meetingReconnectedAt = 0;
+      meetingFatalErrorSent = false;
+      this.meetingDetectionEngine?.endRecordingSession();
+      this.meetingDetectionEngine?.setUserRecording(true);
+
+      const completeStart = async (result) => {
+        assertMeetingAllowed();
+        await this.meetingDetectionEngine?.beginRecordingSession({
+          sessionId: recordingSessionId,
+          autoEndEligible: options.autoEndEligible === true,
+          ownerWebContents: event.sender,
+          noteId: options.noteId ?? null,
+          // Renderer loopback may still fail after main chooses its strategy.
+          // Auto-end stays fail-safe until the renderer confirms a real source.
+          systemAudioAvailable: false,
+        });
+        assertMeetingAllowed();
+        setMeetingSystemAudioStrategy(result.systemAudioStrategy);
+        // Arms on any active system-audio strategy — capture follows platform
+        // capability, not call detection — so the warning copy also covers
+        // in-person recordings where a silent system tap is expected.
+        if (result.systemAudioStrategy && result.systemAudioStrategy !== "unsupported") {
+          armMeetingSystemAudioSilenceTimer(meetingConnectionWin, result.systemAudioStrategy);
+          startMeetingSystemAudioWatchdog(meetingConnectionWin, result.systemAudioStrategy);
+        }
+        return {
+          ...result,
+          sessionId: recordingSessionId,
+          speakerIndexBase: meetingSpeakerIndexBase,
+        };
+      };
+
+      try {
+        const systemAudioPlan = await getMeetingSystemAudioPlan({ refreshWindowsCapability: true });
+        let { mode: systemAudioMode, strategy: systemAudioStrategy } = systemAudioPlan;
+        setMeetingSystemAudioStrategy(systemAudioStrategy);
+        const requestedConnectionKey = getMeetingConnectionKey(options, credentialGeneration);
+        meetingEchoLeakDetector.reset();
+        meetingOneOnOneAttendee = resolveOneOnOneAttendeeForNote(options.noteId);
+        meetingOneOnOneProfileBound = false;
+        meetingNoteId = options.noteId ?? null;
+        meetingSpeakerIndexBase = this._resolveMeetingSpeakerIndexBase(
+          meetingNoteId,
+          options.speakerIndexBase
+        );
+        this._activeMeetingNoteId = meetingNoteId;
+
+        // Seed the speaker cap from the note/calendar participants up front so live
+        // identification isn't stuck at the default if the renderer never pushes a config.
+        if (!this.activeMeetingSpeakerConfig) {
+          this.activeMeetingSpeakerConfig = this._resolveInitialMeetingSpeakerConfig(meetingNoteId);
+        }
+
+        if (systemAudioMode === "unsupported" && this._meetingSystemStreaming?.isConnected) {
+          await this._meetingSystemStreaming.disconnect().catch(() => ({ text: "" }));
+          this._meetingSystemStreaming = null;
+        }
+
+        // If already prepared (warm connections from prepare), just re-attach handlers
+        if (
+          !meetingLocalMode &&
+          isMeetingStreamingConnected(systemAudioMode) &&
+          meetingConnectionKey === requestedConnectionKey
+        ) {
+          debugLogger.debug("Meeting transcription start: reusing warm connections");
+          meetingConnectionOptions = options;
+          const win = BrowserWindow.fromWebContents(event.sender);
+          attachMeetingStreamingHandlers(this._meetingMicStreaming, win, "mic");
+          if (systemAudioMode !== "unsupported") {
+            attachMeetingStreamingHandlers(this._meetingSystemStreaming, win, "system");
+          }
+          await startMeetingAec(systemAudioMode);
+          await startLiveSpeakerIdentification(win, systemAudioMode);
+          ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
+            event,
+            systemAudioMode,
+            systemAudioStrategy,
+            "during warm-start reuse"
+          ));
+          return await completeStart({
+            success: true,
+            systemAudioMode,
+            systemAudioStrategy,
+            oneOnOneAttendee: meetingOneOnOneAttendee,
+          });
+        }
+
+        if (options.provider === "local") {
+          await disconnectMeetingStreaming();
+          // The reset clears the options and window this start already chose.
+          meetingConnectionOptions = options;
+          meetingConnectionWin = BrowserWindow.fromWebContents(event.sender);
+          meetingLocalMode = true;
+          meetingLocalProvider = options.localProvider || "whisper";
+          meetingLocalModel = options.localModel || null;
+          meetingLocalLanguage = options.language || null;
+          meetingLocalWin = BrowserWindow.fromWebContents(event.sender);
+          meetingLocalBuffers = { mic: [], system: [] };
+          meetingLocalTranscript = "";
+
+          await startLiveSpeakerIdentification(meetingLocalWin, systemAudioMode);
+          await startMeetingAec(systemAudioMode);
+
+          meetingLocalTimer = setInterval(() => {
+            transcribeAllLocalBuffers();
+          }, LOCAL_MEETING_CHUNK_INTERVAL_MS);
+
+          ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
+            event,
+            systemAudioMode,
+            systemAudioStrategy,
+            "in local meeting mode"
+          ));
+
+          debugLogger.debug("Meeting transcription started in local mode", {
+            provider: meetingLocalProvider,
+            systemAudioMode,
+            systemAudioStrategy,
+          });
+
+          return await completeStart({
+            success: true,
+            systemAudioMode,
+            systemAudioStrategy,
+            oneOnOneAttendee: meetingOneOnOneAttendee,
+          });
+        }
+
+        await connectRealtimeStreaming(event, options);
+        const realtimeWin = BrowserWindow.fromWebContents(event.sender);
+        await startLiveSpeakerIdentification(realtimeWin, systemAudioMode);
+        await startMeetingAec(systemAudioMode);
+        ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
+          event,
+          systemAudioMode,
+          systemAudioStrategy,
+          "in realtime mode"
+        ));
+        return await completeStart({
+          success: true,
+          systemAudioMode,
+          systemAudioStrategy,
+          oneOnOneAttendee: meetingOneOnOneAttendee,
+        });
+      } catch (error) {
+        await rollbackMeetingTranscriptionStart();
+        this.meetingDetectionEngine?.endRecordingSession(recordingSessionId);
+        this.meetingDetectionEngine?.setUserRecording(false);
+        debugLogger.error("Meeting transcription start error", { error: error.message });
+        return toPolicyFailure(error);
+      } finally {
+        meetingTranscriptionStartInProgress = false;
+      }
+    };
+
+    const sendMeetingAudio = (audioBuffer, source, synthetic = false, capturedAt = null) => {
+      if (this._meetingAdmission?.activeRefusal()) return;
+      const effective = this.effectivePolicyManager.getCurrent();
+      if (
+        this._audioFeaturePolicy.activeFailure("meeting") ||
+        (effective.success &&
+          !productOperationAllowed(effective, app.getVersion(), "meeting-transcription", [
+            meetingConnectionOptions ?? {},
+          ]))
+      )
+        return;
+      const outboundBuffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
+      // Auto-end judges "is anyone audible" from the raw chunk of either
+      // channel, before AEC/holdback/muting can swallow it.
+      if (!synthetic) {
+        this.meetingDetectionEngine?.recordMeetingAudioChunk(source, outboundBuffer);
+      }
+
+      if (source === "system") {
+        const receivedAt = Date.now();
+        // Recovery silence repairs sample clocks, but is not current capture
+        // evidence or an AEC reference for the mic arriving now.
+        if (!synthetic) {
+          meetingEchoLeakDetector.recordSystemChunk(outboundBuffer, receivedAt);
+          meetingSystemChunkReceivedAt = receivedAt;
+          if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(outboundBuffer)) {
+            meetingAecEnabled = false;
+          }
+          flushPendingMeetingMicChunks();
+        }
+
+        // Audio the renderer held through the connect arrives in a burst; its
+        // capture time, not its arrival, places its samples.
+        const chunkCapturedAt = capturedAt ?? receivedAt;
+        if (meetingLiveSpeakerActive) {
+          // identification.startTime counts samples from the first chunk the
+          // identifier sees, so the wall-clock anchor has to be the capture of
+          // that chunk. Stamping it when identification starts is only correct
+          // when capture is already running (the macOS tap); the Windows
+          // loopback helper can take seconds to hand over its first buffer, and
+          // a stale anchor shifts every label earlier by that gap.
+          meetingLiveSpeakerStartedAt ??= chunkCapturedAt;
+          void liveSpeakerIdentifier.feedAudio(outboundBuffer);
+        }
+
+        if (!meetingDiarizationStream) {
+          const os = require("os");
+          meetingDiarizationPath = path.join(os.tmpdir(), `ow-diarize-raw-${Date.now()}.pcm`);
+          meetingDiarizationStream = fs.createWriteStream(meetingDiarizationPath);
+          meetingDiarizationStartedAt = chunkCapturedAt;
+        }
+        meetingDiarizationStream.write(outboundBuffer);
+
+        if (!synthetic) {
+          // Every real chunk feeds the watchdog, including actual silence.
+          const { rms, peak } = computeChunkStats(outboundBuffer);
+          const audible = rms >= MEETING_MIC_SILENCE_RMS || peak >= MEETING_MIC_SILENCE_PEAK;
+          meetingSystemAudioWatchdog.recordChunk(audible);
+          if (audible && !meetingSystemAudioHeard) {
+            // A call is audibly underway, so stop paying the mic capture's disk cost.
+            meetingSystemAudioHeard = true;
+            dropMeetingMicDiarizationCapture();
+          }
+        }
+
+        dispatchMeetingAudioBuffer(outboundBuffer, "system", synthetic, capturedAt);
+        return;
+      }
+
+      if (source === "mic") {
+        // Until the session proves to be a call (audible system audio), keep a
+        // raw mic capture so an in-person recording can be diarized. Written
+        // pre-AEC/pre-gate so the timeline stays continuous, like the system
+        // capture above.
+        if (!meetingSystemAudioHeard) {
+          if (!meetingMicDiarizationStream) {
+            const receivedAt = Date.now();
+            meetingMicDiarizationPath = path.join(
+              os.tmpdir(),
+              `ow-diarize-raw-mic-${receivedAt}.pcm`
+            );
+            meetingMicDiarizationStream = fs.createWriteStream(meetingMicDiarizationPath);
+            // Startup audio the renderer held through the connect arrives in a
+            // burst; its capture time, not its arrival, starts the timeline.
+            meetingMicDiarizationStartedAt = capturedAt ?? receivedAt;
+          }
+          meetingMicDiarizationStream.write(outboundBuffer);
+        }
+
+        if (processMeetingMicWithAec(outboundBuffer)) {
+          return;
+        }
+
+        meetingPendingMicChunks.push({
+          buffer: outboundBuffer,
+          queuedAt: Date.now(),
+          capturedAt,
+        });
+        flushPendingMeetingMicChunks();
+        return;
+      }
+    };
+
+    // The Windows helper reports capture_silent when its own stream is silent
+    // while a render endpoint is playing, which activation success cannot
+    // detect. Start renderer loopback beside it; the handover decides whether
+    // it takes the channel.
+    const degradeMeetingSystemAudioToLoopback = (event) => {
+      if (!meetingSystemAudioHandover.begin()) return;
+      debugLogger.warn(
+        "Windows system audio helper captured only silence, starting renderer loopback beside it",
+        {},
+        "meeting"
+      );
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (win && !win.isDestroyed()) {
+        win.webContents.send("meeting-system-audio-degraded");
+      }
+    };
+
+    const completeMeetingSystemAudioHandover = () => {
+      debugLogger.info("Renderer loopback took over system audio capture", {}, "meeting");
+      meetingSystemAudioWatchdog.detachCapture();
+      // Renderer loopback runs on the mic's clock, so the mic stops waiting.
+      setMeetingSystemAudioStrategy("loopback");
+      void this.windowsLoopbackAudioManager?.stop().catch(() => {});
+    };
+
+    const startManagedMeetingSystemAudio = (event, manager, warningLabel, onWarningCode) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const timeline =
+        manager === this.audioTapManager ? require("./meetingAudioTimeline")() : null;
+      let captureStarted = false;
+      const startCapture = () => {
+        if (captureStarted) timeline?.markRestart();
+        captureStarted = true;
+        return manager.start({
+          onChunk: (chunk) => {
+            if (!meetingSystemAudioHandover.acceptNativeChunk(chunk)) return;
+            if (timeline) {
+              timeline.write(chunk, (buffer, synthetic, capturedAt) =>
+                sendMeetingAudio(buffer, "system", synthetic, capturedAt)
+              );
+            } else {
+              sendMeetingAudio(chunk, "system");
+            }
+          },
+          onError: (error) => {
+            if (win && !win.isDestroyed()) {
+              win.webContents.send("meeting-transcription-error", error.message);
+            }
+          },
+          onWarning: (warning) => {
+            debugLogger.warn(
+              warningLabel,
+              { code: warning.code, message: warning.message },
+              "meeting"
+            );
+            onWarningCode?.(warning.code);
+          },
+        });
+      };
+
+      // Keep the native sample timeline through recovery, including the stall
+      // before detection and the helper restart. New sessions get a new timeline.
+      meetingSystemAudioWatchdog.attachCapture({
+        stop: () => manager.stop(),
+        start: startCapture,
+      });
+
+      return startCapture();
+    };
+
+    const fallBackToMicOnly = async (context) => {
+      if (this._meetingSystemStreaming?.isConnected) {
+        await this._meetingSystemStreaming.disconnect().catch((disconnectError) => {
+          debugLogger.debug(
+            `System streaming disconnect during ${context} fallback failed`,
+            { error: disconnectError.message },
+            "meeting"
+          );
+        });
+      }
+      this._meetingSystemStreaming = null;
+      // No system capture left to recover, so drop the restart hook with it.
+      stopMeetingSystemAudioWatchdog();
+      await stopLiveSpeakerIdentification().catch(() => {});
+    };
+
+    const startMeetingSystemAudio = async (
+      event,
+      systemAudioMode,
+      systemAudioStrategy,
+      context
+    ) => {
+      assertMeetingAllowed();
+      if (systemAudioMode === "native") {
+        try {
+          await startManagedMeetingSystemAudio(
+            event,
+            this.audioTapManager,
+            "macOS system audio tap warning",
+            (code) => {
+              // The tap is pinned to the devices it saw at creation, so a route
+              // change can strand it. Restart before the stall window elapses.
+              if (code === "device_invalidated") {
+                meetingSystemAudioWatchdog.reportDeviceInvalidated();
+              }
+            }
+          );
+          return { systemAudioMode, systemAudioStrategy };
+        } catch (error) {
+          debugLogger.warn(
+            `Native system audio tap failed ${context}, falling back to mic-only`,
+            { error: error.message },
+            "meeting"
+          );
+          await fallBackToMicOnly("native");
+          return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
+        }
+      }
+
+      if (systemAudioStrategy === "wasapi-loopback") {
+        try {
+          await startManagedMeetingSystemAudio(
+            event,
+            this.windowsLoopbackAudioManager,
+            "Windows system audio warning",
+            (code) => {
+              if (code === "capture_silent") {
+                degradeMeetingSystemAudioToLoopback(event);
+              }
+            }
+          );
+          return { systemAudioMode, systemAudioStrategy };
+        } catch (error) {
+          debugLogger.warn(
+            `Windows system audio helper failed ${context}, falling back to renderer loopback`,
+            { error: error.message },
+            "meeting"
+          );
+          // The renderer captures via Chromium's display-media loopback when
+          // it sees the downgraded strategy in the start result.
+          return { systemAudioMode, systemAudioStrategy: "loopback" };
+        }
+      }
+
+      if (systemAudioStrategy !== "pipewire-loopback") {
+        return { systemAudioMode, systemAudioStrategy };
+      }
+
+      try {
+        await startManagedMeetingSystemAudio(
+          event,
+          this.linuxPortalAudioManager,
+          "Linux PipeWire system audio warning"
+        );
+        return { systemAudioMode, systemAudioStrategy };
+      } catch (error) {
+        debugLogger.warn(
+          `Linux PipeWire helper failed ${context}, falling back to mic-only`,
+          { error: error.message },
+          "meeting"
+        );
+        await fallBackToMicOnly("PipeWire");
+        return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
+      }
+    };
+
+    // capturedAt marks audio the renderer held while main connected; it is
+    // clamped to the connect window so a renderer can't move the timeline.
+    ipcMain.on("meeting-transcription-send", (_event, audioBuffer, source, capturedAt) => {
+      const buffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
+      if (source === "system") {
+        const route = meetingSystemAudioHandover.acceptRendererChunk(buffer);
+        if (route === "drop") return;
+        if (route === "takeover") completeMeetingSystemAudioHandover();
+      }
+      const now = Date.now();
+      sendMeetingAudio(
+        buffer,
+        source,
+        false,
+        Number.isFinite(capturedAt)
+          ? Math.min(Math.max(capturedAt, now - MEETING_STARTUP_AUDIO_MAX_AGE_MS), now)
+          : null
+      );
+    });
+
+    this._stopMeetingForPolicy = (reason = "policyRestricted", expectedSessionId) => {
+      if (expectedSessionId && policyMeetingStop?.sessionId !== expectedSessionId) return;
+      const wasActive =
+        meetingConnectionOptions ||
+        meetingLocalMode ||
+        meetingTranscriptionStartInProgress ||
+        isMeetingStreamingConnected();
+      meetingConnectionOptions = null;
+      this._activeEnterpriseAudioMeeting = false;
+      for (const stream of [this._meetingMicStreaming, this._meetingSystemStreaming]) {
+        if (stream) {
+          stream.coldStartBuffer = [];
+          stream.disconnect({ commit: false }).catch(() => {});
+        }
+      }
+      if (meetingLocalTimer) {
+        clearInterval(meetingLocalTimer);
+        meetingLocalTimer = null;
+      }
+      // An attendee-policy stop has already been sent to the owning renderer by session ID.
+      if (wasActive && !expectedSessionId)
+        broadcastToWindows("meeting-transcription-error", reason);
+      const stopped = meetingTranscriptionLifecycle.stopSession(
+        expectedSessionId,
+        reason === "accountChanged" || reason === "workspaceChanged" ? "account-change" : "policy"
+      );
+      // The renderer still needs this result after its capture cleanup to bind
+      // diarization to the resumed note's seed rows.
+      if (policyMeetingStop && !policyMeetingStop.promise) policyMeetingStop.promise = stopped;
+      void stopped.catch((error) =>
+        debugLogger.warn("Policy meeting stop failed", { error: error.message })
+      );
+    };
+
+    const stopMeetingTranscription = async (expectedSessionId) => {
+      // Only a *different* live session blocks teardown — it owns the shared
+      // capture now. With no engine session (e.g. after quit-path engine stop)
+      // the streams below must still be torn down.
+      if (this.meetingDetectionEngine?.endRecordingSession(expectedSessionId) === false) {
+        return { success: false, reason: "stale-session" };
+      }
+      this.meetingDetectionEngine?.setUserRecording(false);
+      clearMeetingSystemAudioSilenceTimer();
+      stopMeetingSystemAudioWatchdog();
+      try {
+        if (this.audioTapManager) {
+          await this.audioTapManager.stop();
+        }
+        if (this.linuxPortalAudioManager) {
+          await this.linuxPortalAudioManager.stop().catch(() => {});
+        }
+        if (this.windowsLoopbackAudioManager) {
+          await this.windowsLoopbackAudioManager.stop().catch(() => {});
+        }
+
+        flushPendingMeetingMicChunks(true);
+        await stopMeetingAec();
+
+        const liveSpeakerState = await stopLiveSpeakerIdentification().catch(() => null);
+
+        const diarizationSessionId = `diar-${Date.now()}`;
+        const diarizationWin = meetingLocalWin || this.windowManager.controlPanelWindow;
+
+        if (meetingLocalMode) {
+          try {
+            await settleLocalMeetingTranscription();
+            if (!this._audioFeaturePolicy.activeFailure("meeting"))
+              await transcribeAllLocalBuffers();
+          } catch (err) {
+            debugLogger.error("Local meeting final transcription failed", { error: err.message });
+          }
+          flushPendingMicFinals(true);
+          const {
+            diarizationPcmPath,
+            diarizationSegments,
+            retractedSegments,
+            diarizationStartedAt,
+            diarizedSource,
+          } = await captureMeetingDiarizationState();
+          const transcript =
+            buildOrderedTranscriptText(diarizationSegments) || meetingLocalTranscript;
+          const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
+          const noteIdSnapshot = meetingNoteId;
+          const speakerIndexBaseSnapshot = meetingSpeakerIndexBase;
+          this.activeMeetingSpeakerConfig = null;
+          resetMeetingLocalState();
+
+          // Fire-and-forget background diarization (or notify skip)
+          this._startOrSkipDiarization(
+            diarizationSessionId,
+            diarizationPcmPath,
+            diarizationStartedAt,
+            diarizationSegments,
+            diarizationWin,
+            liveSpeakerState,
+            sessionSpeakerConfigSnapshot,
+            noteIdSnapshot,
+            diarizedSource,
+            speakerIndexBaseSnapshot,
+            retractedSegments
+          );
+
+          return { success: true, transcript, diarizationSessionId };
+        }
+
+        await disconnectMeetingStreaming({ flushPending: true });
+        const {
+          diarizationPcmPath,
+          diarizationSegments,
+          retractedSegments,
+          diarizationStartedAt,
+          diarizedSource,
+        } = await captureMeetingDiarizationState();
+        // An empty accepted transcript is intentional when every final was filtered.
+        // Provider accumulators still contain those rejected rows.
+        const transcript = buildOrderedTranscriptText(diarizationSegments);
+
+        const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
+        const noteIdSnapshot = meetingNoteId;
+        const speakerIndexBaseSnapshot = meetingSpeakerIndexBase;
+        this.activeMeetingSpeakerConfig = null;
+
+        // Fire-and-forget background diarization (or notify skip)
+        this._startOrSkipDiarization(
+          diarizationSessionId,
+          diarizationPcmPath,
+          diarizationStartedAt,
+          diarizationSegments,
+          diarizationWin,
+          liveSpeakerState,
+          sessionSpeakerConfigSnapshot,
+          noteIdSnapshot,
+          diarizedSource,
+          speakerIndexBaseSnapshot,
+          retractedSegments
+        );
+
+        return { success: true, transcript, diarizationSessionId };
+      } catch (error) {
+        debugLogger.error("Meeting transcription stop error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    };
+
+    const meetingTranscriptionLifecycle = createMeetingTranscriptionLifecycle({
+      start: async ({
+        sessionId,
+        ownerWebContents,
+        options: { transcriptionOptions, authGeneration },
+      }) => {
+        const admission = this._meetingAdmission.start(ownerWebContents, {
+          ...transcriptionOptions,
+          sessionId,
+        });
+        if (!admission.success) return admission;
+        policyMeetingStop = {
+          sessionId,
+          ownerWebContents,
+          authGeneration,
+          promise: null,
+        };
+        let result;
+        try {
+          result = await startMeetingTranscription(
+            { sender: ownerWebContents },
+            { ...transcriptionOptions, sessionId }
+          );
+        } finally {
+          if (!result?.success) this._meetingAdmission.end(sessionId);
+        }
+        if (result?.success)
+          this.meetingAuditLog?.recordingStarted({
+            sessionId,
+            noteId: transcriptionOptions.noteId,
+            trigger: transcriptionOptions.startSource,
+          });
+        return result;
+      },
+      stop: (sessionId, reason) => {
+        this.meetingAuditLog?.recordingStopped({ sessionId, reason });
+        return stopMeetingTranscription(sessionId).finally(() =>
+          this._meetingAdmission.end(sessionId)
+        );
+      },
+      onError: (error, sessionId) => {
+        debugLogger.error(
+          "Meeting transcription owner-loss teardown failed",
+          { error: error?.message, sessionId },
+          "meeting"
+        );
+      },
+    });
+
+    ipcMain.handle("is-meeting-recording-disabled", () =>
+      this.managedMeetingPolicy.isMeetingRecordingDisabled()
+    );
+
+    handleAudioFeature(
+      "meeting-transcription-start",
+      "meeting",
+      (event, options = {}) => {
+        const sessionId =
+          typeof options.sessionId === "string" && options.sessionId.length > 0
+            ? options.sessionId
+            : crypto.randomUUID();
+        // A refused start must not replace the owner's current recording in the lifecycle queue.
+        if (
+          (this._audioFeaturePolicy.activeMeetingPolicy()?.externalAttendees ?? "allowed") !==
+          "allowed"
+        ) {
+          const admission = this._meetingAdmission.checkStart(event.sender, {
+            ...options,
+            sessionId,
+          });
+          if (!admission.success) return admission;
+        }
+        return meetingTranscriptionLifecycle.startSession({
+          sessionId,
+          ownerWebContents: event.sender,
+          options: {
+            transcriptionOptions: options,
+            authGeneration: tokenStore.getState().generation,
+          },
+        });
+      },
+      (failure, options = {}) => auditMeetingRefusal(failure, options.startSource, options.noteId)
+    );
+
+    // The renderer refuses some starts itself, before asking main.
+    ipcMain.handle("meeting-recording-refused", (_event, { noteId, startSource, reason } = {}) => {
+      this.meetingAuditLog?.recordingRefused({ noteId, trigger: startSource, reason });
+    });
+
+    ipcMain.handle("meeting-transcription-stop", async (event, expectedSessionId, reason) => {
+      const stopped = policyMeetingStop;
+      if (stopped?.promise && stopped.sessionId === expectedSessionId) {
+        if (
+          stopped.ownerWebContents !== event.sender ||
+          stopped.authGeneration !== tokenStore.getState().generation
+        )
+          return { success: false, reason: "stale-session" };
+        const result = await stopped.promise;
+        return stopped.authGeneration === tokenStore.getState().generation
+          ? result
+          : { success: false, reason: "stale-session" };
+      }
+      // "window-lost" and "app-quit" are main's own findings, never the renderer's.
+      const rendererReason = ["window-lost", "app-quit"].includes(reason) ? null : reason;
+      return meetingTranscriptionLifecycle.stopSession(expectedSessionId, rendererReason);
+    });
+
+    ipcMain.handle(
+      "meeting-transcription-set-system-audio-available",
+      async (event, sessionId, available) => {
+        const updated = await this.meetingDetectionEngine?.setRecordingSystemAudioAvailable(
+          sessionId,
+          available === true,
+          event.sender
+        );
+        return updated === true ? { success: true } : { success: false, reason: "stale-session" };
+      }
+    );
+
+    ipcMain.handle("meeting-transcription-set-mic-muted", (event, sessionId, muted) => {
+      const updated = this.meetingDetectionEngine?.setRecordingMicMuted(
+        sessionId,
+        muted === true,
+        event.sender
+      );
+      return updated === true ? { success: true } : { success: false, reason: "stale-session" };
+    });
+
+    const streamingStartFailure = (err) => {
+      const result = toPolicyFailure(err);
+      if (err.messageKey) result.messageKey = err.messageKey;
+      if (err.networkCode) result.networkCode = err.networkCode;
+      return result;
+    };
+
+    // Every managed Orukeet connection spends a single-use GPU token, and both
+    // post-dictation re-warm paths fire together. Warmups run one at a time so
+    // the second finds the first's fresh socket and reuses it rather than
+    // discarding it and minting another.
+    const isUnusedOrukeetConnection = (streaming, options) =>
+      streaming instanceof OrukeetStreaming &&
+      streaming.isConnected &&
+      !streaming.failure &&
+      !streaming.finalPromise &&
+      streaming.audioBytesSent === 0 &&
+      streaming.connectionKey === dictationConnectionKey(options);
+
+    const warmupDictationStreaming = async (event, options) => {
+      await this._dictationConnectPromise?.catch(() => {});
+      if (dictationRecordingActive) {
+        ownProductStream(this._dictationStreaming);
+        return { success: true, alreadyWarm: true };
+      }
+      if (!isUnusedOrukeetConnection(this._dictationStreaming, options)) {
+        await connectDictationStreaming(event, options);
+        startDictationIdleTimer();
+        return { success: true };
+      }
+      ownProductStream(this._dictationStreaming);
+      startDictationIdleTimer();
+      return { success: true, alreadyWarm: true };
+    };
+
+    let dictationWarmupQueue = Promise.resolve();
+    handleRemoteProduct("dictation-realtime-warmup", (event, options = {}) => {
+      const warmup = dictationWarmupQueue
+        .then(() => warmupDictationStreaming(event, options))
+        .catch(streamingStartFailure);
+      dictationWarmupQueue = warmup;
+      return warmup;
+    });
+
+    handleRemoteProduct("dictation-realtime-start", async (event, options = {}) => {
+      const managedOrukeet = options.provider === "orukeet" && options.mode !== "byok";
+      const stopGeneration = dictationStopGeneration;
+      if (managedOrukeet) {
+        dictationRecordingActive = true;
+        releaseRecordingWithRenderer(event.sender);
+      }
+      try {
+        clearDictationIdleTimer();
+        this._dictationPreviewEnabled = !!options.preview;
+        // A warmup still connecting may be the connection this start wants. Managed audio
+        // waits in the renderer; other routes need the connection before this tick ends.
+        if (managedOrukeet && this._dictationConnectPromise) {
+          await this._dictationConnectPromise.catch(() => {});
+          if (stopGeneration !== dictationStopGeneration) {
+            throw new Error("Dictation start was cancelled");
+          }
+        }
+        if (
+          !this._dictationStreaming?.isConnected ||
+          this._dictationStreaming.connectionKey !== dictationConnectionKey(options)
+        ) {
+          await connectDictationStreaming(event, options);
+        }
+        ownProductStream(this._dictationStreaming);
+        return { success: true };
+      } catch (err) {
+        dictationRecordingActive = false;
+        return streamingStartFailure(err);
+      }
+    });
+
+    ipcMain.on("dictation-realtime-send", (_event, buffer) => {
+      this._dictationStreaming?.sendAudio(Buffer.from(buffer));
+    });
+
+    ipcMain.handle("dictation-realtime-finalize", async () => {
+      if (!(this._dictationStreaming instanceof OrukeetStreaming)) {
+        return { success: false, error: "No Orukeet recording is active" };
+      }
+      try {
+        return { success: true, ...(await this._dictationStreaming.finalize()) };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("dictation-realtime-stop", async () => {
+      dictationStopGeneration += 1;
+      dictationRecordingActive = false;
+      clearDictationIdleTimer();
+      // A policy retirement may already have taken the stream; its preview is still up.
+      const result = this._dictationStreaming
+        ? await this._dictationStreaming.disconnect().catch(() => ({ text: "" }))
+        : { text: "" };
+      this._dictationStreaming = null;
+      if (this._dictationPreviewEnabled) {
+        this.windowManager.hideTranscriptionPreview();
+        this._dictationPreviewEnabled = false;
+      }
+      return { success: true, ...result, text: result.text || "" };
+    });
+
+    handleProduct(
+      "start-dictation-preview",
+      async (_event, { provider, model, language, display = true }) => {
+        resetDictationPreviewState();
+        const gen = dictationPreviewGen;
+        dictationPreviewMode = true;
+        dictationPreviewSessionActive = true;
+        dictationPreviewProvider = provider;
+        dictationPreviewModel = model;
+        dictationPreviewLanguage = language || null;
+        dictationPreviewDisplay = display;
+        dictationPreviewChunkCount = 0;
+        if (display) this.windowManager.showTranscriptionPreview("");
+
+        if (provider === "nvidia" && this.parakeetManager.supportsOnlineStreaming(model)) {
+          try {
+            const stream = await this.parakeetManager.createOnlineStream(model, {
+              onUpdate: (text) => {
+                if (gen === dictationPreviewGen && text && dictationPreviewDisplay) {
+                  this.windowManager.showTranscriptionPreview(text);
+                }
+              },
+              onError: (error) => {
+                if (gen !== dictationPreviewGen || dictationPreviewStream !== stream) return;
+                if (isLocalModelPolicyRefusal(error)) {
+                  stopDictationPreviewForPolicy(error);
+                  return;
+                }
+                // Keep the preview alive on the chunked path; the final
+                // transcript falls back to decoding the full recording.
+                debugLogger.warn("Online preview stream failed mid-session, falling back", {
+                  model,
+                  error: error.message,
+                });
+                dictationPreviewStream = null;
+                if (dictationPreviewDisplay) startDictationPreviewTimer();
+              },
+            });
+            if (gen !== dictationPreviewGen) {
+              stream.abort();
+              return { success: true };
+            }
+            dictationPreviewStream = stream;
+            for (const chunk of dictationPreviewBuffer) {
+              stream.sendPcm16(chunk);
+            }
+            dictationPreviewBuffer = [];
+            return { success: true };
+          } catch (error) {
+            if (gen !== dictationPreviewGen) return { success: true };
+            if (isLocalModelPolicyRefusal(error)) return stopDictationPreviewForPolicy(error);
+            debugLogger.warn("Online preview stream unavailable, falling back to chunked preview", {
+              model,
+              error: error.message,
+            });
+          }
+        }
+
+        if (gen !== dictationPreviewGen) return { success: true };
+        if (!display) {
+          // A headless session exists only to feed the online stream; without
+          // one, buffered PCM would just accumulate with no consumer.
+          resetDictationPreviewState();
+          return { success: true };
+        }
+        startDictationPreviewTimer();
+        return { success: true };
+      }
+    );
+
+    ipcMain.on("dictation-preview-audio", (_event, audioBuffer) => {
+      if (!dictationPreviewMode) return;
+      dictationPreviewChunkCount++;
+      if (dictationPreviewChunkCount <= 3 || dictationPreviewChunkCount % 50 === 0) {
+        debugLogger.debug("Dictation preview audio received", {
+          bytes: audioBuffer?.byteLength || audioBuffer?.length,
+          count: dictationPreviewChunkCount,
+          bufferSize: dictationPreviewBuffer.length,
+        });
+      }
+      const pcm = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
+      if (dictationPreviewStream) {
+        try {
+          dictationPreviewStream.sendPcm16(pcm);
+        } catch (error) {
+          if (isLocalModelPolicyRefusal(error)) stopDictationPreviewForPolicy(error);
+          else throw error;
+        }
+        return;
+      }
+      dictationPreviewBuffer.push(pcm);
+    });
+
+    ipcMain.handle("dismiss-dictation-preview", () =>
+      queueDictationPreviewOperation(async () => {
+        resetDictationPreviewState();
+        this.windowManager.hideTranscriptionPreview();
+        return { success: true };
+      })
+    );
+
+    ipcMain.handle("update-dictation-preview", (_event, text) =>
+      queueDictationPreviewOperation(async () => {
+        if (typeof text !== "string" || !text.trim()) {
+          return { success: true };
+        }
+        if (!dictationPreviewSessionActive) {
+          resetDictationPreviewState();
+          dictationPreviewSessionActive = true;
+          dictationPreviewDisplay = true;
+        }
+        await this.windowManager.showTranscriptionPreview(text);
+        return { success: true };
+      })
+    );
+
+    ipcMain.handle("complete-dictation-preview", (_event, { text } = {}) =>
+      queueDictationPreviewOperation(async () => {
+        if (!dictationPreviewSessionActive) {
+          return { success: true };
+        }
+        if (typeof text === "string" && text.trim()) {
+          this.windowManager.completeTranscriptionPreview(text);
+        } else {
+          resetDictationPreviewState();
+          this.windowManager.hideTranscriptionPreview();
+        }
+        return { success: true };
+      })
+    );
+
+    ipcMain.handle("hide-dictation-preview", () =>
+      queueDictationPreviewOperation(async () => {
+        resetDictationPreviewState();
+        this.windowManager.hideTranscriptionPreview();
+        return { success: true };
+      })
+    );
+
+    ipcMain.handle("stop-dictation-preview", async (_event, options = {}) => {
+      if (dictationPreviewPolicyError) {
+        const refusal = stopDictationPreviewForPolicy(dictationPreviewPolicyError);
+        // Reported once: this stop's dictation carries it from here.
+        dictationPreviewPolicyError = null;
+        return refusal;
+      }
+      if (!dictationPreviewMode && !dictationPreviewSessionActive) {
+        return { success: true, streamed: false, text: "" };
+      }
+      clearInterval(dictationPreviewTimer);
+      dictationPreviewTimer = null;
+      const display = dictationPreviewDisplay;
+      // Missing flag defaults to trusted so non-streaming callers never regress.
+      const rendererFlushOk = options.flushed !== false;
+      let streamed = false;
+      let streamedText = "";
+      if (dictationPreviewStream) {
+        const stream = dictationPreviewStream;
+        dictationPreviewStream = null;
+        const gen = dictationPreviewGen;
+        let result;
+        try {
+          result = await stream.finish();
+        } catch (error) {
+          if (isLocalModelPolicyRefusal(error)) {
+            const refusal = stopDictationPreviewForPolicy(error);
+            dictationPreviewPolicyError = null;
+            return refusal;
+          }
+          result = null;
+        }
+        if (gen !== dictationPreviewGen) {
+          return { success: true, streamed: false, text: "" };
+        }
+        if (result) {
+          streamedText = result.text || "";
+          // Trust the streamed transcript only on a clean server flush and a clean renderer flush.
+          streamed = !result.truncated && rendererFlushOk;
+        }
+        if (streamedText && display && dictationPreviewSessionActive) {
+          this.windowManager.showTranscriptionPreview(streamedText);
+        }
+      }
+      // Offline chunks only draw previews. The renderer decodes the full
+      // recording separately, so another preview decode here competes with
+      // final transcription without contributing to its result.
+      resetDictationPreviewState({ preserveSession: display });
+      if (!display || !dictationPreviewSessionActive) {
+        return { success: true, streamed, text: streamedText };
+      }
+      this.windowManager.holdTranscriptionPreview(options);
+      return { success: true, streamed, text: streamedText };
+    });
+
+    ipcMain.handle("update-transcription-text", async (_event, id, text, rawText) => {
+      try {
+        if (!this.databaseManager.getTranscriptionById(id)) {
+          return { success: false, error: "Transcription not found" };
+        }
+        this.databaseManager.updateTranscriptionText(id, text, rawText);
+        const updated = this.databaseManager.getTranscriptionById(id);
+        return { success: true, transcription: updated };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to update transcription text",
+          { id, error: error.message },
+          "audio-storage"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleRemoteProduct("cloud-reason", async (event, text, opts = {}) => {
+      const sender = event.sender;
+      const senderId = sender.id;
+      const requestId = crypto.randomUUID();
+      const controller = this._cloudReasonRequests.begin(senderId, requestId);
+      const cancelSenderRequests = () => this._cloudReasonRequests.cancelSender(senderId);
+      sender.once("destroyed", cancelSenderRequests);
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        debugLogger.debug(
+          "Cloud reason request",
+          {
+            model: opts.model || "(default)",
+            agentName: opts.agentName || "(none)",
+            textLength: text?.length || 0,
+            hasScreenContext: !!opts.screenContext,
+          },
+          "cloud-api"
+        );
+
+        const response = await proxyFetch(`${apiUrl}/api/reason`, {
+          method: "POST",
+          signal: controller.signal,
+          headers: withPolicyHeaders({
+            "Content-Type": "application/json",
+            ...authHeader,
+          }),
+          body: JSON.stringify({
+            text,
+            model: opts.model,
+            agentName: opts.agentName,
+            customDictionary: opts.customDictionary,
+            // Teammates' words, which the API quotes as data; absent when none.
+            sharedDictionary: opts.sharedDictionary,
+            customPrompt: opts.customPrompt,
+            systemPrompt: opts.systemPrompt,
+            requestPurpose: opts.requestPurpose,
+            promptMode: opts.promptMode,
+            purpose: opts.purpose,
+            screenContext: opts.screenContext,
+            tone: opts.tone,
+            appCategory: opts.appCategory,
+            language: opts.language,
+            locale: opts.locale,
+            sessionId: this.sessionId,
+            clientType: "desktop",
+            appVersion: app.getVersion(),
+            clientVersion: app.getVersion(),
+            streamingFallbackReason: opts.streamingFallbackReason,
+            sttProvider: opts.sttProvider,
+            sttModel: opts.sttModel,
+            sttProcessingMs: opts.sttProcessingMs,
+            sttWordCount: opts.sttWordCount,
+            sttLanguage: opts.sttLanguage,
+            sttDetectedLanguage: opts.sttDetectedLanguage,
+            sttDetectedLanguageConfidence: opts.sttDetectedLanguageConfidence,
+            sttDetectedLanguageAudioSeconds: opts.sttDetectedLanguageAudioSeconds,
+            sttDetectedLanguageStatus: opts.sttDetectedLanguageStatus,
+            orukeetLanguageRouting: opts.orukeetLanguageRouting,
+            orukeetCleanup: opts.orukeetCleanup,
+            audioDurationMs: opts.audioDurationMs,
+            audioSizeBytes: opts.audioSizeBytes,
+            audioFormat: opts.audioFormat,
+            clientTotalMs: opts.clientTotalMs,
+          }),
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+          }
+          if (response.status === 503) {
+            return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+          }
+          throw await readPolicyResponseError(response, `API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        debugLogger.debug(
+          "Cloud reason response",
+          {
+            model: data.model,
+            provider: data.provider,
+            resultLength: data.text?.length || 0,
+            promptMode: data.promptMode,
+            matchType: data.matchType,
+            screenContextApplied: data.screenContextApplied,
+          },
+          "cloud-api"
+        );
+        return {
+          success: true,
+          text: data.text,
+          model: data.model,
+          provider: data.provider,
+          promptMode: data.promptMode,
+          matchType: data.matchType,
+          screenContextApplied: data.screenContextApplied,
+        };
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return { success: false, error: "Cancelled", code: "REASON_CANCELLED" };
+        }
+        debugLogger.error("Cloud reasoning error:", error);
+        return toPolicyFailure(error);
+      } finally {
+        sender.removeListener("destroyed", cancelSenderRequests);
+        this._cloudReasonRequests.complete(senderId, requestId, controller);
+      }
+    });
+
+    ipcMain.on("cloud-reason-cancel", (event) => {
+      this._cloudReasonRequests.cancelSender(event.sender.id);
+    });
+
+    ipcMain.on("cloud-agent-stream-start", async (event, requestId, messages, opts = {}) => {
+      if (typeof requestId !== "string" || !requestId.trim()) return;
+
+      const sender = event.sender;
+      const senderId = sender.id;
+      const controller = this._agentStreamRequests.begin(senderId, requestId);
+      const operation = {
+        channel: "cloud-agent-stream-start",
+        args: [],
+        remote: true,
+        accountId: this.effectivePolicyManager.getCurrent().accountId,
+      };
+      this._productRequests.set(controller, operation);
+      const cancelSenderRequests = () => this._agentStreamRequests.cancelSender(senderId);
+      const sendToRenderer = (channel, payload) => {
+        if (!sender.isDestroyed()) sender.send(channel, payload);
+      };
+      sender.once("destroyed", cancelSenderRequests);
+
+      try {
+        const restricted = () =>
+          Object.assign(new Error(i18nMain.t("common.policyAiProcessingRestricted")), {
+            code: "DEVICE_POLICY_BLOCKED",
+          });
+        if (this.effectivePolicyManager.getCurrent().status === "loading")
+          await awaitVerdict(event);
+        if (!mayStart(operation)) throw restricted();
+        const assertAllowed = () => {
+          const policy = this.effectivePolicyManager.getCurrent();
+          if (
+            policy.localOnly ||
+            !runningOperationAllowed(
+              policy,
+              operation.accountId,
+              app.getVersion(),
+              operation.channel
+            )
+          )
+            throw restricted();
+          controller.signal.throwIfAborted();
+        };
+        assertAllowed();
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        assertAllowed();
+        const response = await proxyFetch(`${apiUrl}/api/agent/stream`, {
+          method: "POST",
+          headers: withPolicyHeaders({
+            "Content-Type": "application/json",
+            ...authHeader,
+          }),
+          body: JSON.stringify({
+            messages,
+            systemPrompt: opts.systemPrompt,
+            tools: opts.tools,
+            ...(opts.screenContext ? { screenContext: opts.screenContext } : {}),
+            sessionId: this.sessionId,
+            clientType: "desktop",
+            appVersion: app.getVersion(),
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const error = await readPolicyResponseError(response, `API error: ${response.status}`);
+          if (response.status === 401 && !error.code) error.code = "AUTH_EXPIRED";
+          if (response.status === 503 && !error.code) error.code = "SERVER_ERROR";
+          sendToRenderer("cloud-agent-stream-error", {
+            requestId,
+            ...toPolicyFailure(error),
+          });
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            assertAllowed();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                sendToRenderer("cloud-agent-stream-chunk", {
+                  requestId,
+                  chunk: JSON.parse(line),
+                });
+              } catch {
+                // skip malformed NDJSON line
+              }
+            }
+          }
+          if (buffer.trim()) {
+            try {
+              sendToRenderer("cloud-agent-stream-chunk", {
+                requestId,
+                chunk: JSON.parse(buffer),
+              });
+            } catch {
+              // skip malformed remainder
+            }
+          }
+        } finally {
+          if (controller.signal.aborted)
+            await reader.cancel(controller.signal.reason).catch(() => {});
+          reader.releaseLock();
+        }
+
+        sendToRenderer("cloud-agent-stream-end", { requestId });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          sendToRenderer("cloud-agent-stream-end", { requestId });
+          return;
+        }
+        debugLogger.error("Cloud agent stream error:", error);
+        sendToRenderer("cloud-agent-stream-error", {
+          requestId,
+          ...toPolicyFailure(error),
+        });
+      } finally {
+        sender.removeListener("destroyed", cancelSenderRequests);
+        this._agentStreamRequests.complete(senderId, requestId, controller);
+        this._productRequests.delete(controller);
+      }
+    });
+
+    ipcMain.on("cloud-agent-stream-cancel", (event, requestId) => {
+      if (typeof requestId !== "string" || !requestId.trim()) return;
+      this._agentStreamRequests.cancel(event.sender.id, requestId);
+    });
+
+    ipcMain.handle("agent-open-note", async (_event, noteId) => {
+      try {
+        const note = this.databaseManager.getNote(noteId);
+        await this.windowManager.queueNoteNavigation({
+          noteId,
+          folderId: note?.folder_id ?? null,
+        });
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to open note from agent:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleRemoteProduct("agent-web-search", async (event, query, numResults = 5) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        debugLogger.debug("Agent web search request", { query, numResults }, "cloud-api");
+
+        const response = await proxyFetch(`${apiUrl}/api/agent/web-search`, {
+          method: "POST",
+          headers: withPolicyHeaders({
+            "Content-Type": "application/json",
+            ...authHeader,
+          }),
+          body: JSON.stringify({ query, numResults }),
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+          }
+          if (response.status === 503) {
+            return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+          }
+          const error = await readPolicyResponseError(response, `API error: ${response.status}`);
+          return toPolicyFailure(error);
+        }
+
+        const data = await response.json();
+        return { success: true, ...data };
+      } catch (error) {
+        debugLogger.error("Agent web search error:", error);
+        return toPolicyFailure(error);
+      }
+    });
+
+    ipcMain.handle(
+      "cloud-streaming-usage",
+      async (event, text, audioDurationSeconds, opts = {}) => {
+        try {
+          const apiUrl = getApiUrl();
+          if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+          const authHeader = await getAuthHeader(event);
+          if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+          const response = await proxyFetch(`${apiUrl}/api/streaming-usage`, {
+            method: "POST",
+            headers: withPolicyHeaders({
+              "Content-Type": "application/json",
+              ...authHeader,
+            }),
+            body: JSON.stringify({
+              text,
+              audioDurationSeconds,
+              sessionId: this.sessionId,
+              clientType: "desktop",
+              appVersion: app.getVersion(),
+              clientVersion: app.getVersion(),
+              sttProvider: opts.sttProvider,
+              sttModel: opts.sttModel,
+              sttProcessingMs: opts.sttProcessingMs,
+              sttLanguage: opts.sttLanguage,
+              sttDetectedLanguage: opts.sttDetectedLanguage,
+              sttDetectedLanguageConfidence: opts.sttDetectedLanguageConfidence,
+              sttDetectedLanguageAudioSeconds: opts.sttDetectedLanguageAudioSeconds,
+              sttDetectedLanguageStatus: opts.sttDetectedLanguageStatus,
+              orukeetLanguageRouting: opts.orukeetLanguageRouting,
+              orukeetCleanup: opts.orukeetCleanup,
+              audioSizeBytes: opts.audioSizeBytes,
+              audioFormat: opts.audioFormat,
+              clientTotalMs: opts.clientTotalMs,
+              sendLogs: opts.sendLogs,
+              clientTranscriptionId: opts.clientTranscriptionId,
+              localDate: opts.localDate,
+              analyticsOccurredAt: opts.analyticsOccurredAt,
+              analyticsWordCount: opts.analyticsWordCount,
+              analyticsCounterVersion: opts.analyticsCounterVersion,
+            }),
+          });
+
+          if (response.status === 401) {
+            return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+          }
+          if (response.status === 503) {
+            return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+          }
+          if (!response.ok) {
+            throw new Error(`API error: ${response.status}`);
+          }
+
+          const data = await response.json();
+          return { success: true, ...data };
+        } catch (error) {
+          debugLogger.error("Cloud streaming usage error", { error: error.message }, "cloud-api");
+          return { success: false, error: error.message };
+        }
+      }
+    );
+
+    ipcMain.handle("cloud-usage", async (event) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        // Never serve entitlement from Chromium's HTTP cache: a cached
+        // response can outlive the account that produced it.
+        const response = await proxyFetch(`${apiUrl}/api/usage`, {
+          headers: authHeader,
+          cache: "no-store",
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+          }
+          if (response.status === 503) {
+            return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+          }
+          const errorData = await response.json().catch(() => ({}));
+          const message = errorData.error || `API error: ${response.status}`;
+          debugLogger.error(`Cloud usage fetch error: ${message}`);
+          return { success: false, error: message, code: errorData.code };
+        }
+
+        const data = await response.json();
+        return { success: true, ...data };
+      } catch (error) {
+        debugLogger.error("Cloud usage fetch error:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    const fetchStripeUrl = async (event, endpoint, errorPrefix, body, expectedAuthGeneration) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const fence =
+          expectedAuthGeneration === undefined
+            ? null
+            : captureAuthFence(tokenStore, expectedAuthGeneration);
+        const authHeader = fence
+          ? { Authorization: fence.authorization }
+          : await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        const headers = { ...authHeader };
+        const fetchOpts = { method: "POST", headers };
+        if (body) {
+          headers["Content-Type"] = "application/json";
+          fetchOpts.body = JSON.stringify(body);
+        }
+
+        const response = fence
+          ? await fence.awaitBound(() => proxyFetch(`${apiUrl}${endpoint}`, fetchOpts))
+          : await proxyFetch(`${apiUrl}${endpoint}`, fetchOpts);
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+          }
+          if (response.status === 503) {
+            return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+          }
+          const errorData = await response.json().catch(() => ({}));
+          const message = errorData.error || `API error: ${response.status}`;
+          debugLogger.error(`${errorPrefix}: ${message}`);
+          return { success: false, error: message, code: errorData.code };
+        }
+
+        const data = fence ? await fence.awaitBound(() => response.json()) : await response.json();
+        return { success: true, url: data.url };
+      } catch (error) {
+        debugLogger.error(`${errorPrefix}: ${error.message}`);
+        return {
+          success: false,
+          error: error.message,
+          ...(error.code ? { code: error.code } : {}),
+        };
+      }
+    };
+
+    ipcMain.handle("cloud-checkout", (event, opts, expectedAuthGeneration) =>
+      fetchStripeUrl(
+        event,
+        "/api/stripe/checkout",
+        "Cloud checkout error",
+        opts || undefined,
+        expectedAuthGeneration
+      )
+    );
+
+    ipcMain.handle("cloud-billing-portal", (event, expectedAuthGeneration) =>
+      fetchStripeUrl(
+        event,
+        "/api/stripe/portal",
+        "Cloud billing portal error",
+        undefined,
+        expectedAuthGeneration
+      )
+    );
+
+    ipcMain.handle("cloud-switch-plan", async (event, opts) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        const response = await proxyFetch(`${apiUrl}/api/stripe/switch-plan`, {
+          method: "POST",
+          headers: { ...authHeader, "Content-Type": "application/json" },
+          body: JSON.stringify(opts),
+        });
+
+        if (response.status === 401) {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        if (response.status === 503) {
+          return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+        }
+
+        const data = await response.json();
+        if (!response.ok) {
+          return { success: false, error: data.error || "Failed to switch plan" };
+        }
+        return data;
+      } catch (error) {
+        debugLogger.error(`Cloud switch plan error: ${error.message}`);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("cloud-preview-switch", async (event, opts) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+        const response = await proxyFetch(`${apiUrl}/api/stripe/preview-switch`, {
+          method: "POST",
+          headers: { ...authHeader, "Content-Type": "application/json" },
+          body: JSON.stringify(opts),
+        });
+
+        if (response.status === 401) {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        if (response.status === 503) {
+          return { success: false, error: "Request timed out", code: "SERVER_ERROR" };
+        }
+
+        const data = await response.json();
+        if (!response.ok) {
+          return { success: false, error: data.error || "Failed to preview plan change" };
+        }
+        return { success: true, ...data };
+      } catch (error) {
+        debugLogger.error(`Cloud preview switch error: ${error.message}`);
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleRemoteProduct("cloud-api-request", async (_event, opts) => {
+      const operation = this._productRequestContext.getStore();
+      if (operation.args[1]?.resolvingShareVisibility) {
+        const path = new URL(opts.path, "https://api.example.test").pathname.replace(
+          /\/rotate-token\/?$/,
+          ""
+        );
+        const current = await handleCloudApiRequest({
+          ...opts,
+          path,
+          method: "GET",
+          body: undefined,
+        });
+        if (!current.success) return current;
+        const data = current.data?.data ?? current.data;
+        operation.args = [opts, { shareVisibility: data?.share?.visibility }];
+        if (
+          !productOperationAllowed(
+            this.effectivePolicyManager.getCurrent(),
+            app.getVersion(),
+            operation.channel,
+            operation.args
+          )
+        )
+          return policyBlockedFailure(this.effectivePolicyManager.getCurrent());
+      }
+      return handleCloudApiRequest(opts);
+    });
+    ipcMain.handle("affiliate-get-candidate", () => ({
+      config: affiliateLinks.configuration(),
+      candidate: affiliateLinks.candidateForCurrentAccount(),
+      generation: tokenStore.getState().generation,
+    }));
+    ipcMain.handle("affiliate-save-candidate", (_event, input) =>
+      affiliateLinks.saveCandidate(input)
+    );
+    ipcMain.handle("affiliate-resolve-link", (_event, link, generation) =>
+      affiliateLinks.resolveLink(link, generation)
+    );
+
+    ipcMain.handle("get-stt-config", handleSttConfigRequest);
+
+    // Answers at once: only the device read gates a window, and the
+    // workspace verdict arrives by broadcast.
+    ipcMain.handle("get-effective-policy", (event, options) => {
+      void this.refreshEffectivePolicy(event, { refresh: options?.refresh === true });
+      return this.effectivePolicyManager.getCurrent();
+    });
+
+    ipcMain.handle(
+      "get-managed-enterprise-config",
+      async (event, accountId, workspaceId, expectedAuthGeneration, forceRefresh = false) => {
+        const active = accountScopeBinding.resolveActiveAccountScope({
+          ...tokenStore.getState(),
+          binding: accountScopeBinding.read(),
+        });
+        if (active?.accountId !== accountId || active?.authGeneration !== expectedAuthGeneration)
+          throw Object.assign(new Error("Enterprise audio identity changed"), {
+            code: "AUTH_CONTEXT_CHANGED",
+          });
+        const scope = { accountId, workspaceId, authGeneration: expectedAuthGeneration };
+        observeDictationWorkspace(scope);
+        const scopeChanged = !matchesEnterpriseAudioScope(scope);
+        if (scopeChanged) {
+          this._enterpriseAudioScopeRevision = (this._enterpriseAudioScopeRevision ?? 0) + 1;
+          this._enterpriseAudioScope = scope;
+          this._enterpriseAudioBinding = null;
+          // Only an enterprise meeting belongs to the old scope; a personal one
+          // continues, and so does one a token rotation leaves in its scope.
+          if (!sameEnterpriseAudioScope(this._enterpriseAudioOwner, scope))
+            this._retireEnterpriseAudio(
+              false,
+              enterpriseAudioStopReason(this._enterpriseAudioOwner, scope)
+            );
+        }
+        const authHeaders = await getAuthHeader(event);
+        const snapshot = await this.enterpriseIdentityManager.getConfig({
+          accountId,
+          workspaceId,
+          expectedAuthGeneration,
+          authHeaders,
+          forceRefresh,
+        });
+        if (snapshot.success && snapshot.config && matchesEnterpriseAudioScope(snapshot)) {
+          const previous = continuedEnterpriseAudioBinding(snapshot);
+          // A cached envelope skips the broadcast, which would otherwise enforce the new scope.
+          const required = scopeChanged && enforcesEnterpriseTranscription(snapshot);
+          if (
+            previous &&
+            (!sameEnterpriseAudioScope(previous, snapshot) ||
+              previous.generation !== snapshot.config.generation)
+          )
+            this._retireEnterpriseAudio(required, enterpriseAudioStopReason(previous, snapshot));
+          else if (!previous && required) this._retireEnterpriseAudio(true);
+          bindEnterpriseAudio({ ...snapshot, generation: snapshot.config.generation });
+        }
+        return snapshot;
+      }
+    );
+    // Any window clears its identity (at boot, on a token rotation, on a purge),
+    // so a clear alone retires nothing; sign-out and account changes retire
+    // enterprise audio where main learns them. A clear that names the scope the
+    // renderer moves to ends work another scope owns, even before it resolves.
+    ipcMain.handle("clear-managed-enterprise-identity", async (_event, options) => {
+      const next = options?.next;
+      if (typeof next?.accountId === "string" && isWorkspaceIdArgument(next.workspaceId))
+        observeDictationWorkspace(next);
+      const owner = this._enterpriseAudioOwner;
+      if (
+        owner &&
+        typeof next?.accountId === "string" &&
+        (typeof next.workspaceId === "string" || next.workspaceId === null) &&
+        !sameEnterpriseAudioScope(owner, next)
+      ) {
+        this._retireEnterpriseAudio(false, enterpriseAudioStopReason(owner, next));
+        this._enterpriseAudioOwner = null;
+      }
+      this._enterpriseAudioBinding = null;
+      this._enterpriseAudioScope = null;
+      this._enterpriseAudioScopeRevision = (this._enterpriseAudioScopeRevision ?? 0) + 1;
+      this.enterpriseIdentityManager.clear();
+    });
+
+    ipcMain.handle("get-note-recording-config", handleNoteRecordingConfigRequest);
+
+    handleRemoteFile("transcribe-audio-file-cloud", async (cancel, event, filePath, opts = {}) => {
+      const requestId = typeof opts?.requestId === "string" ? opts.requestId : null;
+      const purpose = audioFilePurpose(filePath, opts.purpose);
+      return runAudioJob(event, purpose, cancel, async (signal) => {
+        let cleanupUpload = null;
+        try {
+          signal.throwIfAborted();
+          if (typeof filePath !== "string") {
+            return { success: false, error: "Invalid file path" };
+          }
+          const realCloud = resolveAllowedAudioPath(filePath);
+          if (!realCloud) return { success: false, error: "File path not allowed" };
+
+          const apiUrl = getApiUrl();
+          if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+          const authHeader = await getAuthHeader(event);
+          if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+          const multipartFields = {
+            source: purpose === "dictation" ? "dictation" : "file_upload",
+            clientType: "desktop",
+            appVersion: app.getVersion(),
+            clientVersion: app.getVersion(),
+            sessionId: this.sessionId,
+          };
+
+          const fileSize = fs.statSync(realCloud).size;
+
+          if (fileSize > CLOUD_INLINE_LIMIT) {
+            debugLogger.debug("Large file detected, using client-side chunking", {
+              fileSize,
+              filePath: path.basename(realCloud),
+            });
+            const { text, warning, failedChunks, totalChunks } = await chunkedCloudTranscribe({
+              filePath: realCloud,
+              apiUrl,
+              policyHeaders: withPolicyHeaders(authHeader),
+              multipartFields,
+              onProgress: (payload) => event.sender.send("upload-transcription-progress", payload),
+              signal,
+            });
+            return {
+              success: true,
+              text,
+              ...(warning ? { warning, failedChunks, totalChunks } : {}),
+            };
+          }
+
+          const upload = await prepareProviderUpload(realCloud, { signal });
+          cleanupUpload = upload.cleanup;
+          const { body, boundary } = buildMultipartBody(
+            fs.readFileSync(upload.path),
+            path.basename(upload.path),
+            providerContentType(upload.path),
+            multipartFields
+          );
+          const url = new URL(`${apiUrl}/api/transcribe`);
+          const data = await postMultipart(url, body, boundary, withPolicyHeaders(authHeader), {
+            signal: AbortSignal.any([
+              ...(signal ? [signal] : []),
+              AbortSignal.timeout(CLOUD_UPLOAD_TIMEOUT_MS),
+            ]),
+            session: getInlineCloudUploadSession(),
+          });
+          const result = interpretTranscribeResponse(data);
+
+          return { success: true, text: result.text };
+        } catch (error) {
+          if (signal?.aborted) {
+            debugLogger.debug("Cloud audio file transcription cancelled", { requestId });
+            return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+          }
+          debugLogger.error("Cloud audio file transcription error", { error: error.message });
+          return toPolicyFailure(error);
+        } finally {
+          cleanupUpload?.();
+        }
+      });
+    });
+
+    // Unknown or already-finished request ids are a no-op.
+    ipcMain.handle("cancel-upload-transcription", async (_event, requestId) => {
+      return { success: this._uploadCancelRegistry.cancel(requestId) > 0 };
+    });
+
+    handleRemoteFile(
+      "transcribe-audio-file-byok",
+      async (
+        cancel,
+        event,
+        {
+          filePath,
+          durationSeconds,
+          requestId,
+          purpose,
+          apiKey,
+          baseUrl,
+          model,
+          diarize,
+          timestamps,
+          provider,
+          language,
+          environment,
+          tenant,
+          transcriptionMode,
+          remoteTranscriptionUrl,
+          remoteTranscriptionModel,
+          managed,
+        } = {}
+      ) => {
+        const fs = require("fs");
+        const resolvedPurpose = audioFilePurpose(filePath, purpose);
+        return runAudioJob(event, resolvedPurpose, cancel, async (signal) => {
+          let cleanupUpload = null;
+          let providerErrorContext = null;
+          try {
+            signal.throwIfAborted();
+            if (typeof filePath !== "string") {
+              return { success: false, error: "Invalid file path" };
+            }
+            const sourcePath = resolveAllowedAudioPath(filePath);
+            if (!sourcePath) return { success: false, error: "File path not allowed" };
+
+            const { resolveTranscriptionRoute, batchTranscriptionHttpError, uploadsInChunks } =
+              await import("./transcriptionRoute.ts");
+            const route = resolveTranscriptionRoute({
+              policy: productPolicyState(
+                this.effectivePolicyManager.getCurrent(),
+                app.getVersion()
+              ),
+              settings: {
+                transcriptionMode,
+                remoteTranscriptionUrl,
+                remoteTranscriptionModel,
+                cloudTranscriptionProvider: provider,
+                cloudTranscriptionModel: model,
+                cloudTranscriptionBaseUrl: baseUrl,
+                cortiEnvironment: environment,
+                cortiTenant: tenant,
+              },
+              providers: transcriptionProviderBaseUrls(),
+              managed,
+              request: { effectiveLanguage: language || undefined },
+            });
+
+            // Fail closed: a misconfigured route must never fall through to a default.
+            if (route.transport === "error") {
+              return {
+                success: false,
+                error: route.message,
+                code: route.code,
+                messageKey: route.messageKey,
+              };
+            }
+
+            await trackTranscriptionRoute(route, transcriptionMode);
+
+            if (route.transport === "managed") {
+              const result = await transcribeManagedAudio(event, route, {
+                filePath: sourcePath,
+                signal,
+                onProgress: (payload) =>
+                  event.sender.send("upload-transcription-progress", payload),
+              });
+              return { success: true, ...result };
+            }
+
+            // Every branch but the managed one calls a BYOK provider or the user's own server.
+            const byokErrorContext = {
+              provider: transcriptionProviderName(route.provider),
+              selfHosted: route.provider === "self-hosted" || route.provider === "custom",
+              model: route.model,
+              surface: "transcription",
+            };
+
+            // OpenRouter's upstream providers stop after ~60 s of work per request,
+            // so its uploads go out in 4-minute pieces, cut straight from the source
+            // with any video dropped. The whole-file cap below never applies.
+            if (uploadsInChunks(route)) {
+              providerErrorContext = byokErrorContext;
+              if (!apiKey && route.provider !== "custom") {
+                throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+                  provider: byokErrorContext.provider,
+                  surface: "transcription",
+                });
+              }
+              const url = new URL(route.endpoint);
+              const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined;
+              const { text, warning, failedChunks, totalChunks } = await transcribeOpenRouterChunks(
+                {
+                  inputPath: sourcePath,
+                  split: require("./ffmpegUtils").splitAudioFile,
+                  transcribeChunk: async (chunkPath, attemptSignal) => {
+                    const { body, boundary } = buildMultipartBody(
+                      fs.readFileSync(chunkPath),
+                      path.basename(chunkPath),
+                      "audio/mpeg",
+                      { model: route.model }
+                    );
+                    const data = await postMultipart(url, body, boundary, headers, {
+                      signal: attemptSignal,
+                    });
+                    if (data.statusCode === 200) return { text: data.data?.text ?? "" };
+                    debugLogger.warn("OpenRouter upload piece failed", {
+                      piece: path.basename(chunkPath),
+                      status: data.statusCode,
+                      body: redactProviderBody(data.data),
+                    });
+                    // The handler's catch classifies it (asProviderError) by status and body.
+                    throw Object.assign(
+                      new Error(
+                        data.data?.error?.message ||
+                          data.data?.error ||
+                          `API error: ${data.statusCode}`
+                      ),
+                      { statusCode: data.statusCode, responseBody: data.data },
+                      batchTranscriptionHttpError(data.statusCode, route.endpoint)
+                    );
+                  },
+                  onProgress: (payload) =>
+                    event.sender.send("upload-transcription-progress", payload),
+                  signal,
+                }
+              );
+              return {
+                success: true,
+                text,
+                ...(warning ? { warning, failedChunks, totalChunks } : {}),
+              };
+            }
+
+            const upload = await prepareProviderUpload(sourcePath, { signal });
+            cleanupUpload = upload.cleanup;
+            signal.throwIfAborted();
+            const realByok = upload.path;
+            providerErrorContext = byokErrorContext;
+
+            if (route.transport === "http-batch" && route.provider === "self-hosted") {
+              // User's own server, so the 25 MB third-party cap does not apply.
+              const { body, boundary } = buildMultipartBody(
+                fs.readFileSync(realByok),
+                path.basename(realByok),
+                providerContentType(realByok),
+                { model: route.model, language: route.language }
+              );
+              // A voice draft goes to dictation's server, a file to the Upload tab's.
+              const request = selfHostedRequest(audioFilePurpose(filePath, purpose), route);
+              const data = await postMultipart(
+                new URL(route.endpoint),
+                body,
+                boundary,
+                request.headers,
+                { signal, redirect: request.redirect }
+              );
+              if (data.statusCode !== 200) {
+                debugLogger.warn("Self-hosted file transcription failed", {
+                  status: data.statusCode,
+                  body: redactProviderBody(data.data),
+                });
+                throw providerHttpError({
+                  ...providerErrorContext,
+                  status: data.statusCode,
+                  body: data.data,
+                });
+              }
+              return { success: true, text: data.data.text };
+            }
+
+            if (route.transport === "proxied" && route.provider === "assemblyai") {
+              const { text } = await transcribeAssemblyAiDictation(event, {
+                filePath: realByok,
+                contentType: providerContentType(realByok),
+                durationSeconds,
+                language: route.language,
+                apiKey: apiKey || this.environmentManager.getAssemblyAIKey(),
+                signal,
+              });
+              return { success: true, text };
+            }
+
+            const fileSize = fs.statSync(realByok).size;
+            if (route.sizeCapBytes && fileSize > route.sizeCapBytes) {
+              return { success: false, error: byokSizeCapError(route.sizeCapBytes) };
+            }
+
+            if (route.transport === "proxied" && route.provider === "corti") {
+              const clientId = this.environmentManager.getCortiClientId();
+              const clientSecret = this.environmentManager.getCortiClientSecret();
+              if (!clientId || !clientSecret) {
+                throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+                  provider: "Corti",
+                  surface: "transcription",
+                });
+              }
+              const { transcribeAudio } = require("./cortiTranscription");
+              const { text } = await transcribeAudio({
+                environment: route.cortiEnvironment,
+                tenant: route.cortiTenant,
+                clientId,
+                clientSecret,
+                audioBuffer: fs.readFileSync(realByok),
+                signal,
+                language: route.language,
+              });
+              return { success: true, text };
+            }
+
+            if (route.transport === "proxied" && route.provider === "tinfoil") {
+              const { text } = await transcribeWithTinfoil({
+                audioBuffer: fs.readFileSync(realByok),
+                signal,
+                fileName: path.basename(realByok),
+                contentType: providerContentType(realByok),
+                language: route.language,
+                apiKey: this.environmentManager.getTinfoilKey(),
+              });
+              return { success: true, text };
+            }
+
+            if (route.transport === "proxied" && route.provider === "gemini") {
+              // Deliberately no language hint — same rationale as the multipart
+              // branch below, and Gemini's language_codes is a hard constraint.
+              const { text } = await transcribeWithGemini({
+                audioBuffer: fs.readFileSync(realByok),
+                signal,
+                model: route.model,
+                contentType: providerContentType(realByok),
+                apiKey: apiKey || this.environmentManager.getGeminiKey(),
+              });
+              return { success: true, text };
+            }
+
+            if (route.transport === "proxied" && route.provider === "elevenlabs") {
+              // No language hint, as for the other uploads: a file is often not
+              // in the dictation language.
+              const { text } = await transcribeElevenLabsSpeech({
+                audioBuffer: fs.readFileSync(realByok),
+                signal,
+                model: route.model,
+                fileName: path.basename(realByok),
+                contentType: providerContentType(realByok),
+                apiKey: apiKey || this.environmentManager.getElevenlabsKey(),
+              });
+              return { success: true, text };
+            }
+
+            if (!apiKey && route.provider !== "custom") {
+              throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+                provider: transcriptionProviderName(route.provider),
+                surface: "transcription",
+              });
+            }
+
+            const audioBuffer = fs.readFileSync(realByok);
+            const contentType = providerContentType(realByok);
+            const fileName = path.basename(realByok);
+
+            // mistral/xai have no OpenAI-compatible endpoint — talk to them
+            // directly; everything else consumes the route endpoint as-is.
+            let transcriptionUrl;
+            const multipartFields = {};
+            if (route.provider === "xai") {
+              transcriptionUrl = XAI_STT_URL;
+              // xAI STT accepts no model field; the route pre-filters language
+              if (route.language) {
+                multipartFields.language = route.language;
+                multipartFields.format = "true";
+              }
+            } else {
+              transcriptionUrl =
+                route.provider === "mistral" ? MISTRAL_TRANSCRIPTION_URL : route.endpoint;
+              multipartFields.model = route.model;
+              // No language field: an uploaded file is often not in the dictation
+              // language, and a wrong hint silently mistranscribes it. Providers
+              // that require one (Corti) are handled on their own branch above.
+            }
+
+            const filterDictation =
+              resolvedPurpose === "dictation" &&
+              !diarize &&
+              !timestamps &&
+              supportsWhisperSegments(route.provider, route.model);
+            if (diarize) {
+              // A Custom endpoint may front OpenAI or Mistral, so fall back to the
+              // resolved host before giving up on speaker labels.
+              const diarizeTarget =
+                route.provider === "custom" ? diarizationHost(route.endpoint) : route.provider;
+              if (diarizeTarget === "mistral") {
+                multipartFields.diarize = "true";
+                multipartFields.timestamp_granularities = "segment";
+              } else if (diarizeTarget === "openai") {
+                multipartFields.model = "gpt-4o-transcribe-diarize";
+                // Speaker annotations require diarized_json; verbose_json is not supported by this model.
+                multipartFields.response_format = "diarized_json";
+                multipartFields.chunking_strategy = "auto";
+              } else {
+                // Degrade to a plain transcript, never fail the upload.
+                debugLogger.warn(
+                  "BYOK diarization requested but provider is not OpenAI/Mistral; transcribing without speakers",
+                  { provider: route.provider, endpoint: route.endpoint }
+                );
+              }
+            } else if (timestamps || filterDictation) {
+              // Providers/models that don't support the request keep the
+              // plain-text request untouched (helper returns null).
+              const fields = timestampRequestFields(route.provider, route.model);
+              if (fields) Object.assign(multipartFields, fields);
+            }
+
+            const { body, boundary } = buildMultipartBody(
+              audioBuffer,
+              fileName,
+              contentType,
+              multipartFields
+            );
+
+            const url = new URL(transcriptionUrl);
+            // Mistral authenticates with x-api-key, not Bearer.
+            const headers = apiKey
+              ? route.provider === "mistral"
+                ? { "x-api-key": apiKey }
+                : route.transport === "http-batch" && route.auth.scheme === "azure-api-key"
+                  ? { "api-key": apiKey }
+                  : { Authorization: `Bearer ${apiKey}` }
+              : undefined;
+            const data = await postMultipart(url, body, boundary, headers, { signal });
+
+            if (data.statusCode !== 200) {
+              debugLogger.warn("BYOK file transcription failed", {
+                provider: route.provider,
+                status: data.statusCode,
+                body: redactProviderBody(data.data),
+              });
+              throw providerHttpError({
+                ...providerErrorContext,
+                status: data.statusCode,
+                body: data.data,
+              });
+            }
+
+            if (diarize && data.data?.speakers) {
+              const segments = (data.data.speakers || []).map((s) => ({
+                speaker: s.id || `Speaker ${s.speaker || "?"}`,
+                text: s.text || "",
+                start: s.start || 0,
+                end: s.end || 0,
+              }));
+              const formatted = segments
+                .map(
+                  (s) =>
+                    `[${s.speaker}] ${formatDiarTime(s.start)} - ${formatDiarTime(s.end)}\n${s.text}`
+                )
+                .join("\n\n");
+              return { success: true, text: formatted, diarized: true, segments };
+            }
+
+            if (diarize && data.data?.segments) {
+              const segments = (data.data.segments || []).map((s) => ({
+                speaker: s.speaker || "Speaker ?",
+                text: s.text || "",
+                start: s.start || 0,
+                end: s.end || 0,
+              }));
+              const formatted = segments
+                .map(
+                  (s) =>
+                    `[${s.speaker}] ${formatDiarTime(s.start)} - ${formatDiarTime(s.end)}\n${s.text}`
+                )
+                .join("\n\n");
+              return { success: true, text: formatted, diarized: true, segments };
+            }
+
+            if (diarize) {
+              debugLogger.warn("BYOK diarization requested but provider returned no speaker data");
+            }
+            const segments = timestamps ? mapVerboseSegments(data.data) : null;
+            if (timestamps && !segments) {
+              debugLogger.debug("BYOK transcription returned no usable segment timing", {
+                provider: route.provider,
+                hasSegments: Array.isArray(data.data?.segments),
+              });
+            }
+            const text = filterDictation ? dropNoSpeechSegments(data.data) : data.data.text;
+            return { success: true, text, ...(segments ? { segments } : {}) };
+          } catch (rawError) {
+            if (signal.aborted) {
+              return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+            }
+            const error = providerErrorContext
+              ? asProviderError(rawError, providerErrorContext)
+              : rawError;
+            debugLogger.error("BYOK audio file transcription error", { error: error.message });
+            return { success: false, ...ipcErrorFields(error) };
+          } finally {
+            cleanupUpload?.();
+          }
+        });
+      }
+    );
+
+    ipcMain.handle("get-referral-stats", async (event) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) {
+          throw new Error("OpenWhispr API URL not configured");
+        }
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) {
+          throw new Error("Not authenticated");
+        }
+
+        const response = await proxyFetch(`${apiUrl}/api/referrals/stats`, {
+          headers: {
+            ...authHeader,
+          },
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            throw new Error("Unauthorized - please sign in");
+          }
+          if (response.status === 503) {
+            throw new Error("Service temporarily unavailable");
+          }
+          throw new Error(`Failed to fetch referral stats: ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data;
+      } catch (error) {
+        debugLogger.error("Error fetching referral stats:", error);
+        throw error;
+      }
+    });
+
+    ipcMain.handle("send-referral-invite", async (event, email) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) {
+          throw new Error("OpenWhispr API URL not configured");
+        }
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) {
+          throw new Error("Not authenticated");
+        }
+
+        const response = await proxyFetch(`${apiUrl}/api/referrals/invite`, {
+          method: "POST",
+          headers: {
+            ...authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ email }),
+        });
+
+        if (!response.ok) {
+          let errorMessage = `Failed to send invite: ${response.status}`;
+          try {
+            const errorData = await response.json();
+            if (errorData.error) errorMessage = errorData.error;
+          } catch (_) {}
+          throw new Error(errorMessage);
+        }
+
+        const data = await response.json();
+        return data;
+      } catch (error) {
+        debugLogger.error("Error sending referral invite:", error);
+        throw error;
+      }
+    });
+
+    ipcMain.handle("get-referral-invites", async (event) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) {
+          throw new Error("OpenWhispr API URL not configured");
+        }
+
+        const authHeader = await getAuthHeader(event);
+        if (!Object.keys(authHeader).length) {
+          throw new Error("Not authenticated");
+        }
+
+        const response = await proxyFetch(`${apiUrl}/api/referrals/invites`, {
+          headers: {
+            ...authHeader,
+          },
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            throw new Error("Unauthorized - please sign in");
+          }
+          if (response.status === 503) {
+            throw new Error("Service temporarily unavailable");
+          }
+          throw new Error(`Failed to fetch referral invites: ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data;
+      } catch (error) {
+        debugLogger.error("Error fetching referral invites:", error);
+        throw error;
+      }
+    });
+
+    ipcMain.handle("get-model-cache-root", () => {
+      const { getCacheRoot } = require("./modelDirUtils");
+      return getCacheRoot();
+    });
+
+    ipcMain.handle("open-whisper-models-folder", async () => {
+      try {
+        const { getCacheRoot } = require("./modelDirUtils");
+        const cacheRoot = getCacheRoot();
+        await fs.promises.mkdir(cacheRoot, { recursive: true });
+        const errMsg = await shell.openPath(cacheRoot);
+        if (errMsg) return { success: false, error: errMsg };
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to open model cache folder:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("get-ydotool-status", () => {
+      const { getYdotoolStatus } = require("./ensureYdotool");
+      return getYdotoolStatus();
+    });
+
+    ipcMain.handle("get-debug-state", async () => {
+      try {
+        return {
+          enabled: debugLogger.isEnabled(),
+          logPath: debugLogger.getLogPath(),
+          logLevel: debugLogger.getLevel(),
+        };
+      } catch (error) {
+        debugLogger.error("Failed to get debug state:", error);
+        return { enabled: false, logPath: null, logLevel: "info" };
+      }
+    });
+
+    ipcMain.handle("set-debug-logging", async (event, enabled) => {
+      try {
+        await this.environmentManager.saveDebugLogging(enabled);
+
+        debugLogger.refreshLogLevel();
+        // Each window caches its level on first log, so tell them all to re-read it.
+        broadcastToWindows("log-level-changed");
+
+        return {
+          success: true,
+          enabled: debugLogger.isEnabled(),
+          logPath: debugLogger.getLogPath(),
+        };
+      } catch (error) {
+        debugLogger.error("Failed to set debug logging:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("open-logs-folder", async () => {
+      try {
+        const logsDir = path.join(app.getPath("userData"), "logs");
+        await shell.openPath(logsDir);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to open logs folder:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle(
+      "get-model-registry-updates",
+      () => process.env.OPENWHISPR_MODEL_REGISTRY_MODE !== "bundled"
+    );
+
+    ipcMain.handle("set-model-registry-updates", async (event, enabled) => {
+      try {
+        await this.environmentManager.saveModelRegistryUpdates(enabled === true);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to save model catalog updates setting:", error);
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("check-for-updates", async () => {
+      return this.updateManager.checkForUpdates();
+    });
+
+    ipcMain.handle("download-update", async () => {
+      return this.updateManager.downloadUpdate();
+    });
+
+    ipcMain.handle("install-update", async () => {
+      return this.updateManager.installUpdate();
+    });
+
+    ipcMain.handle("get-app-version", async () => {
+      return this.updateManager.getAppVersion();
+    });
+
+    ipcMain.handle("get-post-migration-state", () => ({
+      justMigrated: postMigrationDetector.isReturningFromOldBundle(),
+    }));
+
+    ipcMain.handle("get-oauth-protocol-registered", () => this.oauthProtocolRegistered);
+
+    ipcMain.handle("get-oauth-protocol", () => this.oauthProtocol);
+
+    ipcMain.handle("mark-bundle-migrated", () => {
+      postMigrationDetector.markBundleMigrated();
+    });
+
+    ipcMain.handle("mark-bundle-migration-dismissed", () => {
+      postMigrationDetector.markBundleMigrationDismissed();
+    });
+
+    ipcMain.handle("get-update-status", async () => {
+      return this.updateManager.getUpdateStatus();
+    });
+
+    ipcMain.handle("get-update-info", async () => {
+      return this.updateManager.getUpdateInfo();
+    });
+
+    ipcMain.handle("set-auto-updates-enabled", async (_event, enabled) => {
+      this.updateManager.setAutoUpdatesEnabled(enabled === true);
+      return { success: true };
+    });
+
+    const fetchStreamingToken = async (event) => {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        throw new Error("OpenWhispr API URL not configured");
+      }
+
+      const authHeader = await getAuthHeader(event);
+      if (!Object.keys(authHeader).length) {
+        throw new Error("Not authenticated");
+      }
+
+      const tokenResponse = await proxyFetch(`${apiUrl}/api/streaming-token`, {
+        method: "POST",
+        headers: withPolicyHeaders({
+          "Content-Type": "application/json",
+          ...authHeader,
+        }),
+        body: JSON.stringify({ purpose: "dictation" }),
+      });
+
+      if (!tokenResponse.ok) {
+        if (tokenResponse.status === 401) {
+          const err = new Error("Session expired");
+          err.code = "AUTH_EXPIRED";
+          throw err;
+        }
+        throw await readPolicyResponseError(
+          tokenResponse,
+          `Failed to get streaming token: ${tokenResponse.status}`
+        );
+      }
+
+      const { token } = await tokenResponse.json();
+      if (!token) {
+        throw new Error("No token received from API");
+      }
+
+      return token;
+    };
+
+    // BYOK dictation mints through the shared realtime-token table instead of the
+    // account-scoped server endpoint, so it needs neither an API URL nor a
+    // session. The client's token cache is deliberately bypassed on that path:
+    // AssemblyAI's BYOK grant lives 60 seconds against a 5-minute cache window,
+    // and a cache shared across modes would replay a managed token as a BYOK one.
+    const fetchAssemblyAiToken = (event, byok) =>
+      byok
+        ? fetchRealtimeToken(event, { mode: "byok", provider: "assemblyai-realtime" })
+        : fetchStreamingToken(event);
+
+    // A warm socket opened before the latest key save still carries the old key;
+    // dropping it sends the start out on a fresh connect with the new one. Starts
+    // check right before connecting, because a warmup that was still minting can
+    // open its socket during the start's own token fetch.
+    const dropStaleWarmConnection = (streaming) => {
+      if (streaming.warmConnectionOptions?.credentialGeneration !== credentialGeneration) {
+        streaming.cleanupWarmConnection();
+      }
+    };
+
+    // A warmup replaces a stale ready socket instead of reporting it warm, so the
+    // next start finds one with the new key. A socket still opening is left to the
+    // start: closing it mid-handshake would fail the warmup that opened it.
+    const dropStaleReadyWarmConnection = (streaming) => {
+      if (streaming.hasWarmConnection()) dropStaleWarmConnection(streaming);
+    };
+
+    handleRemoteProduct("assemblyai-streaming-warmup", async (event, options = {}) => {
+      try {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
+          return { success: false, error: "API not configured", code: "NO_API" };
+        }
+
+        if (!this.assemblyAiStreaming) {
+          this.assemblyAiStreaming = new AssemblyAiStreaming();
+        }
+        const streaming = ownProductStream(this.assemblyAiStreaming);
+        streaming.adoptMode(options);
+        if (byok) dropStaleReadyWarmConnection(streaming);
+
+        if (streaming.hasWarmConnection()) {
+          debugLogger.debug("AssemblyAI connection already warm", {}, "streaming");
+          return { success: true, alreadyWarm: true };
+        }
+
+        // Read before the key is, so a save during the mint marks this socket stale.
+        const generation = credentialGeneration;
+        let token = byok ? null : streaming.getCachedToken();
+        if (!token) {
+          debugLogger.debug("Fetching new streaming token for warmup", { byok }, "streaming");
+          token = await fetchAssemblyAiToken(event, byok);
+        }
+
+        ownProductStream(streaming);
+        await streaming.warmup({
+          ...options,
+          token,
+          credentialGeneration: generation,
+        });
+        debugLogger.debug("AssemblyAI connection warmed up", {}, "streaming");
+
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("AssemblyAI warmup error", { error: error.message });
+        return toPolicyFailure(error);
+      }
+    });
+
+    let streamingStartInProgress = false;
+
+    handleRemoteProduct("assemblyai-streaming-start", async (event, options = {}) => {
+      if (streamingStartInProgress) {
+        debugLogger.debug("Streaming start already in progress, ignoring", {}, "streaming");
+        return { success: false, error: "Operation in progress" };
+      }
+
+      streamingStartInProgress = true;
+      let streaming;
+      try {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
+          return { success: false, error: "API not configured", code: "NO_API" };
+        }
+
+        const win = BrowserWindow.fromWebContents(event.sender);
+
+        if (!this.assemblyAiStreaming) {
+          this.assemblyAiStreaming = new AssemblyAiStreaming();
+        }
+        streaming = ownProductStream(this.assemblyAiStreaming);
+        streaming.adoptMode(options);
+
+        // Clean up any stale active connection (shouldn't happen normally)
+        if (streaming.isConnected) {
+          debugLogger.debug(
+            "AssemblyAI cleaning up stale connection before start",
+            {},
+            "streaming"
+          );
+          await streaming.disconnect({ commit: false });
+          ownProductStream(streaming);
+        }
+
+        const hasWarm = streaming.hasWarmConnection();
+        debugLogger.debug(
+          "AssemblyAI streaming start",
+          { hasWarmConnection: hasWarm },
+          "streaming"
+        );
+
+        // Buffer before the token fetch (a network round trip for BYOK, even when
+        // a warm socket will carry the session) so assemblyai-streaming-send has
+        // somewhere to put the first frames.
+        streaming.beginConnecting();
+        let token = byok ? null : streaming.getCachedToken();
+        if (!token) {
+          debugLogger.debug("Fetching streaming token", { byok }, "streaming");
+          token = await fetchAssemblyAiToken(event, byok);
+          ownProductStream(streaming);
+          if (!byok) streaming.cacheToken(token);
+        } else {
+          debugLogger.debug("Using cached streaming token", {}, "streaming");
+        }
+
+        // Set up callbacks to forward events to renderer
+        streaming.onPartialTranscript = (text) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("assemblyai-partial-transcript", text);
+          }
+        };
+
+        streaming.onFinalTranscript = (text) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("assemblyai-final-transcript", text);
+          }
+        };
+
+        streaming.onError = (error) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("assemblyai-error", error.message);
+          }
+        };
+
+        streaming.onSessionEnd = (data) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("assemblyai-session-end", data);
+          }
+        };
+
+        if (byok) dropStaleWarmConnection(streaming);
+        await streaming.connect({ ...options, token });
+        ownProductStream(streaming);
+        debugLogger.debug("AssemblyAI streaming started", {}, "streaming");
+
+        return {
+          success: true,
+          usedWarmConnection: streaming.hasWarmConnection() === false,
+        };
+      } catch (error) {
+        debugLogger.error("AssemblyAI streaming start error", { error: error.message });
+        // Nothing is in flight after a failed start, so its held audio goes too.
+        streaming?.cleanup();
+        if (error.code === "AUTH_EXPIRED") {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        return streamingStartFailure(error);
+      } finally {
+        streamingStartInProgress = false;
+      }
+    });
+
+    ipcMain.on("assemblyai-streaming-send", (event, audioBuffer) => {
+      try {
+        if (!this.assemblyAiStreaming) return;
+        const buffer = Buffer.from(audioBuffer);
+        this.assemblyAiStreaming.sendAudio(buffer);
+      } catch (error) {
+        debugLogger.error("AssemblyAI streaming send error", { error: error.message });
+      }
+    });
+
+    ipcMain.on("assemblyai-streaming-force-endpoint", () => {
+      this.assemblyAiStreaming?.forceEndpoint();
+    });
+
+    ipcMain.handle("assemblyai-streaming-stop", async () => {
+      try {
+        let result = { text: "" };
+        if (this.assemblyAiStreaming) {
+          result = await this.assemblyAiStreaming.disconnect();
+          this.assemblyAiStreaming.cleanupAll();
+          this.assemblyAiStreaming = null;
+        }
+
+        return { success: true, text: result?.text || "" };
+      } catch (error) {
+        debugLogger.error("AssemblyAI streaming stop error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("assemblyai-streaming-status", async () => {
+      if (!this.assemblyAiStreaming) {
+        return { isConnected: false, sessionId: null };
+      }
+      return this.assemblyAiStreaming.getStatus();
+    });
+
+    let deepgramTokenWindowId = null;
+
+    const fetchDeepgramStreamingTokenFromWindow = async (windowId) => {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+
+      const win = BrowserWindow.fromId(windowId);
+      if (!win || win.isDestroyed()) throw new Error("Window not available for token refresh");
+
+      const authHeader = await getAuthHeaderFromWindow(win);
+      if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
+
+      const tokenResponse = await proxyFetch(`${apiUrl}/api/deepgram-streaming-token`, {
+        method: "POST",
+        headers: withPolicyHeaders({ "Content-Type": "application/json", ...authHeader }),
+        body: JSON.stringify({ purpose: "dictation" }),
+      });
+
+      if (!tokenResponse.ok) {
+        if (tokenResponse.status === 401) {
+          const err = new Error("Session expired");
+          err.code = "AUTH_EXPIRED";
+          throw err;
+        }
+        throw await readPolicyResponseError(
+          tokenResponse,
+          `Failed to get Deepgram streaming token: ${tokenResponse.status}`
+        );
+      }
+
+      const { token } = await tokenResponse.json();
+      if (!token) throw new Error("No token received from API");
+      return token;
+    };
+
+    const fetchDeepgramStreamingToken = async (event) => {
+      const apiUrl = getApiUrl();
+      if (!apiUrl) {
+        throw new Error("OpenWhispr API URL not configured");
+      }
+
+      const authHeader = await getAuthHeader(event);
+      if (!Object.keys(authHeader).length) {
+        throw new Error("Not authenticated");
+      }
+
+      const tokenResponse = await proxyFetch(`${apiUrl}/api/deepgram-streaming-token`, {
+        method: "POST",
+        headers: withPolicyHeaders({
+          "Content-Type": "application/json",
+          ...authHeader,
+        }),
+        body: JSON.stringify({ purpose: "dictation" }),
+      });
+
+      if (!tokenResponse.ok) {
+        if (tokenResponse.status === 401) {
+          const err = new Error("Session expired");
+          err.code = "AUTH_EXPIRED";
+          throw err;
+        }
+        throw await readPolicyResponseError(
+          tokenResponse,
+          `Failed to get Deepgram streaming token: ${tokenResponse.status}`
+        );
+      }
+
+      const { token } = await tokenResponse.json();
+      if (!token) {
+        throw new Error("No token received from API");
+      }
+
+      return token;
+    };
+
+    // Same BYOK contract as AssemblyAI above, except the "token" is the raw
+    // long-lived Deepgram key. It still bypasses the client cache so a token
+    // minted in one mode can never be replayed in the other.
+    const DEEPGRAM_BYOK_TOKEN_OPTIONS = { mode: "byok", provider: "deepgram-realtime" };
+    const fetchDeepgramToken = (event, byok) =>
+      byok
+        ? fetchRealtimeToken(event, DEEPGRAM_BYOK_TOKEN_OPTIONS)
+        : fetchDeepgramStreamingToken(event);
+    const setDeepgramTokenRefreshFn = (event, byok) => {
+      this.deepgramStreaming.setTokenRefreshFn(async () => {
+        if (byok) return fetchRealtimeToken(event, DEEPGRAM_BYOK_TOKEN_OPTIONS);
+        if (!deepgramTokenWindowId) throw new Error("No window reference");
+        return fetchDeepgramStreamingTokenFromWindow(deepgramTokenWindowId);
+      });
+    };
+
+    handleRemoteProduct("deepgram-streaming-warmup", async (event, options = {}) => {
+      try {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
+          return { success: false, error: "API not configured", code: "NO_API" };
+        }
+
+        const win = BrowserWindow.fromWebContents(event.sender);
+        if (win && !win.isDestroyed()) {
+          deepgramTokenWindowId = win.id;
+        }
+
+        if (!this.deepgramStreaming) {
+          this.deepgramStreaming = new DeepgramStreaming();
+        }
+        const streaming = ownProductStream(this.deepgramStreaming);
+        streaming.adoptMode(options);
+
+        setDeepgramTokenRefreshFn(event, byok);
+        if (byok) dropStaleReadyWarmConnection(streaming);
+
+        if (streaming.hasWarmConnection()) {
+          debugLogger.debug("Deepgram connection already warm", {}, "streaming");
+          return { success: true, alreadyWarm: true };
+        }
+
+        const generation = credentialGeneration;
+        let token = byok ? null : streaming.getCachedToken();
+        if (!token) {
+          debugLogger.debug(
+            "Fetching new Deepgram streaming token for warmup",
+            { byok },
+            "streaming"
+          );
+          token = await fetchDeepgramToken(event, byok);
+        }
+
+        ownProductStream(streaming);
+        await streaming.warmup({
+          ...options,
+          token,
+          credentialGeneration: generation,
+        });
+        debugLogger.debug("Deepgram connection warmed up", {}, "streaming");
+
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Deepgram warmup error", { error: error.message });
+        return toPolicyFailure(error);
+      }
+    });
+
+    let deepgramStreamingStartInProgress = false;
+    let sendDropCount = 0;
+
+    handleRemoteProduct("deepgram-streaming-start", async (event, options = {}) => {
+      if (deepgramStreamingStartInProgress) {
+        debugLogger.debug(
+          "Deepgram streaming start already in progress, ignoring",
+          {},
+          "streaming"
+        );
+        return { success: false, error: "Operation in progress" };
+      }
+
+      deepgramStreamingStartInProgress = true;
+      try {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
+          return { success: false, error: "API not configured", code: "NO_API" };
+        }
+
+        const win = BrowserWindow.fromWebContents(event.sender);
+        if (win && !win.isDestroyed()) {
+          deepgramTokenWindowId = win.id;
+        }
+
+        if (!this.deepgramStreaming) {
+          this.deepgramStreaming = new DeepgramStreaming();
+        }
+        const streaming = ownProductStream(this.deepgramStreaming);
+        streaming.adoptMode(options);
+        if (byok) dropStaleWarmConnection(streaming);
+
+        setDeepgramTokenRefreshFn(event, byok);
+
+        if (streaming.isConnected) {
+          debugLogger.debug("Deepgram cleaning up stale connection before start", {}, "streaming");
+          await streaming.disconnect({ commit: false });
+          ownProductStream(streaming);
+        }
+
+        const hasWarm = streaming.hasWarmConnection();
+        debugLogger.debug("Deepgram streaming start", { hasWarmConnection: hasWarm }, "streaming");
+
+        let token = byok ? null : streaming.getCachedToken();
+        if (!token) {
+          debugLogger.debug("Fetching Deepgram streaming token", { byok }, "streaming");
+          token = await fetchDeepgramToken(event, byok);
+          ownProductStream(streaming);
+          if (!byok) streaming.cacheToken(token);
+        } else {
+          debugLogger.debug("Using cached Deepgram streaming token", {}, "streaming");
+        }
+
+        streaming.onPartialTranscript = (text) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("deepgram-partial-transcript", text);
+          }
+        };
+
+        streaming.onFinalTranscript = (text) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("deepgram-final-transcript", text);
+          }
+        };
+
+        streaming.onError = (error) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("deepgram-error", error.message);
+          }
+        };
+
+        streaming.onSessionEnd = (data) => {
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("deepgram-session-end", data);
+          }
+        };
+
+        sendDropCount = 0;
+        await streaming.connect({ ...options, token });
+        ownProductStream(streaming);
+        debugLogger.debug(
+          "Deepgram streaming started",
+          {
+            isConnected: streaming.isConnected,
+            hasWs: !!streaming.ws,
+            wsReadyState: streaming.ws?.readyState,
+            forceNew: !!options.forceNew,
+          },
+          "streaming"
+        );
+
+        return {
+          success: true,
+          usedWarmConnection: hasWarm && !options.forceNew,
+        };
+      } catch (error) {
+        debugLogger.error("Deepgram streaming start error", { error: error.message });
+        if (error.code === "AUTH_EXPIRED") {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        return streamingStartFailure(error);
+      } finally {
+        deepgramStreamingStartInProgress = false;
+      }
+    });
+
+    ipcMain.on("deepgram-streaming-send", (event, audioBuffer) => {
+      try {
+        if (!this.deepgramStreaming) return;
+        const buffer = Buffer.from(audioBuffer);
+        const sent = this.deepgramStreaming.sendAudio(buffer);
+        if (!sent) {
+          sendDropCount++;
+          if (sendDropCount <= 3 || sendDropCount % 50 === 0) {
+            debugLogger.warn(
+              "Deepgram audio send dropped",
+              {
+                dropCount: sendDropCount,
+                hasWs: !!this.deepgramStreaming.ws,
+                isConnected: this.deepgramStreaming.isConnected,
+                wsReadyState: this.deepgramStreaming.ws?.readyState,
+              },
+              "streaming"
+            );
+          }
+        } else {
+          if (sendDropCount > 0) {
+            debugLogger.debug(
+              "Deepgram audio send resumed after drops",
+              {
+                previousDrops: sendDropCount,
+              },
+              "streaming"
+            );
+            sendDropCount = 0;
+          }
+        }
+      } catch (error) {
+        debugLogger.error("Deepgram streaming send error", { error: error.message });
+      }
+    });
+
+    ipcMain.on("deepgram-streaming-finalize", () => {
+      this.deepgramStreaming?.finalize();
+    });
+
+    ipcMain.handle("deepgram-streaming-stop", async () => {
+      try {
+        const model = this.deepgramStreaming?.currentModel || "nova-3";
+        const audioBytesSent = this.deepgramStreaming?.audioBytesSent || 0;
+        let result = { text: "" };
+        if (this.deepgramStreaming) {
+          result = await this.deepgramStreaming.disconnect();
+        }
+
+        return { success: true, text: result?.text || "", model, audioBytesSent };
+      } catch (error) {
+        debugLogger.error("Deepgram streaming stop error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("deepgram-streaming-status", async () => {
+      if (!this.deepgramStreaming) {
+        return { isConnected: false, sessionId: null };
+      }
+      return this.deepgramStreaming.getStatus();
+    });
+
+    let geminiStreamingStartInProgress = false;
+    let geminiSendDropCount = 0;
+    let geminiStartAudio = [];
+    let geminiStartAudioBytes = 0;
+    // Match the client's three-second cold-start bound. A model-changing start
+    // owns these frames, even while a previous warm handshake is finishing.
+    const GEMINI_START_AUDIO_MAX = 3 * 16000 * 2;
+    // One handshake at a time. A start that raced an in-flight warmup used to
+    // clear the cold-start buffer, spend a second single-use managed token and
+    // report success while the warmup's handshake (and its failure) were still
+    // pending on a promise nobody read.
+    let geminiConnectInFlight = null;
+
+    // Re-bound on every warmup/start so a warm socket promoted by a different
+    // window can never emit into the window that opened it.
+    const ensureGeminiStreaming = (event) => {
+      let streaming = ownProductStream(this.geminiStreaming);
+      if (!this.geminiStreaming) {
+        streaming = ownProductStream(new GeminiLiveStreaming());
+        this.geminiStreaming = streaming;
+      }
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const emit = (channel, payload) => {
+        if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+      };
+      streaming.onPartialTranscript = (text) => emit("gemini-partial-transcript", text);
+      streaming.onFinalTranscript = (text) => emit("gemini-final-transcript", text);
+      streaming.onError = (error) => emit("gemini-error", error.message);
+      streaming.onSessionEnd = (data) => emit("gemini-session-end", data);
+      return streaming;
+    };
+
+    // Managed tokens are constrained to the server's existing model. BYOK can
+    // select newly published compatible models, each requiring its own socket.
+    const geminiConnectionModel = resolveGeminiLiveModel;
+    // A warm socket cannot cross credentials, modes, or selected models.
+    const geminiConnectionKey = (options) =>
+      JSON.stringify([
+        options.mode === "byok" ? `byok:${credentialGeneration}` : "managed",
+        geminiConnectionModel(options),
+      ]);
+
+    const connectGeminiStreaming = (event, options) => {
+      if (geminiConnectInFlight) return geminiConnectInFlight;
+      geminiConnectInFlight = (async () => {
+        const streaming = ensureGeminiStreaming(event);
+        // byok resolves to the raw API key, managed to a single-use ephemeral
+        // token; the client picks its Live method from `mode` accordingly.
+        const tokenOptions = {
+          mode: options.mode,
+          provider: "gemini-realtime",
+          purpose: "dictation",
+        };
+        // Buffer before the token fetch (a real network round trip) so
+        // gemini-streaming-send has somewhere to put the first frames.
+        streaming.beginConnecting();
+        streaming.connectionKey = geminiConnectionKey(options);
+        const token = await fetchRealtimeToken(event, tokenOptions);
+        ownProductStream(streaming);
+        await streaming.connect({
+          ...options,
+          model: geminiConnectionModel(options),
+          token,
+          refreshToken: () => fetchRealtimeToken(event, tokenOptions),
+        });
+      })().finally(() => {
+        geminiConnectInFlight = null;
+      });
+      return geminiConnectInFlight;
+    };
+
+    handleRemoteProduct("gemini-streaming-warmup", async (event, options = {}) => {
+      try {
+        if (ownProductStream(this.geminiStreaming)?.isConnected) {
+          ensureGeminiStreaming(event);
+          debugLogger.debug("Gemini Live connection already warm", {}, "streaming");
+          return { success: true, alreadyWarm: true };
+        }
+        await connectGeminiStreaming(event, options);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Gemini streaming warmup error", { error: error.message });
+        return toPolicyFailure(error);
+      }
+    });
+
+    handleRemoteProduct("gemini-streaming-start", async (event, options = {}) => {
+      if (geminiStreamingStartInProgress) {
+        debugLogger.debug("Gemini streaming start already in progress, ignoring", {}, "streaming");
+        return { success: false, error: "Operation in progress" };
+      }
+
+      geminiStreamingStartInProgress = true;
+      geminiStartAudio = [];
+      geminiStartAudioBytes = 0;
+      try {
+        const streaming = ensureGeminiStreaming(event);
+        if (geminiConnectInFlight) await geminiConnectInFlight;
+        ownProductStream(streaming);
+        const usedWarmConnection =
+          streaming.isConnected &&
+          !options.forceNew &&
+          streaming.connectionKey === geminiConnectionKey(options);
+        if (!usedWarmConnection) {
+          if (streaming.isConnected) await streaming.disconnect({ commit: false });
+          await connectGeminiStreaming(event, options);
+        }
+        for (const buffer of geminiStartAudio) streaming.sendAudio(buffer);
+        geminiSendDropCount = 0;
+        debugLogger.debug("Gemini streaming started", { usedWarmConnection }, "streaming");
+        return { success: true, usedWarmConnection };
+      } catch (error) {
+        debugLogger.error("Gemini streaming start error", { error: error.message });
+        if (error.code === "AUTH_EXPIRED") {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        return streamingStartFailure(error);
+      } finally {
+        geminiStreamingStartInProgress = false;
+        geminiStartAudio = [];
+        geminiStartAudioBytes = 0;
+      }
+    });
+
+    ipcMain.on("gemini-streaming-send", (_event, audioBuffer) => {
+      try {
+        if (geminiStreamingStartInProgress) {
+          const buffer = Buffer.from(audioBuffer);
+          if (geminiStartAudioBytes + buffer.length <= GEMINI_START_AUDIO_MAX) {
+            geminiStartAudio.push(buffer);
+            geminiStartAudioBytes += buffer.length;
+          } else {
+            // Same accounting as a dropped live send, so a slow start is visible in logs.
+            geminiSendDropCount++;
+            if (geminiSendDropCount <= 3 || geminiSendDropCount % 50 === 0)
+              debugLogger.warn(
+                "Gemini start audio dropped past the 3 s buffer",
+                { dropCount: geminiSendDropCount },
+                "streaming"
+              );
+          }
+          return;
+        }
+        if (!this.geminiStreaming) return;
+        const sent = this.geminiStreaming.sendAudio(Buffer.from(audioBuffer));
+        if (!sent) {
+          geminiSendDropCount++;
+          if (geminiSendDropCount <= 3 || geminiSendDropCount % 50 === 0) {
+            debugLogger.warn(
+              "Gemini audio send dropped",
+              {
+                dropCount: geminiSendDropCount,
+                isConnected: this.geminiStreaming.isConnected,
+                wsReadyState: this.geminiStreaming.ws?.readyState,
+              },
+              "streaming"
+            );
+          }
+        } else if (geminiSendDropCount > 0) {
+          debugLogger.debug(
+            "Gemini audio send resumed after drops",
+            { previousDrops: geminiSendDropCount },
+            "streaming"
+          );
+          geminiSendDropCount = 0;
+        }
+      } catch (error) {
+        debugLogger.error("Gemini streaming send error", { error: error.message });
+      }
+    });
+
+    ipcMain.on("gemini-streaming-finalize", () => {
+      this.geminiStreaming?.finalize();
+    });
+
+    ipcMain.handle("gemini-streaming-stop", async () => {
+      try {
+        const model = this.geminiStreaming?.currentModel || GEMINI_LIVE_MODEL;
+        const audioBytesSent = this.geminiStreaming?.audioBytesSent || 0;
+        let result = { text: "" };
+        if (this.geminiStreaming) {
+          result = await this.geminiStreaming.disconnect();
+        }
+
+        return { success: true, text: result?.text || "", model, audioBytesSent };
+      } catch (error) {
+        debugLogger.error("Gemini streaming stop error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("gemini-streaming-status", async () => {
+      if (!this.geminiStreaming) {
+        return { isConnected: false, isConnecting: false };
+      }
+      return this.geminiStreaming.getStatus();
+    });
+
+    handleRemoteProduct("corti-streaming-warmup", async (_event, options = {}) => {
+      try {
+        if (!this.cortiStreaming) {
+          this.cortiStreaming = new CortiStreaming();
+        }
+        const streaming = ownProductStream(this.cortiStreaming);
+        dropStaleReadyWarmConnection(streaming);
+        if (streaming.hasWarmConnection() || streaming.isConnected) {
+          return { success: true, alreadyWarm: true };
+        }
+        const generation = credentialGeneration;
+        const { token, environment, tenant } = await this._mintStoredCortiToken(options);
+        ownProductStream(streaming);
+        await streaming.warmup({
+          token,
+          environment,
+          tenant,
+          language: options.language,
+          keyterms: options.keyterms,
+          credentialGeneration: generation,
+        });
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message, code: error.code };
+      }
+    });
+
+    handleRemoteProduct("corti-streaming-start", async (event, options = {}) => {
+      let streaming;
+      try {
+        if (!this.cortiStreaming) {
+          this.cortiStreaming = new CortiStreaming();
+        }
+        streaming = ownProductStream(this.cortiStreaming);
+        if (streaming.isConnected) {
+          await streaming.disconnect({ commit: false });
+          ownProductStream(streaming);
+        }
+
+        // Buffer before the token mint (a network round trip unless cached) so
+        // corti-streaming-send has somewhere to put the first frames.
+        streaming.beginConnecting();
+        const { token, environment, tenant } = await this._mintStoredCortiToken(options);
+        ownProductStream(streaming);
+        const win = BrowserWindow.fromWebContents(event.sender);
+
+        streaming.onPartialTranscript = (text) => {
+          if (win && !win.isDestroyed()) win.webContents.send("corti-partial-transcript", text);
+        };
+        streaming.onFinalTranscript = (text) => {
+          if (win && !win.isDestroyed()) win.webContents.send("corti-final-transcript", text);
+        };
+        streaming.onError = (error) => {
+          if (win && !win.isDestroyed()) win.webContents.send("corti-error", error.message);
+        };
+        streaming.onSessionEnd = (data) => {
+          if (win && !win.isDestroyed()) win.webContents.send("corti-session-end", data);
+        };
+
+        dropStaleWarmConnection(this.cortiStreaming);
+        await streaming.connect({
+          token,
+          environment,
+          tenant,
+          language: options.language,
+          keyterms: options.keyterms,
+        });
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Corti streaming start error", { error: error.message }, "streaming");
+        // Nothing is in flight after a failed start, so its held audio goes too.
+        streaming?.cleanup();
+        return { success: false, error: error.message, code: error.code };
+      }
+    });
+
+    ipcMain.on("corti-streaming-send", (_event, audioBuffer) => {
+      this.cortiStreaming?.sendAudio(Buffer.from(audioBuffer));
+    });
+
+    ipcMain.on("corti-streaming-finalize", () => {
+      this.cortiStreaming?.finalize();
+    });
+
+    ipcMain.handle("corti-streaming-stop", async () => {
+      try {
+        const model = this.cortiStreaming?.currentModel || "corti-transcribe";
+        const audioBytesSent = this.cortiStreaming?.audioBytesSent || 0;
+        let result = { text: "" };
+        if (this.cortiStreaming) {
+          result = await this.cortiStreaming.disconnect();
+        }
+        return { success: true, text: result?.text || "", model, audioBytesSent };
+      } catch (error) {
+        debugLogger.error("Corti streaming stop error", { error: error.message }, "streaming");
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("corti-streaming-status", async () => {
+      if (!this.cortiStreaming) {
+        return { isConnected: false, sessionId: null };
+      }
+      return this.cortiStreaming.getStatus();
+    });
+
+    // Agent mode handlers
+    ipcMain.handle("update-voice-agent-hotkey", async (_event, hotkey) => {
+      const hotkeyManager = this.windowManager.hotkeyManager;
+      const voiceAgentCallback = this.windowManager._voiceAgentHotkeyCallback;
+      if (!voiceAgentCallback) {
+        return { success: false };
+      }
+
+      if (!hotkey) {
+        const removed = await hotkeyManager.unregisterSlot("voiceAgent");
+        if (removed === false) return { success: false };
+        this.environmentManager.saveVoiceAgentKey?.("");
+        this.windowManager.reconcileNativeKeyListeners();
+        this._notifyHotkeyChanged("");
+        return { success: true, message: "Voice agent hotkey cleared" };
+      }
+
+      const result = await hotkeyManager.registerSlot("voiceAgent", hotkey, voiceAgentCallback, {
+        atomic: true,
+      });
+      this.windowManager.reconcileNativeKeyListeners();
+      if (result.success) {
+        this.environmentManager.saveVoiceAgentKey?.(hotkey);
+        this._notifyHotkeyChanged(hotkey);
+        return { success: true, message: `Voice agent hotkey updated to: ${hotkey}` };
+      }
+
+      return { success: false, message: result.error };
+    });
+
+    ipcMain.handle("get-voice-agent-key", async () => {
+      return this.environmentManager.getVoiceAgentKey?.() || "";
+    });
+
+    ipcMain.handle("update-translation-hotkey", async (_event, hotkey) => {
+      const hotkeyManager = this.windowManager.hotkeyManager;
+      const translationCallback = this.windowManager._translationHotkeyCallback;
+      if (!translationCallback) {
+        return { success: false };
+      }
+
+      if (!hotkey) {
+        const removed = await hotkeyManager.unregisterSlot("translation");
+        if (removed === false) return { success: false };
+        this.environmentManager.saveTranslationKey?.("");
+        this.windowManager.reconcileNativeKeyListeners();
+        this._notifyHotkeyChanged("");
+        return { success: true, message: "Translation hotkey cleared" };
+      }
+
+      const result = await hotkeyManager.registerSlot("translation", hotkey, translationCallback, {
+        atomic: true,
+      });
+      this.windowManager.reconcileNativeKeyListeners();
+      if (result.success) {
+        this.environmentManager.saveTranslationKey?.(hotkey);
+        this._notifyHotkeyChanged(hotkey);
+        return { success: true, message: `Translation hotkey updated to: ${hotkey}` };
+      }
+
+      return { success: false, message: result.error };
+    });
+
+    ipcMain.handle("get-translation-key", async () => {
+      return this.environmentManager.getTranslationKey?.() || "";
+    });
+
+    // Provider-neutral availability over the shared calendar cache.
+    ipcMain.handle("calendar-get-availability", async (_event, request) => {
+      try {
+        return {
+          success: true,
+          availability: getCalendarAvailability({
+            request,
+            databaseManager: this.databaseManager,
+            calendarProviders: [
+              { provider: "google", manager: this.googleCalendarManager },
+              { provider: "microsoft", manager: this.microsoftCalendarManager },
+              { provider: "apple", manager: this.appleCalendarManager },
+            ],
+          }),
+        };
+      } catch (error) {
+        debugLogger.warn(
+          "Calendar availability request failed",
+          { error: error instanceof Error ? error.message : String(error) },
+          "calendar"
+        );
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to check calendar availability",
+        };
+      }
+    });
+
+    const authorizeCalendar = async (event, requestId, authorize) => {
+      requestId = requestId || crypto.randomUUID();
+      const requests = this._calendarAuthorizationRequests;
+      const controller = requests.begin(event.sender.id, requestId);
+      const abort = () => controller.abort();
+      const policySignal = this._productRequestContext.getStore()?.signal;
+      policySignal?.addEventListener("abort", abort, { once: true });
+      if (policySignal?.aborted) abort();
+      event.sender.once("destroyed", abort);
+      try {
+        // A cancel after the account was saved doesn't undo it, so report what happened.
+        return await authorize(controller.signal);
+      } catch (error) {
+        if (controller.signal.aborted)
+          return { success: false, error: "oauth_cancelled", reason: "cancelled" };
+        debugLogger.error("Calendar authorization failed", { error: error.message }, "calendar");
+        return { success: false, error: error.message };
+      } finally {
+        event.sender.removeListener("destroyed", abort);
+        policySignal?.removeEventListener("abort", abort);
+        requests.complete(event.sender.id, requestId, controller);
+      }
+    };
+    ipcMain.handle("calendar-cancel-connect", (event, requestId) =>
+      this._calendarAuthorizationRequests.cancel(event.sender.id, requestId)
+    );
+
+    // Google Calendar
+    handleRemoteProduct("gcal-start-oauth", (event, requestId) =>
+      authorizeCalendar(event, requestId, (signal) =>
+        this.googleCalendarManager.startOAuth({ signal })
+      )
+    );
+
+    ipcMain.handle("gcal-disconnect", async (_event, email) => {
+      try {
+        this.googleCalendarManager.disconnect(email);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Google Calendar disconnect failed",
+          { error: error.message },
+          "calendar"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("gcal-get-connection-status", async () => {
+      try {
+        return this.googleCalendarManager.getConnectionStatus();
+      } catch (error) {
+        return { connected: false, email: null };
+      }
+    });
+
+    ipcMain.handle("gcal-get-calendars", async () => {
+      try {
+        return { success: true, calendars: this.googleCalendarManager.getCalendars() };
+      } catch (error) {
+        return { success: false, calendars: [] };
+      }
+    });
+
+    handleRemoteProduct("gcal-set-calendar-selection", async (_event, calendarId, isSelected) => {
+      try {
+        await this.googleCalendarManager.setCalendarSelection(calendarId, isSelected);
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleRemoteProduct("gcal-set-primary-only", async (_event, value) => {
+      try {
+        await this.googleCalendarManager.setPrimaryOnly(value);
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    handleRemoteProduct("gcal-sync-events", async () => {
+      try {
+        await this.googleCalendarManager.syncEvents();
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("gcal-get-upcoming-events", async (_event, windowMinutes, options) => {
+      try {
+        return {
+          success: true,
+          events: await this.googleCalendarManager.getUpcomingEvents(windowMinutes, {
+            includeAllDay: options?.includeAllDay === true,
+          }),
+        };
+      } catch (error) {
+        return { success: false, events: [] };
+      }
+    });
+
+    ipcMain.handle("gcal-get-event", async (_event, eventId) => {
+      try {
+        const event = this.databaseManager.getCalendarEventById(eventId);
+        return { success: true, event };
+      } catch (error) {
+        return { success: false, event: null };
+      }
+    });
+
+    ipcMain.handle("calendar-get-linkable-events", async () => {
+      try {
+        // A day past the synced history: an all-day row's plain-date end reads
+        // as UTC midnight, up to 14 hours off the user's local end.
+        const endsAfter = new Date(
+          Date.now() - CALENDAR_LOOKBACK_MS - 24 * 60 * 60 * 1000
+        ).toISOString();
+        return {
+          success: true,
+          events: this.databaseManager.getLinkableCalendarEvents({ endsAfter }),
+        };
+      } catch (error) {
+        debugLogger.debug("Linkable calendar events failed", { error: error.message }, "calendar");
+        return { success: false, events: [] };
+      }
+    });
+
+    // Microsoft Calendar
+    handleRemoteProduct("mcal-start-oauth", (event, requestId) =>
+      authorizeCalendar(event, requestId, (signal) =>
+        this.microsoftCalendarManager.startOAuth({ signal })
+      )
+    );
+
+    ipcMain.handle("mcal-disconnect", async (_event, email) => {
+      try {
+        this.microsoftCalendarManager.disconnect(email);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Microsoft Calendar disconnect failed",
+          { error: error.message },
+          "calendar"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("mcal-get-connection-status", async () => {
+      try {
+        return this.microsoftCalendarManager.getConnectionStatus();
+      } catch (error) {
+        debugLogger.error(
+          "Microsoft Calendar connection status failed",
+          { error: error.message },
+          "calendar"
+        );
+        return { connected: false, accounts: [] };
+      }
+    });
+
+    handleRemoteProduct("mcal-set-primary-only", async (_event, value) => {
+      try {
+        await this.microsoftCalendarManager.setPrimaryOnly(value);
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    // Apple Calendar (macOS EventKit)
+    ipcMain.handle("acal-connect", (event, requestId) =>
+      authorizeCalendar(event, requestId, (signal) => this.appleCalendarManager.connect({ signal }))
+    );
+
+    ipcMain.handle("acal-disconnect", async () => {
+      try {
+        return this.appleCalendarManager.disconnect();
+      } catch (error) {
+        debugLogger.error("Apple Calendar disconnect failed", { error: error.message }, "acal");
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("acal-get-connection-status", async () => {
+      try {
+        return this.appleCalendarManager.getConnectionStatus();
+      } catch (error) {
+        debugLogger.error(
+          "Apple Calendar connection status failed",
+          { error: error.message },
+          "acal"
+        );
+        return { connected: false, sourceNames: [] };
+      }
+    });
+
+    ipcMain.handle("search-contacts", async (_event, query) => {
+      try {
+        const contacts = this.databaseManager.searchContacts(query);
+        return { success: true, contacts };
+      } catch (error) {
+        return { success: false, contacts: [] };
+      }
+    });
+
+    // Limited to connected calendars and contact sources, like find_contact, with the addresses
+    // the invite dialog can't use left out before the limit so they don't crowd out the rest.
+    ipcMain.handle("search-invite-contacts", async (_event, query, exclude) => {
+      try {
+        const excluded = new Set(
+          (Array.isArray(exclude) ? exclude : []).map((email) => String(email).toLowerCase())
+        );
+        const { contacts } = searchContacts(
+          this.databaseManager.getContactLookupSources(),
+          String(query ?? ""),
+          { limit: excluded.size + INVITE_SUGGESTION_LIMIT }
+        );
+        return {
+          success: true,
+          contacts: contacts
+            .filter((contact) => !excluded.has(contact.email.toLowerCase()))
+            .slice(0, INVITE_SUGGESTION_LIMIT)
+            .map(({ email, name }) => ({ email, name })),
+        };
+      } catch {
+        return { success: false, contacts: [] };
+      }
+    });
+
+    ipcMain.handle("upsert-contact", async (_event, contact) => {
+      try {
+        this.databaseManager.addManualContact(contact);
+        return { success: true };
+      } catch (error) {
+        return { success: false };
+      }
+    });
+
+    ipcMain.handle("get-md5-hash", (_event, text) => {
+      return crypto.createHash("md5").update(text.toLowerCase().trim()).digest("hex");
+    });
+
+    const NOTIFICATION_PREF_KEYS = new Set([
+      "notificationsEnabled",
+      "notifyMeetingDetection",
+      "notifyCalendarReminders",
+    ]);
+
+    this._syncMeetingDetectorPolicy = () => {
+      this.meetingDetectionEngine?.setPreferences(
+        deriveDetectorPreferences({
+          ...this.windowManager.notificationPrefs,
+          meetingProcessDetection: this.meetingProcessDetection,
+          meetingRecordingEnabled: !this._audioFeaturePolicy.failure("meeting"),
+        })
+      );
+      // The tray's meeting item follows the same policy.
+      this.getTrayManager?.()?.updateTrayMenu?.();
+    };
+
+    ipcMain.handle("sync-notification-preferences", async (_event, prefs) => {
+      try {
+        if (!prefs || typeof prefs !== "object") {
+          return { success: false, error: "Invalid preferences" };
+        }
+        for (const [key, value] of Object.entries(prefs)) {
+          if (NOTIFICATION_PREF_KEYS.has(key)) {
+            this.windowManager.notificationPrefs[key] = !!value;
+          }
+        }
+        if (typeof prefs.meetingProcessDetection === "boolean") {
+          this.meetingProcessDetection = prefs.meetingProcessDetection;
+        }
+        this._syncMeetingDetectorPolicy();
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("meeting-set-speaker-diarization-enabled", async (_event, payload) => {
+      try {
+        this.speakerDiarizationEnabled = payload?.enabled !== false;
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("whisper-vad-get-config", async () => {
+      try {
+        return { success: true, config: this._getWhisperVadSettings() };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("whisper-vad-set-config", async (_event, payload) => {
+      try {
+        const config = this._setWhisperVadSettings(payload || {});
+        return { success: true, config };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("meeting-set-session-speaker-config", async (_event, payload) => {
+      try {
+        const enabled = payload?.enabled !== false;
+        const expectedCount = Math.max(
+          1,
+          Math.min(
+            MAX_SPEAKER_COUNT,
+            Number(payload?.expectedCount) || DEFAULT_EXPECTED_SPEAKER_COUNT
+          )
+        );
+        // Only a stepper-set count is explicit; the diarization toggle reuses this
+        // channel and must not freeze the count against roster-driven refreshes.
+        this.activeMeetingSpeakerConfig = {
+          enabled,
+          expectedCount,
+          explicit: payload?.countIsExplicit === true,
+        };
+        liveSpeakerIdentifier.setEnabled(enabled);
+        // Live identification only labels other speakers (the mic track is "you"),
+        // so cap at expectedCount - 1 to match resolveSessionMaxSpeakers().
+        liveSpeakerIdentifier.setMaxSpeakers(Math.max(1, expectedCount - 1));
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("get-meeting-notification-destination", (event) =>
+      this.getMeetingNotificationDestination(
+        this.windowManager.captureMeetingNotificationOwner(event.sender)
+      )
+    );
+    ipcMain.handle("select-meeting-notification-folder", (event, ref) =>
+      this.selectMeetingNotificationFolder(
+        this.windowManager.captureMeetingNotificationOwner(event.sender),
+        ref
+      )
+    );
+    ipcMain.handle("create-meeting-notification-folder", (event, request) =>
+      this.createMeetingNotificationFolder(
+        this.windowManager.captureMeetingNotificationOwner(event.sender),
+        request
+      )
+    );
+
+    ipcMain.handle("set-meeting-notification-surface", (event, state) => {
+      const owner = this.windowManager.captureMeetingNotificationOwner(event.sender);
+      return this.windowManager.setMeetingNotificationSurface(owner, state);
+    });
+
+    ipcMain.handle("meeting-notification-respond", (event, detectionId, action, options) => {
+      const owner = this.windowManager.captureMeetingNotificationOwner(event.sender);
+      if (!owner || owner.prompt.detectionId !== detectionId)
+        return { success: false, code: "STALE_NOTIFICATION" };
+      const respond = () =>
+        this.meetingDetectionEngine.handleNotificationResponse(detectionId, action, options, owner);
+      if (action === "dismiss" || action === "open") return respond();
+      // Join opens the meeting even when the org refuses to let it be recorded;
+      // only the recording is subject to the policy.
+      if (action === "join") this.meetingDetectionEngine.openNotificationJoinUrl(owner);
+      return this._audioFeaturePolicy.run(event, "meeting", respond, {
+        onRefused: (failure) => auditMeetingRefusal(failure, "prompt"),
+      });
+    });
+    ipcMain.handle("confirm-meeting-note-navigation", (event, navigationId, status) =>
+      this.windowManager.confirmMeetingNoteNavigation(event.sender, navigationId, status)
+    );
+    ipcMain.handle("meeting-note-opened-without-recording", (event, id) => {
+      if (
+        event.sender !== this.windowManager.controlPanelWindow?.webContents ||
+        typeof id !== "string"
+      )
+        return;
+      this.meetingDetectionEngine?.markMeetingNoteOnly(id);
+    });
+    ipcMain.handle("meeting-note-closed", (event, id) => {
+      if (
+        event.sender !== this.windowManager.controlPanelWindow?.webContents ||
+        typeof id !== "string"
+      )
+        return;
+      this.meetingDetectionEngine?.closeMeetingNote(id);
+    });
+
+    ipcMain.handle("join-calendar-meeting", async (_event, eventId, notesOnly) => {
+      try {
+        // Sent from the open panel, which may have just opened the meeting
+        // link: leave the meeting in front rather than pulling the panel back.
+        const refusal = await this.meetingDetectionEngine.joinCalendarMeeting(
+          eventId,
+          "calendar-join",
+          {
+            activate: false,
+            startSource: "calendar-join",
+            ...(notesOnly === true && { notesOnly: true }),
+          }
+        );
+        return refusal ?? { success: true };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    });
+
+    // The pill's menu is the only renderer that starts a meeting by hand.
+    handleAudioFeature(
+      "start-manual-meeting",
+      "meeting",
+      () => this.windowManager.startManualMeeting({ startSource: "pill" }),
+      (failure) => auditMeetingRefusal(failure, "pill")
+    );
+
+    ipcMain.handle("get-meeting-notification-data", async (event) => {
+      if (this.windowManager?.notificationWindow?.webContents !== event.sender) return null;
+      return this.windowManager?._pendingNotificationData ?? null;
+    });
+
+    ipcMain.handle("get-pending-meeting-note-navigation", async (event) => {
+      return this.windowManager?.consumePendingMeetingNoteNavigation(event.sender) ?? null;
+    });
+
+    ipcMain.handle("get-pending-note-navigation", async () => {
+      return this.windowManager?.consumePendingNoteNavigation() ?? null;
+    });
+
+    ipcMain.handle("get-pending-settings-section", async () => {
+      return this.windowManager?.consumePendingSettingsSection() ?? null;
+    });
+
+    ipcMain.handle("meeting-notification-ready", async (event) => {
+      this.windowManager?.showNotificationWindow(event.sender);
+    });
+
+    // Note files (markdown mirror) handlers
+    ipcMain.handle("note-files-set-enabled", async (_event, enabled, customPath, options) => {
+      try {
+        if (!enabled) {
+          this.noteFiles.disable();
+          return { success: true };
+        }
+        const basePath = customPath || path.join(app.getPath("userData"), "notes");
+        await this.noteFiles.enable(basePath, { skipRebuild: Boolean(options?.skipRebuild) });
+        // Their rows are gone, and an old-layout file is only removed when it
+        // matches one.
+        for (const note of this.databaseManager.mergedNotes.splice(0)) {
+          this.noteFiles.deleteNote(note.id, note, note.speakerMappings);
+        }
+        this._flushAccountRepairMirrors();
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to set note-files enabled",
+          { error: error.message },
+          "note-files"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("note-files-set-path", async (_event, newPath) => {
+      try {
+        if (!this.noteFiles.enabled) return { success: false, error: "Note files not enabled" };
+        await this.noteFiles.setPath(newPath);
+        this._flushAccountRepairMirrors();
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to set note-files path", { error: error.message }, "note-files");
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("note-files-rebuild", async () => {
+      try {
+        if (!this.noteFiles.enabled) return { success: false, error: "Note files not enabled" };
+        await this.noteFiles.rebuild();
+        this._flushAccountRepairMirrors();
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to rebuild note files", { error: error.message }, "note-files");
+        return { success: false, error: error.message };
+      }
+    });
+
+    // Workspace names live on the server; the mirror's directories need them offline too.
+    ipcMain.handle("note-files-set-workspace-names", async (_event, workspaces) => {
+      try {
+        const rows = (Array.isArray(workspaces) ? workspaces : []).filter(
+          (workspace) =>
+            typeof workspace?.id === "string" &&
+            workspace.id &&
+            typeof workspace.name === "string" &&
+            workspace.name.trim()
+        );
+        if (this.databaseManager.setWorkspaceNames(rows) > 0) this.noteFiles.containersChanged();
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Failed to save workspace names", { error: error.message }, "note-files");
+        return { success: false };
+      }
+    });
+
+    ipcMain.handle("note-files-get-default-path", async () => {
+      return path.join(app.getPath("userData"), "notes");
+    });
+
+    ipcMain.handle("show-note-file", async (_event, noteId) => {
+      try {
+        const filePath = this.noteFiles.notePath(noteId);
+        if (!filePath) return { success: false };
+        shell.showItemInFolder(filePath);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to show note file",
+          { noteId, error: error.message },
+          "note-files"
+        );
+        return { success: false };
+      }
+    });
+
+    ipcMain.handle("show-folder-in-explorer", async (_event, folderId) => {
+      try {
+        const dirPath = this.noteFiles.folderPath(folderId);
+        if (!dirPath) return { success: false };
+        await shell.openPath(dirPath);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to show folder",
+          { folderId, error: error.message },
+          "note-files"
+        );
+        return { success: false };
+      }
+    });
+
+    ipcMain.handle("note-files-pick-folder", async () => {
+      try {
+        const { dialog } = require("electron");
+        const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+        if (result.canceled || !result.filePaths.length) {
+          return { canceled: true };
+        }
+        return { canceled: false, path: result.filePaths[0] };
+      } catch (error) {
+        debugLogger.error("Failed to pick folder", { error: error.message }, "note-files");
+        return { canceled: true };
+      }
+    });
+
+    ipcMain.handle("granola-import-pick-and-preview", async (event) => {
+      try {
+        const { dialog } = require("electron");
+        // Parent the dialog so it opens as a sheet on the settings window —
+        // a parentless panel can land invisible on another display/Space.
+        const parentWindow = BrowserWindow.fromWebContents(event.sender);
+        // Granola chunks large exports into numbered files (…-000.csv, -001, …),
+        // so let the user grab the whole set in one pick.
+        const dialogOptions = {
+          properties: ["openFile", "multiSelections"],
+          filters: [{ name: "CSV", extensions: ["csv"] }],
+        };
+        const result = parentWindow
+          ? await dialog.showOpenDialog(parentWindow, dialogOptions)
+          : await dialog.showOpenDialog(dialogOptions);
+        if (result.canceled || !result.filePaths.length) {
+          return { canceled: true };
+        }
+        const filePaths = [...result.filePaths].sort();
+        const MAX_IMPORT_BYTES = 200 * 1024 * 1024;
+        const { createGranolaNoteKeyAllocator, parseGranolaCsv } =
+          await import("./granolaImport.js");
+        const allocateNoteKey = createGranolaNoteKeyAllocator();
+        const notes = [];
+        const seenIds = new Set();
+        let rowIssueCount = 0;
+        for (const filePath of filePaths) {
+          if (fs.statSync(filePath).size > MAX_IMPORT_BYTES) {
+            return { canceled: false, success: false, error: "FILE_TOO_LARGE" };
+          }
+          const parsed = parseGranolaCsv(fs.readFileSync(filePath, "utf8"), {
+            allocateNoteKey,
+          });
+          if (!parsed.ok) {
+            return { canceled: false, success: false, error: parsed.error.code };
+          }
+          // File-level warnings (e.g. ignored columns) are expected on every
+          // real export; only row-scoped problems belong in the issue count.
+          rowIssueCount += parsed.warnings.filter((warning) => warning.row != null).length;
+          for (const note of parsed.notes) {
+            if (!seenIds.has(note.clientNoteId)) {
+              seenIds.add(note.clientNoteId);
+              notes.push(note);
+            }
+          }
+        }
+        const existing = new Set(this.databaseManager.getImportedClientNoteIds(notes));
+        const freshNotes = notes.filter((n) => !existing.has(n.clientNoteId));
+        // The run handler only ever imports what this preview parsed — the
+        // renderer never sends a file path across the bridge.
+        this._granolaImportPending = { notes };
+        return {
+          canceled: false,
+          success: true,
+          fileName: filePaths.map((p) => path.basename(p)).join(", "),
+          total: notes.length,
+          newCount: freshNotes.length,
+          duplicateCount: notes.length - freshNotes.length,
+          sampleTitles: freshNotes.slice(0, 5).map((n) => n.title),
+          rowIssueCount,
+        };
+      } catch (error) {
+        debugLogger.error(
+          "Granola import preview failed",
+          { error: error.message },
+          "granola-import"
+        );
+        return { canceled: false, success: false, error: "READ_FAILED" };
+      }
+    });
+
+    ipcMain.handle("granola-import-run", async () => {
+      const pending = this._granolaImportPending;
+      this._granolaImportPending = null;
+      if (!pending) return { success: false, error: "NO_PENDING_IMPORT" };
+      try {
+        const result = this.databaseManager.importNotes(pending.notes);
+        if (result.imported > 0) {
+          // One-shot side effects: a single index wake-up (the SQLite triggers
+          // already journaled every imported note) and a single mirror rebuild —
+          // never per-note work (sync storm / O(notes × files) mirror scans).
+          setImmediate(() => {
+            try {
+              this.notifyVectorChanges();
+              if (this.noteFiles.enabled) {
+                this.noteFiles.rebuild().catch((error) => {
+                  debugLogger.error(
+                    "Note file rebuild failed after Granola import",
+                    { error: error.message },
+                    "granola-import"
+                  );
+                });
+              }
+            } catch (sideEffectError) {
+              debugLogger.error(
+                "Granola import side effects failed",
+                { error: sideEffectError.message },
+                "granola-import"
+              );
+            }
+          });
+        }
+        return {
+          success: true,
+          imported: result.imported,
+          skipped: result.skipped,
+          errors: result.errors,
+        };
+      } catch (error) {
+        debugLogger.error("Granola import failed", { error: error.message }, "granola-import");
+        return { success: false, error: "IMPORT_FAILED" };
+      }
+    });
+
+    ipcMain.handle("dragon-import-pick-file", async (event) => {
+      try {
+        const { dialog } = require("electron");
+        // Parent the dialog so it opens as a sheet on the panel window —
+        // a parentless panel can land invisible on another display/Space.
+        const parentWindow = BrowserWindow.fromWebContents(event.sender);
+        const dialogOptions = {
+          properties: ["openFile"],
+          filters: [{ name: "Dragon word list", extensions: ["txt", "xml"] }],
+        };
+        const result = parentWindow
+          ? await dialog.showOpenDialog(parentWindow, dialogOptions)
+          : await dialog.showOpenDialog(dialogOptions);
+        if (result.canceled || !result.filePaths.length) {
+          return { canceled: true };
+        }
+        const [filePath] = result.filePaths;
+        // A twenty-year Dragon vocabulary is well under 1 MB; anything near
+        // this bound is not a word list.
+        const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
+        if (fs.statSync(filePath).size > MAX_IMPORT_BYTES) {
+          return { canceled: false, success: false, error: "FILE_TOO_LARGE" };
+        }
+        // The renderer parses the bytes and applies the words, so a large or
+        // malformed file never holds up hotkeys and dictation here.
+        return {
+          canceled: false,
+          success: true,
+          fileName: path.basename(filePath),
+          bytes: fs.readFileSync(filePath),
+        };
+      } catch (error) {
+        debugLogger.error("Dragon import failed", { error: error.message }, "dragon-import");
+        return { canceled: false, success: false, error: "READ_FAILED" };
+      }
+    });
+
+    ipcMain.handle("get-speaker-mappings", async (_event, noteId) => {
+      return this.databaseManager.getSpeakerMappings(noteId);
+    });
+
+    ipcMain.handle(
+      "set-speaker-mapping",
+      async (_event, noteId, speakerId, displayName, email, profileId) => {
+        const embeddings = this.databaseManager.getNoteSpeakerEmbeddings(noteId);
+        const noteSpeakerEmbedding = embeddings.find((e) => e.speaker_id === speakerId);
+        // Live speaker ids restart with every meeting, so only the note being
+        // recorded may borrow the live voice or name the live speaker.
+        const isRecordingNote = noteId === this._activeMeetingNoteId;
+        const liveSpeakerEmbedding = isRecordingNote
+          ? liveSpeakerIdentifier.getSpeakerEmbedding(speakerId)
+          : null;
+        const speakerEmbeddingBuffer =
+          noteSpeakerEmbedding?.embedding ||
+          (liveSpeakerEmbedding ? Buffer.from(liveSpeakerEmbedding.buffer) : null);
+
+        let resolvedProfileId = profileId ?? null;
+        if (speakerEmbeddingBuffer) {
+          const profile = this.databaseManager.upsertSpeakerProfile(
+            displayName,
+            email || null,
+            speakerEmbeddingBuffer,
+            resolvedProfileId
+          );
+          resolvedProfileId = profile.id;
+          this._retroactiveMapping(profile);
+        } else {
+          const profile = this.databaseManager.linkSpeakerProfile(
+            displayName,
+            email || null,
+            resolvedProfileId
+          );
+          if (profile) resolvedProfileId = profile.id;
+        }
+
+        this.databaseManager.setSpeakerMapping(noteId, speakerId, resolvedProfileId, displayName);
+        if (isRecordingNote) {
+          liveSpeakerIdentifier.mapSpeaker(speakerId, resolvedProfileId, displayName, noteId);
+        }
+        return { success: true, profileId: resolvedProfileId };
+      }
+    );
+
+    ipcMain.handle("remove-speaker-mapping", async (_event, noteId, speakerId) => {
+      this.databaseManager.removeSpeakerMapping(noteId, speakerId);
+      return { success: true };
+    });
+
+    ipcMain.handle("get-speaker-profiles", async () => {
+      return this.databaseManager.getSpeakerProfiles();
+    });
+
+    ipcMain.handle("attach-speaker-email", async (_event, profileId, email) => {
+      try {
+        const profile = this.databaseManager.attachEmailToProfile(profileId, email);
+        this._retroactiveMapping(profile);
+        return {
+          success: true,
+          profile: {
+            id: profile.id,
+            display_name: profile.display_name,
+            email: profile.email,
+            sample_count: profile.sample_count,
+          },
+        };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to attach email to speaker profile",
+          { error: error.message },
+          "speaker"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("save-note-speaker-embeddings", async (_event, noteId, embeddingsObj) => {
+      const buffers = {};
+      for (const [speakerId, arr] of Object.entries(embeddingsObj)) {
+        buffers[speakerId] = Buffer.from(new Float32Array(arr).buffer);
+      }
+      this.databaseManager.saveNoteSpeakerEmbeddings(noteId, buffers);
+      this._tryAutoLabelOneOnOne(noteId);
+      return { success: true };
+    });
+  }
+
+  _retroactiveMapping(profile) {
+    // A profile whose embedding predates the current model/feature version can't be
+    // compared with note embeddings; it re-enrolls the next time the speaker is labeled.
+    if (profile?.embedding_version !== EMBEDDING_VERSION) return;
+    setImmediate(async () => {
+      try {
+        const speakerEmbeddings = require("./speakerEmbeddings");
+        const { matchVoiceToProfile } = require("./diarizationPolicy");
+        const similarity = (a, b) => speakerEmbeddings.cosineSimilarity(a, b);
+        const profileVoices = this._speakerProfileVoices();
+        const noteIds = this.databaseManager.getNotesWithUnmappedSpeakers();
+
+        for (const noteId of noteIds) {
+          const embeddings = this.databaseManager.getNoteSpeakerEmbeddings(noteId);
+          const existing = this.databaseManager.getSpeakerMappings(noteId);
+          const mappedSpeakers = new Set(existing.map((m) => m.speaker_id));
+          for (const emb of embeddings) {
+            if (mappedSpeakers.has(emb.speaker_id)) continue;
+
+            const speakerEmb = new Float32Array(
+              emb.embedding.buffer,
+              emb.embedding.byteOffset,
+              emb.embedding.byteLength / 4
+            );
+            // The speaker is this profile's person only if no other profile is
+            // as close a match.
+            const match = matchVoiceToProfile(speakerEmb, profileVoices, similarity);
+
+            if (match?.confirmed && match.profile.id === profile.id) {
+              this.databaseManager.setSpeakerMapping(
+                noteId,
+                emb.speaker_id,
+                profile.id,
+                profile.display_name
+              );
+
+              const note = this.databaseManager.getNote(noteId);
+              if (note?.transcript) {
+                try {
+                  const segments = JSON.parse(note.transcript);
+                  let changed = false;
+                  for (const seg of segments) {
+                    if (seg.speaker === emb.speaker_id && !seg.speakerName) {
+                      if (canAutoRelabelSpeaker(seg)) {
+                        applyConfirmedSpeaker(seg, {
+                          speakerName: profile.display_name,
+                          speakerIsPlaceholder: false,
+                        });
+                      } else {
+                        seg.speakerName = profile.display_name;
+                        seg.speakerIsPlaceholder = false;
+                      }
+                      changed = true;
+                    }
+                  }
+                  if (changed) {
+                    this.databaseManager.updateNote(noteId, {
+                      transcript: JSON.stringify(segments),
+                    });
+                  }
+                } catch (_) {}
+              }
+            }
+          }
+        }
+      } catch (err) {
+        debugLogger.warn("Retroactive speaker mapping failed", { error: err.message });
+      }
+    });
+  }
+
+  // Stored profiles in the current embedding version, each with its voice.
+  _speakerProfileVoices() {
+    return this.databaseManager.getSpeakerProfiles(true).map((profile) => ({
+      profile,
+      voice: new Float32Array(
+        profile.embedding.buffer,
+        profile.embedding.byteOffset,
+        profile.embedding.byteLength / 4
+      ),
+    }));
+  }
+
+  _tryAutoLabelOneOnOne(noteId) {
+    setImmediate(async () => {
+      try {
+        const note = this.databaseManager.getNote(noteId);
+        const other = this._resolveOneOnOneOtherParticipant(note?.participants);
+        if (!other) return;
+        const { displayName, email } = other;
+
+        const embeddings = this.databaseManager.getNoteSpeakerEmbeddings(noteId);
+        if (!embeddings.length) return;
+
+        const existingMappings = this.databaseManager.getSpeakerMappings(noteId);
+        const mappedSpeakers = new Set(existingMappings.map((m) => m.speaker_id));
+
+        const transcript = note.transcript ? JSON.parse(note.transcript) : [];
+        const systemSpeakers = new Set(
+          transcript.filter((s) => s.source !== "mic" && s.speaker).map((s) => s.speaker)
+        );
+
+        const unmapped = embeddings.filter(
+          (e) => !mappedSpeakers.has(e.speaker_id) && systemSpeakers.has(e.speaker_id)
+        );
+        if (!unmapped.length) return;
+
+        let profile = null;
+        for (const emb of unmapped) {
+          profile = this.databaseManager.upsertSpeakerProfile(
+            displayName,
+            email,
+            emb.embedding,
+            profile?.id ?? null
+          );
+          this.databaseManager.setSpeakerMapping(noteId, emb.speaker_id, profile.id, displayName);
+        }
+
+        const unmappedSystemSpeakers = new Set(unmapped.map((e) => e.speaker_id));
+        let changed = false;
+        for (const seg of transcript) {
+          if (!unmappedSystemSpeakers.has(seg.speaker)) continue;
+          if (seg.speakerName && !seg.speakerIsPlaceholder) continue;
+          if (canAutoRelabelSpeaker(seg)) {
+            applyConfirmedSpeaker(seg, { speakerName: displayName, speakerIsPlaceholder: false });
+          } else {
+            seg.speakerName = displayName;
+            seg.speakerIsPlaceholder = false;
+          }
+          changed = true;
+        }
+
+        if (changed) {
+          this.databaseManager.updateNote(noteId, { transcript: JSON.stringify(transcript) });
+          const updated = this.databaseManager.getNote(noteId);
+          if (updated) broadcastToWindows("note-updated", updated);
+        }
+
+        if (profile) this._retroactiveMapping(profile);
+
+        debugLogger.info(
+          "Auto-labeled 1-on-1 meeting speakers",
+          { noteId, displayName, speakerCount: unmapped.length },
+          "speaker"
+        );
+      } catch (err) {
+        debugLogger.warn("Auto-label 1-on-1 failed", { noteId, error: err.message }, "speaker");
+      }
+    });
+  }
+
+  _applySpeakerName(segments, speakerId, displayName) {
+    if (!displayName) {
+      return;
+    }
+
+    for (const segment of segments) {
+      if (segment.speaker !== speakerId) {
+        continue;
+      }
+
+      applyConfirmedSpeaker(segment, {
+        speakerName: displayName,
+        speakerIsPlaceholder: false,
+        suggestedName: undefined,
+        suggestedProfileId: undefined,
+      });
+    }
+  }
+
+  // Returns, per named live speaker, the voice its name went to.
+  _reconcileLiveSpeakerState(liveSpeakerState, speakerEmbeddingsMap, enrichedSegments) {
+    const namedVoices = new Map();
+    if (!liveSpeakerState || !speakerEmbeddingsMap) {
+      return namedVoices;
+    }
+
+    const speakerEmbeddings = require("./speakerEmbeddings");
+    const { VOICE_MATCH_SIMILARITY } = require("./diarizationPolicy");
+    const reconciledSpeakers = new Set();
+    const usedLiveSpeakers = new Set();
+    const noteMappings = new Map();
+
+    const liveEntries = Object.entries(liveSpeakerState)
+      .map(([speakerId, data]) => ({
+        speakerId,
+        displayName: data?.displayName || null,
+        profileId: data?.profileId ?? null,
+        noteId: data?.noteId ?? null,
+        embedding: Array.isArray(data?.embedding) ? new Float32Array(data.embedding) : null,
+      }))
+      .filter((entry) => entry.embedding);
+
+    const getMappingsForNote = (noteId) => {
+      if (!noteMappings.has(noteId)) {
+        noteMappings.set(noteId, this.databaseManager.getSpeakerMappings(noteId));
+      }
+      return noteMappings.get(noteId);
+    };
+
+    // Closest pairs first: with no count, one live speaker stands for every
+    // remote voice, and its name belongs to the voice it sounds most like, not
+    // to the first one that clears the bar.
+    const pairs = [];
+    for (const [mappedId, embeddingArray] of Object.entries(speakerEmbeddingsMap)) {
+      const embedding = new Float32Array(embeddingArray);
+      for (const entry of liveEntries) {
+        const similarity = speakerEmbeddings.cosineSimilarity(embedding, entry.embedding);
+        if (similarity > VOICE_MATCH_SIMILARITY) {
+          pairs.push({ mappedId, bestEntry: entry, similarity });
+        }
+      }
+    }
+    pairs.sort((a, b) => b.similarity - a.similarity);
+
+    for (const { mappedId, bestEntry } of pairs) {
+      if (reconciledSpeakers.has(mappedId) || usedLiveSpeakers.has(bestEntry.speakerId)) {
+        continue;
+      }
+
+      usedLiveSpeakers.add(bestEntry.speakerId);
+      reconciledSpeakers.add(mappedId);
+
+      let displayName = bestEntry.displayName;
+      let profileId = bestEntry.profileId;
+
+      if (bestEntry.noteId) {
+        const liveMapping = getMappingsForNote(bestEntry.noteId).find(
+          (mapping) => mapping.speaker_id === bestEntry.speakerId
+        );
+        if (liveMapping) {
+          displayName = liveMapping.display_name || displayName;
+          profileId = liveMapping.profile_id ?? profileId;
+          this.databaseManager.setSpeakerMapping(
+            bestEntry.noteId,
+            mappedId,
+            profileId,
+            displayName
+          );
+          // Live and offline ids share one namespace now, so they often match —
+          // removing the "old" row would delete the mapping just written.
+          if (bestEntry.speakerId !== mappedId) {
+            this.databaseManager.removeSpeakerMapping(bestEntry.noteId, bestEntry.speakerId);
+          }
+        } else if (displayName) {
+          this.databaseManager.setSpeakerMapping(
+            bestEntry.noteId,
+            mappedId,
+            profileId,
+            displayName
+          );
+        }
+      }
+
+      this._applySpeakerName(enrichedSegments, mappedId, displayName);
+      if (displayName) {
+        namedVoices.set(bestEntry.speakerId, { speaker: mappedId, name: displayName });
+      }
+    }
+    return namedVoices;
+  }
+
+  // The renderer's base covers the transcript it resumes; mappings and embeddings
+  // can also hold ids no row carries any more (merged clusters, a cluster that
+  // owned no segment), and a reused one would still name the new voice.
+  // A note recorded again before its last session's diarization lands has neither
+  // that result's ids in the seed nor its embeddings stored yet, so the session's
+  // reserved ceiling counts too.
+  _resolveMeetingSpeakerIndexBase(noteId, requestedBase) {
+    let base = normalizeSpeakerIndexBase(requestedBase);
+    if (noteId == null) return base;
+    for (const reservation of this._diarizationSpeakerReservations.values()) {
+      if (reservation.noteId === noteId) base = Math.max(base, reservation.ceiling);
+    }
+    try {
+      const storedIds = [
+        ...this.databaseManager.getSpeakerMappings(noteId).map((m) => m.speaker_id),
+        ...this.databaseManager.getNoteSpeakerEmbeddings(noteId).map((e) => e.speaker_id),
+      ];
+      return resolveSpeakerIndexBase(base, storedIds);
+    } catch (error) {
+      debugLogger.warn(
+        "Could not read stored speaker ids for the meeting note",
+        { noteId, error: error.message },
+        "speaker"
+      );
+      return base;
+    }
+  }
+
+  // The most speakers post-call diarization may keep, from the count the user or
+  // the note gives; clustering finds how many actually spoke.
+  _resolveSpeakerCap({ sessionConfig, noteId, diarizedSource }) {
+    // Only a count the user set explicitly outranks the note: participants added
+    // mid-meeting postdate the config snapshot taken at recording start.
+    let expectedTotal = sessionConfig?.explicit ? sessionConfig.expectedCount : null;
+
+    if (!expectedTotal && noteId != null) {
+      try {
+        expectedTotal = this._noteExpectedSpeakerCountOrNull(this.databaseManager.getNote(noteId));
+      } catch (_) {
+        expectedTotal = null;
+      }
+    }
+
+    // Diarizing the mic track (in-person session) means the user is one of the
+    // diarized voices, so the expected total applies without the -1 the
+    // system-audio branches use.
+    const micMode = diarizedSource === "mic";
+
+    if (expectedTotal) {
+      const total = Math.min(expectedTotal, MAX_SPEAKER_COUNT);
+      return micMode ? total : Math.max(1, total - 1);
+    }
+
+    if (micMode) {
+      return DEFAULT_EXPECTED_SPEAKER_COUNT;
+    }
+
+    // Only system audio reaches the diarizer (the mic track is "you"), so a cap
+    // would count other speakers. With no count there's none: live
+    // identification folds every remote voice into one then, so its speaker ids
+    // can't tell how many people spoke (#2641).
+    return null;
+  }
+
+  _startOrSkipDiarization(
+    sessionId,
+    rawPcmPath,
+    audioStartedAt,
+    transcriptSegments,
+    win,
+    liveSpeakerState = null,
+    sessionConfig = null,
+    noteId = null,
+    diarizedSource = "system",
+    speakerIndexBase = 0,
+    retractedSegments = []
+  ) {
+    const startMs =
+      (Number.isFinite(audioStartedAt) && audioStartedAt) ||
+      transcriptSegments.find((segment) => segment.source === diarizedSource)?.timestamp ||
+      transcriptSegments[0]?.timestamp ||
+      0;
+    const isEpochMs = startMs > 1e9;
+    const normalized = transcriptSegments.map((seg) => ({
+      ...seg,
+      timestamp:
+        seg.timestamp != null
+          ? isEpochMs
+            ? (seg.timestamp - startMs) / 1000
+            : seg.timestamp
+          : undefined,
+    }));
+
+    // Split before any send so diarized, skipped and failed runs drop the same
+    // echo rows.
+    const { kept, removed: echoDuplicates } = this.diarizationManager?.splitMicEchoDuplicates(
+      normalized
+    ) ?? { kept: normalized, removed: [] };
+    const echoDuplicateSet = new Set(echoDuplicates);
+    const isEchoDuplicate = (index) => echoDuplicateSet.has(normalized[index]);
+    // Rows main dropped that the renderer may still hold in the transcript it
+    // persisted at stop. Raw (epoch-ms) timestamps, matching that copy (#2781).
+    const removedSegments = [
+      ...retractedSegments,
+      ...transcriptSegments.filter((_, index) => isEchoDuplicate(index)),
+    ].map(({ text, source, timestamp }) => ({ text, source, timestamp }));
+    const send = (payload) => {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send("meeting-diarization-complete", {
+          sessionId,
+          noteId,
+          ...payload,
+          segments: payload.segments.map(
+            ({ timestampIsSpeechStart: _timestampIsSpeechStart, ...segment }) => segment
+          ),
+          removedSegments,
+        });
+      }
+    };
+    // Raw rows, sent when there is no diarization to merge.
+    const sendUndiarized = () =>
+      send({
+        segments: transcriptSegments
+          .map((segment, index) => ({ ...segment, id: segment.id || `segment-${index}` }))
+          .filter((_, index) => !isEchoDuplicate(index)),
+      });
+
+    const diarizationEnabled = (sessionConfig?.enabled ?? this.speakerDiarizationEnabled) !== false;
+
+    if (!diarizationEnabled || !this.diarizationManager?.isAvailable() || !rawPcmPath) {
+      sendUndiarized();
+      return;
+    }
+
+    const fs = require("fs");
+
+    const speakerCap = this._resolveSpeakerCap({ sessionConfig, noteId, diarizedSource });
+    // Reserved before the async work so a "record more" started while this runs
+    // numbers its speakers past every cluster the result can name. With no count
+    // the cap is settled after clustering, and it never exceeds MAX_SPEAKER_COUNT - 1.
+    if (noteId != null) {
+      this._diarizationSpeakerReservations.set(sessionId, {
+        noteId,
+        ceiling: speakerIndexBase + (speakerCap ?? MAX_SPEAKER_COUNT - 1),
+      });
+    }
+
+    (async () => {
+      let tmpWav = null;
+      try {
+        tmpWav = await this.diarizationManager.convertRawPcmToWav(rawPcmPath, 24000);
+        const {
+          resolveClusterThreshold,
+          mergeClustersByVoice,
+          dropNegligibleClusters,
+          isCollapsedDiarization,
+          matchVoiceToProfile,
+          dropVoicelessClustersOverCap,
+          capSpeakerClustersByVoice,
+        } = require("./diarizationPolicy");
+        const { PCM16_MONO_16K_BYTES_PER_SECOND } = require("./transcriptionTimeout");
+        const speakerEmb = require("./speakerEmbeddings");
+        const similarity = (a, b) => speakerEmb.cosineSimilarity(a, b);
+
+        // Always auto-cluster, as uploads do: a forced cluster count splits short
+        // utterances from long ones instead of one voice from another (#2021).
+        const durationSeconds = fs.statSync(tmpWav).size / PCM16_MONO_16K_BYTES_PER_SECOND;
+        let diarizationSegments = await this.diarizationManager.diarize(tmpWav, {
+          threshold: resolveClusterThreshold(durationSeconds),
+        });
+        let centroids = new Map();
+        try {
+          centroids = await speakerEmb.extractClusterCentroids(tmpWav, diarizationSegments);
+        } catch (error) {
+          debugLogger.warn("Speaker voices unavailable; clusters are not merged by voice", {
+            error: error.message,
+          });
+        }
+        // Voices were only measured on the remote side (#2641). On the mic track a
+        // merge could fold the other person into the user, and one cluster there
+        // labels every line "you".
+        if (diarizedSource === "system") {
+          // A count the user set says how many people spoke. One read off the
+          // note's invitees only bounds them, since invitees don't all turn up.
+          const countedVoices =
+            sessionConfig?.explicit && sessionConfig.expectedCount ? speakerCap : 0;
+          diarizationSegments = mergeClustersByVoice(
+            diarizationSegments,
+            centroids,
+            similarity,
+            countedVoices
+          );
+        }
+        // The count is what tells a quiet participant from a phantom. With none,
+        // a one-on-one is the likeliest call, so only the largest cluster is
+        // safe from the phantom rule: a sliver split off the one remote voice
+        // doesn't become a second speaker.
+        diarizationSegments = dropNegligibleClusters(
+          diarizationSegments,
+          speakerCap == null ? { protectedCount: 1 } : { voiced: centroids }
+        );
+        // With no count, one remote voice holding nearly all the speech beside
+        // short slivers is a one-on-one call: the slivers are the same voice. (An
+        // upload that collapses like this loses its labels instead, since it
+        // expects several voices.) A cluster without a voice can't be told from
+        // sherpa's split of one voice, so it's dropped and its lines go to the
+        // speaker nearest in time. With no voice at all, the cap stays at one.
+        let cap = speakerCap;
+        if (cap == null) {
+          const voiced = diarizationSegments.filter((s) => centroids.has(s.speaker));
+          if (voiced.length === 0 || isCollapsedDiarization(diarizationSegments)) {
+            cap = 1;
+          } else {
+            diarizationSegments = voiced;
+            cap = MAX_SPEAKER_COUNT - 1;
+          }
+        } else if (diarizedSource === "system") {
+          diarizationSegments = dropVoicelessClustersOverCap(diarizationSegments, cap, centroids);
+        }
+        diarizationSegments = capSpeakerClustersByVoice(
+          diarizationSegments,
+          cap,
+          centroids,
+          similarity
+        );
+
+        const enrichedSegments = this.diarizationManager.mergeWithTranscript(
+          kept,
+          diarizationSegments,
+          { diarizedSource, speakerIndexBase }
+        );
+
+        const speakerSet = new Set(diarizationSegments.map((d) => d.speaker));
+        const speakerRenumber = buildSpeakerRenumber(speakerSet, speakerIndexBase);
+        // Narrowed to the ids the result actually names; kept until quit, since the
+        // renderer persists them only after this send.
+        if (noteId != null) {
+          this._diarizationSpeakerReservations.set(sessionId, {
+            noteId,
+            ceiling: speakerIndexBase + speakerRenumber.size,
+          });
+        }
+
+        // Mirrors the mic-mode single-cluster softening in mergeWithTranscript:
+        // every segment stays "you", so persisting an embedding keyed to a
+        // cluster id that owns no segments would leave the note inconsistent.
+        const micSingleClusterSoftened = diarizedSource === "mic" && speakerSet.size === 1;
+
+        let speakerEmbeddingsMap = null;
+        try {
+          if (!micSingleClusterSoftened && speakerEmb.isAvailable() && tmpWav) {
+            const voices = await speakerEmb.extractClusterCentroids(tmpWav, diarizationSegments);
+            speakerEmbeddingsMap = {};
+            for (const [spk, centroid] of voices) {
+              speakerEmbeddingsMap[speakerRenumber.get(spk) || spk] = Array.from(centroid);
+            }
+          }
+        } catch (err) {
+          debugLogger.debug("Speaker embedding extraction skipped", { error: err.message });
+        }
+
+        // Live identification names its speaker on every line it labels (here
+        // and in the renderer), and with no count its one speaker covers every
+        // remote voice. When the call holds more than one voice and more voices
+        // than live speakers, every line's name is cleared, and reconciliation
+        // and profile matching below name each voice. Without voices to match,
+        // the names stay. null, not undefined: the renderer keeps a line's old
+        // value for an undefined field.
+        const liveSpeakersSplit =
+          Object.keys(speakerEmbeddingsMap || {}).length > 0 &&
+          speakerSet.size > Math.max(1, Object.keys(liveSpeakerState || {}).length);
+        if (liveSpeakersSplit) {
+          for (const segment of enrichedSegments) {
+            if (segment.source === diarizedSource) {
+              applyConfirmedSpeaker(segment, { speakerName: null });
+            }
+          }
+        }
+
+        const namedVoices = this._reconcileLiveSpeakerState(
+          liveSpeakerState,
+          speakerEmbeddingsMap,
+          enrichedSegments
+        );
+        // A name the user gave a live speaker is locked, in the renderer, onto
+        // every line that speaker labelled. After a split the renderer keeps
+        // that lock only on the voice the name went to; a name that matched no
+        // voice isn't listed, and stays on all of its lines.
+        const splitLiveSpeakers = liveSpeakersSplit ? Object.fromEntries(namedVoices) : undefined;
+
+        if (speakerEmbeddingsMap) {
+          try {
+            const profileVoices = this._speakerProfileVoices();
+
+            for (const [mappedId, embArr] of Object.entries(speakerEmbeddingsMap)) {
+              const alreadyMapped = enrichedSegments.some(
+                (segment) => segment.speaker === mappedId && segment.speakerName
+              );
+              if (alreadyMapped) {
+                continue;
+              }
+
+              const match = matchVoiceToProfile(
+                new Float32Array(embArr),
+                profileVoices,
+                similarity
+              );
+              if (!match) {
+                continue;
+              }
+
+              for (const seg of enrichedSegments) {
+                if (seg.speaker !== mappedId) {
+                  continue;
+                }
+                if (match.confirmed) {
+                  applyConfirmedSpeaker(seg, {
+                    speakerName: match.profile.display_name,
+                    speakerIsPlaceholder: false,
+                    suggestedName: undefined,
+                    suggestedProfileId: undefined,
+                  });
+                } else {
+                  applySuggestedSpeaker(seg, {
+                    suggestedName: match.profile.display_name,
+                    suggestedProfileId: match.profile.id,
+                  });
+                }
+              }
+            }
+          } catch (err) {
+            debugLogger.debug("Auto speaker recognition skipped", { error: err.message });
+          }
+        }
+
+        send({
+          segments: enrichedSegments,
+          speakerEmbeddings: speakerEmbeddingsMap,
+          splitLiveSpeakers,
+        });
+      } catch (err) {
+        debugLogger.warn("Background diarization failed", { error: err.message });
+        this._diarizationSpeakerReservations.delete(sessionId);
+        // The renderer only applies removedSegments alongside segments, so a
+        // failed run falls back to the skip result rather than an empty one.
+        sendUndiarized();
+      } finally {
+        try {
+          fs.unlinkSync(rawPcmPath);
+        } catch (_) {}
+        if (tmpWav) {
+          try {
+            fs.unlinkSync(tmpWav);
+          } catch (_) {}
+        }
+      }
+    })();
+  }
+
+  deleteTranscriptionInternal(id) {
+    const result = this.databaseManager.deleteTranscription(id);
+    if (result?.success) {
+      // After the scoped delete, so another account's recording is never touched.
+      this.audioStorageManager.deleteAudio(id);
+      setImmediate(() => {
+        broadcastToWindows("transcription-deleted", { id });
+      });
+    }
+    return result;
+  }
+
+  deleteNoteInternal(id) {
+    const snapshots = this._captureMirrorDeletionNotes({ id });
+    const result = this.databaseManager.deleteNote(id);
+    if (result?.success) {
+      setImmediate(() => broadcastToWindows("note-deleted", { id }));
+      this.notifyVectorChanges();
+      this._asyncMirrorDelete(id, snapshots);
+    }
+    return result;
+  }
+}
+
+module.exports = IPCHandlers;

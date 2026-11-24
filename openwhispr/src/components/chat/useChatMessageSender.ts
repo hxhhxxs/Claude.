@@ -1,0 +1,126 @@
+import { useCallback, useRef } from "react";
+import type { ChatPersistence } from "./useChatPersistence";
+import type { ChatStreaming, SendToAIOptions } from "./useChatStreaming";
+import type { Message } from "./types";
+import { normalizeAgentSelectionContext } from "../../utils/agentSelectionContext";
+
+interface PersistedMessageContext {
+  conversationId: number;
+  text: string;
+  isFirstMessage: boolean;
+}
+
+interface UseChatMessageSenderOptions {
+  conversationId: number | null;
+  persistence: ChatPersistence;
+  streaming: Pick<ChatStreaming, "sendToAI">;
+  createConversation: (text: string) => Promise<number>;
+  onMessagePersisted?: (context: PersistedMessageContext) => void | Promise<void>;
+  onSendingChange?: (sending: boolean) => void;
+}
+
+export interface MessageSubmissionLock {
+  run: (operation: () => Promise<void>) => Promise<boolean>;
+}
+
+export function createMessageSubmissionLock(): MessageSubmissionLock {
+  let active = false;
+
+  return {
+    async run(operation: () => Promise<void>): Promise<boolean> {
+      if (active) return false;
+      active = true;
+      try {
+        await operation();
+        return true;
+      } finally {
+        active = false;
+      }
+    },
+  };
+}
+
+export function useChatMessageSender({
+  conversationId,
+  persistence,
+  streaming,
+  createConversation,
+  onMessagePersisted,
+  onSendingChange,
+}: UseChatMessageSenderOptions): (text: string, options?: SendToAIOptions) => Promise<boolean> {
+  const submissionLockRef = useRef<MessageSubmissionLock | null>(null);
+  if (submissionLockRef.current === null) {
+    submissionLockRef.current = createMessageSubmissionLock();
+  }
+
+  return useCallback(
+    async (text: string, options?: SendToAIOptions) => {
+      const version = persistence.getSessionVersion?.();
+      const isCurrent = () => version === persistence.getSessionVersion?.();
+      let submitted = false;
+      const accepted = await submissionLockRef.current!.run(async () => {
+        onSendingChange?.(true);
+        let claimedId: number | null = null;
+        let streamStarted = false;
+        try {
+          const convId =
+            (conversationId === persistence.conversationId ? conversationId : null) ??
+            (await createConversation(text));
+          if (!isCurrent()) return;
+          const claim = await persistence.claimConversation?.(convId);
+          if (claim === false) return;
+          claimedId = convId;
+          if (!isCurrent()) return;
+          const previousMessages = claim?.messages ?? persistence.messages;
+          const context = normalizeAgentSelectionContext(options?.selectedContext);
+          const selectedContext = context?.text;
+          const selectedContextSource = context?.source === "external" ? "external" : undefined;
+          const userMessage: Message = {
+            id: crypto.randomUUID(),
+            role: "user",
+            content: text,
+            isStreaming: false,
+            ...(selectedContext ? { selectedContext } : {}),
+            ...(selectedContextSource ? { selectedContextSource } : {}),
+          };
+
+          persistence.setMessages((messages) => [...messages, userMessage]);
+          await persistence.saveUserMessage(text, {
+            messageId: userMessage.id,
+            selectedContext,
+            ...(selectedContextSource ? { selectedContextSource } : {}),
+          });
+          if (!isCurrent()) return;
+          await onMessagePersisted?.({
+            conversationId: convId,
+            text,
+            isFirstMessage: previousMessages.length === 0,
+          });
+          if (!isCurrent()) return;
+          submitted = true;
+          streamStarted = true;
+          await streaming.sendToAI(text, [...previousMessages, userMessage], {
+            ...options,
+            conversationId: convId,
+            persistAssistantMessage: persistence.saveAssistantMessage,
+          });
+        } catch (error) {
+          if (isCurrent()) throw error;
+        } finally {
+          if (claimedId != null && !streamStarted)
+            await persistence.releaseConversation?.(claimedId);
+          onSendingChange?.(false);
+        }
+      });
+      return accepted && submitted;
+    },
+    [
+      conversationId,
+      createConversation,
+      onMessagePersisted,
+      onSendingChange,
+      persistence,
+      streaming,
+    ]
+  );
+}

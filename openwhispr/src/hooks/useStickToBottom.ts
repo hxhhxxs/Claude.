@@ -1,0 +1,167 @@
+import {
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  type RefObject,
+  type TouchEvent,
+  type WheelEvent,
+} from "react";
+import {
+  createScrollFollowController,
+  type ScrollFollowController,
+} from "../utils/scrollFollowState";
+
+// Passive scrolls within this distance still follow the stream. Explicit
+// upward input stays detached until the reader reaches the true bottom.
+const PIN_THRESHOLD_PX = 40;
+
+interface StickToBottomOptions {
+  /** While true the scroller resets to the top and re-pins (e.g. cleared content). */
+  resetToTop?: boolean;
+}
+
+interface StickToBottomResult<T extends HTMLElement> {
+  scrollRef: RefObject<T | null>;
+  handleScroll: () => void;
+  handleWheel: (event: WheelEvent<T>) => void;
+  handleTouchStart: (event: TouchEvent<T>) => void;
+  handleTouchMove: (event: TouchEvent<T>) => void;
+  handleTouchEnd: () => void;
+}
+
+function pinToBottom(node: HTMLElement): void {
+  const bottom = node.scrollHeight - node.clientHeight;
+  if (bottom > 0 && Math.abs(node.scrollTop - bottom) > 1) node.scrollTop = bottom;
+}
+
+// How long an upward gesture an inner scroller took stays its own between
+// events. Chromium keeps a whole gesture, momentum included, on the scroller it
+// started in, even once that scroller reaches its top.
+const INNER_GESTURE_MS = 200;
+
+// Portaled descendants (e.g. a popover opened from a row) bubble synthetic
+// events through the React tree while their DOM target lives outside the
+// scroller; wheeling there scrolls another surface, not the stream.
+function isReaderGesture(node: HTMLElement, target: EventTarget | null): boolean {
+  return (
+    node.scrollHeight - node.clientHeight > 1 && target instanceof Node && node.contains(target)
+  );
+}
+
+// A clipped box scrolled by scrollIntoView has a scrollTop too, but a wheel
+// over it scrolls the stream.
+function scrollsVertically(el: Element): boolean {
+  const overflowY = el.ownerDocument.defaultView?.getComputedStyle(el).overflowY ?? "";
+  return el.scrollHeight > el.clientHeight && /^(?:auto|scroll)$/.test(overflowY);
+}
+
+// An upward gesture moves the reader up the stream, unless a scroller inside
+// it that can still scroll up (a card's long body) takes it, or it goes on from
+// a gesture such a scroller took (`innerGestureAt` holds when it last did).
+function leavesBottom(
+  node: HTMLElement,
+  target: EventTarget | null,
+  at: number,
+  innerGestureAt: { current: number }
+): boolean {
+  if (!isReaderGesture(node, target)) return false;
+  let inner = at - innerGestureAt.current < INNER_GESTURE_MS;
+  for (let el = target as Node | null; !inner && el && el !== node; el = el.parentNode) {
+    inner = el instanceof Element && el.scrollTop > 0 && scrollsVertically(el);
+  }
+  if (inner) innerGestureAt.current = at;
+  return !inner;
+}
+
+/**
+ * Keeps a scroller pinned to its bottom while content (`dep`) grows, but never
+ * yanks a user back down after they scroll up to re-read. Attach the returned
+ * ref and event handlers to the scrolling element.
+ */
+export function useStickToBottom<T extends HTMLElement>(
+  dep: unknown,
+  { resetToTop = false }: StickToBottomOptions = {}
+): StickToBottomResult<T> {
+  const scrollRef = useRef<T>(null);
+  const followerRef = useRef<ScrollFollowController | null>(null);
+  const touchYRef = useRef<number | null>(null);
+  const innerGestureAtRef = useRef(Number.NEGATIVE_INFINITY);
+  if (!followerRef.current) {
+    followerRef.current = createScrollFollowController({
+      nearBottomThreshold: PIN_THRESHOLD_PX,
+    });
+  }
+
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    if (resetToTop) {
+      followerRef.current?.follow();
+      node.scrollTop = 0;
+      return;
+    }
+    if (followerRef.current?.isFollowing()) pinToBottom(node);
+
+    const content = node.firstElementChild;
+    const ro = new ResizeObserver(() => {
+      if (followerRef.current?.isFollowing()) pinToBottom(node);
+    });
+    // The scroller's own border box: a resized viewport re-pins, but padding the scroller
+    // makes for an overlay over the page (the note chat over a transcript) doesn't move it.
+    ro.observe(node, { box: "border-box" });
+    // The content's border box, so bottom padding that makes room for the chat's own
+    // composer re-pins, keeping the last lines above it.
+    if (content) ro.observe(content, { box: "border-box" });
+    return () => ro.disconnect();
+  }, [dep, resetToTop]);
+
+  const handleScroll = useCallback(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    followerRef.current?.update(node);
+  }, []);
+
+  const handleWheel = useCallback((event: WheelEvent<T>) => {
+    const node = scrollRef.current;
+    if (
+      event.deltaY < 0 &&
+      node &&
+      leavesBottom(node, event.target, event.timeStamp, innerGestureAtRef)
+    ) {
+      followerRef.current?.leaveBottom();
+    }
+  }, []);
+
+  const handleTouchStart = useCallback((event: TouchEvent<T>) => {
+    touchYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const handleTouchMove = useCallback((event: TouchEvent<T>) => {
+    const nextY = event.touches[0]?.clientY;
+    const previousY = touchYRef.current;
+    if (nextY == null) return;
+    const node = scrollRef.current;
+    if (
+      previousY != null &&
+      nextY > previousY &&
+      node &&
+      leavesBottom(node, event.target, event.timeStamp, innerGestureAtRef)
+    ) {
+      followerRef.current?.leaveBottom();
+    }
+    touchYRef.current = nextY;
+  }, []);
+
+  const handleTouchEnd = useCallback(() => {
+    touchYRef.current = null;
+  }, []);
+
+  return {
+    scrollRef,
+    handleScroll,
+    handleWheel,
+    handleTouchStart,
+    handleTouchMove,
+    handleTouchEnd,
+  };
+}

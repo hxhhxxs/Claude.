@@ -1,0 +1,2501 @@
+const { app, screen, BrowserWindow, dialog, ipcMain } = require("electron");
+const debugLogger = require("./debugLogger");
+const tokenStore = require("./tokenStore");
+const accountScopeBinding = require("./accountScopeBinding");
+const {
+  describeMeetingNote,
+  meetingDestinationContext,
+} = require("./meetingNotificationDestination");
+const { createLinuxWindowInputRegion } = require("./linuxWindowInputRegion");
+const { createWin32WindowShape } = require("./win32WindowShape");
+// Aliased: this class has an openExternalUrl method wrapping the helper.
+const { openExternalUrl: openUrlInExternalBrowser } = require("./externalUrlOpener");
+const HotkeyManager = require("./hotkeyManager");
+const { isGlobeLikeHotkey } = HotkeyManager;
+const DragManager = require("./dragManager");
+const MainWindowPlacementCoordinator = require("./mainWindowPlacementCoordinator");
+const { plasmaWorkAreas } = require("./plasmaWorkAreas");
+const MenuManager = require("./menuManager");
+const DevServerManager = require("./devServerManager");
+const {
+  isAllowedAppNavigation,
+  isExternalBrowserUrl,
+  isExternalOpenUrl,
+} = require("./navigationGuard");
+const { pathToFileURL } = require("url");
+const dockManager = require("./dockManager");
+const { i18nMain } = require("./i18nMain");
+const { NotificationDismissTimer, getNotificationTimeoutMs } = require("./notificationTimer");
+const {
+  DICTATION_LIFECYCLE,
+  normalizeDictationLifecycle,
+  shouldIgnoreDictationHotkey,
+  isDictationRecording,
+} = require("./dictationLifecycle");
+const { DEV_SERVER_PORT } = DevServerManager;
+const DRAG_MOVE_TOLERANCE_PX = 2;
+const ERR_ABORTED = -3;
+const {
+  MAIN_WINDOW_CONFIG,
+  CONTROL_PANEL_CONFIG,
+  ONBOARDING_WINDOW_SIZES,
+  NOTIFICATION_WINDOW_CONFIG,
+  fitMeetingNotificationWindow,
+  fitAssistantContentWindowToWorkArea,
+  fitDictationErrorContentWindowToWorkArea,
+  fitDictationErrorWindowToWorkArea,
+  resolveHorizontalWindowDirection,
+  WINDOW_SIZES,
+  WindowPositionUtil,
+} = require("./windowConfig");
+// The collapsed prompt card, inset 4px inside the notification window.
+const MEETING_NOTIFICATION_CARD_REGION = Object.freeze({
+  x: 4,
+  y: 4,
+  width: NOTIFICATION_WINDOW_CONFIG.width - 8,
+  height: NOTIFICATION_WINDOW_CONFIG.height - 8,
+});
+const { centeredBounds, clampedBounds } = require("./onboardingWindowBounds");
+const { ONBOARDING_DEMO_KINDS, isOnboardingInputAllowed } = require("./onboardingInputPolicy");
+const { createHotkeyRepeatGate } = require("./hotkeyRepeatGate");
+
+// The renderer asks for a window mode per onboarding step; each one names its
+// size in ONBOARDING_WINDOW_SIZES. "restore" is handled separately.
+const ONBOARDING_WINDOW_SIZE_KEYS = {
+  compact: "COMPACT",
+  expanded: "EXPANDED",
+  "local-setup": "LOCAL_SETUP",
+};
+
+class WindowManager {
+  constructor() {
+    this.mainWindow = null;
+    this.controlPanelWindow = null;
+    this._resizeMaskTokenCounter = 0;
+    this._controlPanelVisibilityTimer = null;
+    this._onboardingRestoreBounds = null;
+    this._onboardingWindowMode = null;
+    this._onboardingWindowState = null;
+    // Fail closed until AppRouter has resolved persisted onboarding state and
+    // committed the normal app. This covers the startup gap before React mounts.
+    this._onboardingActive = true;
+    this._onboardingDemoKind = null;
+    // Set by IPCHandlers so its demo session dies with the demo kind on every
+    // teardown path (id-matched end, onboarding exit, control panel closed).
+    this.onOnboardingDemoTeardown = null;
+    // Main observes accepted transitions for cleanup residency and the tray.
+    this.onDictationStateChanged = null;
+    // Set by IPCHandlers: the org-policy refusal of meeting recording, or null.
+    this.getMeetingRecordingRefusal = () => null;
+    // Set by IPCHandlers: the same refusal, fetching the policy if it hasn't loaded.
+    this.resolveMeetingRecordingRefusal = async () => null;
+    // Set by main.js: an app started to the tray creates no control panel.
+    this.startedMinimized = false;
+    this.notificationWindow = null;
+    this._meetingNotificationOwner = null;
+    this.meetingRecentDestinations = [];
+    this._notificationDismissTimer = new NotificationDismissTimer(() => {
+      // Dismiss first: a prompt raised from the timeout handler must not be
+      // closed by this dismissal. The engine is not told the card closed either —
+      // handleNotificationTimeout below settles this expiry, and a close report
+      // here would flush the queue into a card that handler is about to clear.
+      this.dismissMeetingNotification({ notifyEngine: false });
+      this.meetingDetectionEngine?.handleNotificationTimeout();
+    });
+    this.notificationPrefs = {
+      notificationsEnabled: true,
+      notifyMeetingDetection: true,
+      notifyCalendarReminders: true,
+    };
+    this.tray = null;
+    // Set by main.js: the assistant's own window (agentWindowManager.js).
+    this.agentWindow = null;
+    this.hotkeyManager = new HotkeyManager();
+    this.dragManager = new DragManager();
+    this._mainWindowPlacementCoordinator = new MainWindowPlacementCoordinator();
+    this.isQuitting = false;
+    this.loadErrorShown = false;
+    this.macCompoundPushState = null;
+    this.winPushState = null;
+    this._nativeKeyListenersReady = false;
+    this._cachedActivationMode = "tap";
+    this._floatingIconAutoHide = false;
+    this._panelStartPosition = "bottom-right";
+    this._activeHorizontalDirection = null;
+    this._isDictatingToggle = false;
+    this._dictationLifecycleState = DICTATION_LIFECYCLE.IDLE;
+    this._dictationAttempt = null;
+    this._pendingMeetingNoteNavigation = null;
+    this._pendingNoteNavigation = null;
+    this._pendingSettingsSection = null;
+
+    app.on("before-quit", () => {
+      this.isQuitting = true;
+      this.hotkeyManager.unregisterAll();
+    });
+  }
+
+  async createMainWindow() {
+    // The agent window anchors above a center-docked dictation pill, so it
+    // follows once the pill has moved.
+    void plasmaWorkAreas.start(async () => {
+      await this._reanchorMainWindow();
+      this.agentWindow?.refit();
+    });
+    const cursorPos = screen.getCursorScreenPoint();
+    const display = plasmaWorkAreas.resolve(screen.getDisplayNearestPoint(cursorPos));
+    const position = WindowPositionUtil.getMainWindowPosition(
+      display,
+      null,
+      this._panelStartPosition
+    );
+
+    this.mainWindow = new BrowserWindow({
+      ...MAIN_WINDOW_CONFIG,
+      ...position,
+    });
+
+    this.setMainWindowInteractivity(false);
+    this.registerMainWindowEvents();
+    this.registerExternalLinkHandlers(this.mainWindow, false);
+
+    // Register load event handlers BEFORE loading to catch all events
+    this.mainWindow.webContents.on(
+      "did-fail-load",
+      async (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) {
+          return;
+        }
+        if (
+          process.env.NODE_ENV === "development" &&
+          validatedURL &&
+          validatedURL.includes(`localhost:${DEV_SERVER_PORT}`)
+        ) {
+          setTimeout(async () => {
+            const isReady = await DevServerManager.waitForDevServer();
+            if (isReady) {
+              this.mainWindow.reload();
+            }
+          }, 2000);
+        } else {
+          this.showLoadFailureDialog("Dictation panel", errorCode, errorDescription, validatedURL);
+        }
+      }
+    );
+
+    const dictationContents = this.mainWindow.webContents;
+    const releaseDictation = () => {
+      if (this.mainWindow?.webContents === dictationContents) {
+        this.setDictationLifecycleState(DICTATION_LIFECYCLE.IDLE);
+      }
+    };
+    dictationContents.on("did-navigate", releaseDictation);
+    dictationContents.on("render-process-gone", releaseDictation);
+    dictationContents.on("destroyed", releaseDictation);
+    this.mainWindow.webContents.on("did-finish-load", () => {
+      // A reload has not resolved its route yet. AppRouter releases this gate
+      // after it renders the normal app; fresh onboarding keeps it active.
+      this.setOnboardingActive(true);
+      this.endOnboardingDemo();
+      this.mainWindow.setTitle(i18nMain.t("window.voiceRecorderTitle"));
+      this.enforceMainWindowOnTop();
+      this._notifyMainWindowHorizontalDirection();
+    });
+
+    await this.loadMainWindow();
+    await this.initializeHotkey();
+    this.dragManager.setTargetWindow(this.mainWindow);
+    MenuManager.setupMainMenu(() => this.openSettings());
+  }
+
+  _updateMainContentProtection() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.setContentProtection(Boolean(this._screenContextProtection));
+  }
+
+  setScreenContextProtection(enabled) {
+    this._screenContextProtection = Boolean(enabled);
+    this._updateMainContentProtection();
+  }
+
+  // blur() leaves X focus on the Linux pill, and GNOME hands focus back to the
+  // previous app only when the focused override-redirect window unmaps. A hidden
+  // pill holds no focus, and remapping it would undo whatever hid it.
+  returnLinuxKeyboardFocus() {
+    const win = this.mainWindow;
+    if (!win || win.isDestroyed() || !win.isVisible()) return;
+    win.hide();
+    win.showInactive();
+  }
+
+  setMainWindowInteractivity(shouldCapture) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return;
+    }
+
+    if (process.platform === "win32") {
+      // Windows click-through forwarding is unreliable for this floating panel.
+      this.mainWindow.setIgnoreMouseEvents(false);
+      return;
+    }
+
+    if (process.platform === "linux") {
+      // Native capture is the fallback when the input-region helper is unavailable.
+      this.mainWindow.setIgnoreMouseEvents(!shouldCapture);
+    } else if (shouldCapture) {
+      this.mainWindow.setIgnoreMouseEvents(false);
+    } else {
+      this.mainWindow.setIgnoreMouseEvents(true, { forward: true });
+    }
+  }
+
+  _mainWindowInputRegion() {
+    const win = this.mainWindow;
+    if (this._linuxWindowInputRegion?.window !== win) {
+      this._linuxWindowInputRegion?.stop();
+      this._linuxWindowInputRegion = { window: win, ...createLinuxWindowInputRegion(win) };
+    }
+    return this._linuxWindowInputRegion;
+  }
+
+  _win32MainWindowShape() {
+    const win = this.mainWindow;
+    if (this._win32WindowShape?.window !== win) {
+      this._win32WindowShape = { window: win, ...createWin32WindowShape(win) };
+    }
+    return this._win32WindowShape;
+  }
+
+  async setMainWindowInputRegion(region) {
+    const win = this.mainWindow;
+    if (!win || win.isDestroyed()) return false;
+    if (process.platform === "win32") {
+      const visible = win.isVisible() && !win.isMinimized();
+      // A hidden pill shows whole; the renderer shapes it again once shown.
+      this._win32MainWindowShape().set(visible ? region : null);
+      return visible;
+    }
+    if (process.platform !== "linux") return false;
+    try {
+      // Electron reapplies this flag on every bounds, state and theme change. Clear it for
+      // full-window input and let the helper set the exact clickable area for a collapsed pill.
+      win.setIgnoreMouseEvents(region !== null);
+      await this._mainWindowInputRegion().set(region);
+      return !win.isDestroyed() && win.isVisible() && !win.isMinimized();
+    } catch (error) {
+      // The writer rejects after its process closes, so an old shape cannot
+      // overwrite this fallback and leave native hover unreachable.
+      if (!win.isDestroyed()) win.setIgnoreMouseEvents(false);
+      throw error;
+    }
+  }
+
+  // Every token or account change retires the prompt first, so only the
+  // current binding has to agree with the database's account.
+  hasMeetingNotificationScope() {
+    const database = this.meetingDetectionEngine?.databaseManager;
+    if (!database) return false;
+    const state = tokenStore.getState();
+    // A token without a valid binding scopes like no token (signed out).
+    const boundAccountId = state.token
+      ? (accountScopeBinding.resolveActiveAccountScope({
+          ...state,
+          binding: accountScopeBinding.read(),
+        })?.accountId ?? null)
+      : null;
+    return boundAccountId === database.activeAccountId;
+  }
+
+  captureMeetingNotificationOwner(sender) {
+    const owner = this._meetingNotificationOwner;
+    return owner && owner.window.webContents === sender && this.isMeetingNotificationOwner(owner)
+      ? owner
+      : null;
+  }
+
+  isMeetingNotificationOwner(owner) {
+    return Boolean(
+      owner &&
+      owner === this._meetingNotificationOwner &&
+      !owner.window.isDestroyed() &&
+      !this._onboardingActive &&
+      owner.detection &&
+      this.meetingDetectionEngine?.activeDetections?.get(owner.prompt.detectionId) ===
+        owner.detection &&
+      this.hasMeetingNotificationScope()
+    );
+  }
+
+  retireMeetingNotificationScope() {
+    this.meetingRecentDestinations = [];
+    this._pendingMeetingNoteNavigation = null;
+    this._cancelMeetingNavigation("STALE_NOTIFICATION");
+    if (this.meetingDetectionEngine) {
+      this.meetingDetectionEngine._notificationQueue = [];
+      this.meetingDetectionEngine.activeDetections.clear();
+    }
+    this.dismissMeetingNotification({ notifyEngine: false });
+  }
+
+  updateMeetingNotificationPause(owner) {
+    if (owner !== this._meetingNotificationOwner) return;
+    if (owner.pointerInside || owner.mode !== "closed" || owner.responseInFlight) {
+      this._notificationDismissTimer.pause();
+    } else this._notificationDismissTimer.resume();
+  }
+
+  setNotificationInteractivity(sender, interactive) {
+    const win = this.notificationWindow;
+    if (!win || win.isDestroyed() || sender !== win.webContents) return;
+    if (process.platform !== "linux") win.setIgnoreMouseEvents(!interactive, { forward: true });
+    const owner = this._meetingNotificationOwner;
+    owner.pointerInside = interactive;
+    this.updateMeetingNotificationPause(owner);
+  }
+
+  setMeetingNotificationSurface(owner, state) {
+    if (!this.isMeetingNotificationOwner(owner))
+      return { success: false, code: "STALE_NOTIFICATION" };
+    if (
+      !state ||
+      !Number.isSafeInteger(state.revision) ||
+      state.revision <= owner.layoutRevision ||
+      !["closed", "list", "form"].includes(state.mode) ||
+      !["request", "release", "keep"].includes(state.focus) ||
+      !Number.isFinite(state.contentHeight) ||
+      state.contentHeight <= 0 ||
+      state.contentHeight > 4096 ||
+      !Array.isArray(state.regions) ||
+      !state.regions.length ||
+      state.regions.length > 16 ||
+      state.regions.some(
+        (r) =>
+          !r ||
+          ![r.x, r.y, r.width, r.height].every(Number.isFinite) ||
+          r.x < 0 ||
+          r.y < 0 ||
+          r.width <= 0 ||
+          r.height <= 0 ||
+          r.x + r.width > NOTIFICATION_WINDOW_CONFIG.width ||
+          r.y + r.height > 4096
+      )
+    ) {
+      return { success: false, code: "INVALID_REQUEST" };
+    }
+    const win = owner.window;
+    const display = screen.getDisplayMatching(win.getBounds());
+    const bounds = fitMeetingNotificationWindow(
+      state.contentHeight,
+      display.workArea || display.bounds
+    );
+    const regions = state.regions
+      .map((r) => ({
+        x: Math.min(Math.round(r.x), bounds.width),
+        y: Math.min(Math.round(r.y), bounds.height),
+        width: Math.max(0, Math.min(Math.ceil(r.width), bounds.width - Math.round(r.x))),
+        height: Math.max(0, Math.min(Math.ceil(r.height), bounds.height - Math.round(r.y))),
+      }))
+      .filter((r) => r.width > 0 && r.height > 0);
+    if (!regions.length) return { success: false, code: "INVALID_REQUEST" };
+    owner.layoutRevision = state.revision;
+    owner.mode = state.mode;
+    owner.surface = state;
+    const previousBounds = win.getBounds();
+    if (Object.keys(bounds).some((key) => bounds[key] !== previousBounds[key]))
+      win.setBounds(bounds);
+    if (process.platform === "linux") win.setShape(regions);
+    if (state.focus === "request" && state.mode !== "closed") {
+      if (process.platform !== "linux") win.setFocusable(true);
+      // macOS panels need show() to activate after becoming focusable. Only an
+      // explicit chooser action reaches here; measurement never raises them.
+      win.show();
+      win.focus();
+    } else if (state.focus === "release") {
+      // macOS blur orders the window out and back, blinking the whole card.
+      // Keep it visible while disabling input focus.
+      if (process.platform !== "darwin") win.blur();
+      if (process.platform !== "linux") win.setFocusable(false);
+    }
+    const cursor = screen.getCursorScreenPoint();
+    owner.pointerInside = regions.some(
+      (r) =>
+        cursor.x >= bounds.x + r.x &&
+        cursor.x < bounds.x + r.x + r.width &&
+        cursor.y >= bounds.y + r.y &&
+        cursor.y < bounds.y + r.y + r.height
+    );
+    if (process.platform !== "linux")
+      win.setIgnoreMouseEvents(!owner.pointerInside, { forward: true });
+    this.updateMeetingNotificationPause(owner);
+    return {
+      success: true,
+      value: {
+        width: bounds.width,
+        height: bounds.height,
+        maxHeight: fitMeetingNotificationWindow(512, display.workArea || display.bounds).height,
+      },
+    };
+  }
+
+  resizeMainWindow(sizeKey) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return { success: false, message: "Window not available" };
+    }
+    return this._enqueueMainWindowMutation(() => this._performMainWindowResize(sizeKey));
+  }
+
+  resizeAssistantWindowToContent(surfaceHeight) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return { success: false, message: "Window not available" };
+    }
+
+    return this._enqueueMainWindowMutation(() =>
+      this._performMainWindowResize("ASSISTANT_CONTENT", { surfaceHeight })
+    );
+  }
+
+  resizeDictationErrorWindowToContent(surfaceHeight) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return { success: false, message: "Window not available" };
+    }
+
+    return this._enqueueMainWindowMutation(() =>
+      this._performMainWindowResize("DICTATION_ERROR_CONTENT", { surfaceHeight })
+    );
+  }
+
+  // Deliberate moves are not anchored resizes: the renderer must drop any live
+  // resize mask rather than hold a translation against invalidated bounds.
+  _clearRendererResizeMask() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.webContents.send("main-window-will-resize", { anchor: "none" });
+  }
+
+  async _prepareRendererForMainWindowResize(bounds, anchor) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+
+    // The renderer must install screen-space anchor compensation before
+    // setBounds reaches the OS compositor. Without this handshake, Windows
+    // and macOS can paint the new viewport size one frame before the
+    // corresponding window position, which visibly kicks the pill or panel.
+    // A fixed sleep loses that race whenever the renderer is mid-task (an
+    // entrance commit, mic warm-up), so wait for its explicit ack; the
+    // timeout only covers an unresponsive or torn-down renderer.
+    const token = ++this._resizeMaskTokenCounter;
+    const ackPromise = new Promise((resolve) => {
+      const listener = (_event, ackToken) => {
+        if (ackToken !== token) return;
+        ipcMain.removeListener("main-window-resize-mask-ready", listener);
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        ipcMain.removeListener("main-window-resize-mask-ready", listener);
+        resolve();
+      }, 60);
+      ipcMain.on("main-window-resize-mask-ready", listener);
+    });
+    this.mainWindow.webContents.send("main-window-will-resize", { bounds, anchor, token });
+    await ackPromise;
+  }
+
+  _enqueueMainWindowMutation(run) {
+    // Renderer voice requests are latest-wins, while errors and other overlays
+    // and active-display placement can also mutate the native bounds. Serialize
+    // once more at the native boundary so setBounds calls cannot interleave.
+    this._mainWindowResizeQueue = (this._mainWindowResizeQueue || Promise.resolve()).then(run, run);
+    return this._mainWindowResizeQueue;
+  }
+
+  // The pill is bottom-anchored, so the display that owns its bottom-center
+  // point is the one that must keep it through resizes and repositions.
+  _getMainWindowDisplayFor(bounds) {
+    return plasmaWorkAreas.resolve(
+      screen.getDisplayNearestPoint({
+        x: bounds.x + bounds.width / 2,
+        y: bounds.y + bounds.height,
+      })
+    );
+  }
+
+  _resolveMainWindowSize(sizeKey, workArea, request) {
+    switch (sizeKey) {
+      case "DICTATION_ERROR":
+      case "DICTATION_ERROR_WITH_TRANSCRIPT":
+        return fitDictationErrorWindowToWorkArea(WINDOW_SIZES[sizeKey], workArea);
+      case "ASSISTANT_CONTENT":
+        return fitAssistantContentWindowToWorkArea(request?.surfaceHeight, workArea);
+      case "DICTATION_ERROR_CONTENT":
+        return fitDictationErrorContentWindowToWorkArea(request?.surfaceHeight, workArea);
+      default:
+        return WINDOW_SIZES[sizeKey] || WINDOW_SIZES.BASE;
+    }
+  }
+
+  _setResizedMainWindowBounds(bounds) {
+    // A Windows shape measured at the old size would cover the wrong part of
+    // the resized window, or none of it, until the resize event clears it.
+    if (process.platform === "win32") this._win32MainWindowShape().prepareResize(bounds);
+    this.mainWindow.setBounds(bounds);
+  }
+
+  async _performMainWindowResize(sizeKey, request) {
+    // The queue can drain after the window is gone (quit, recreate); the
+    // caller's guard ran before enqueueing.
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return { success: false, error: "Main window not available" };
+    }
+    // Bounds, display and the work-area fit are all sampled inside the queue:
+    // a queued cross-display move would otherwise leave a fit computed at
+    // enqueue time describing the display the window is about to leave.
+    const currentBounds = this.mainWindow.getBounds();
+    const display = this._getMainWindowDisplayFor(currentBounds);
+    const newSize = this._resolveMainWindowSize(
+      sizeKey,
+      display.workArea || display.bounds,
+      request
+    );
+
+    // A window moved since the last resize (dragged) means the captured BASE
+    // bounds no longer describe where the user wants the pill — drop them.
+    // Tolerate a couple of pixels: fractional DPI scaling can round setBounds
+    // values, and treating that as a drag would defeat the restore forever.
+    const MOVE_TOLERANCE_PX = 2;
+    if (
+      this._lastResizeBounds &&
+      (Math.abs(currentBounds.x - this._lastResizeBounds.x) > MOVE_TOLERANCE_PX ||
+        Math.abs(currentBounds.y - this._lastResizeBounds.y) > MOVE_TOLERANCE_PX)
+    ) {
+      this._baseBoundsBeforeResize = null;
+      this._activeHorizontalDirection = null;
+    }
+
+    // Returning to BASE restores the exact pre-grow bounds. Anchoring the
+    // shrink on the grown bounds instead would re-anchor on whatever the
+    // work-area clamp did on the way up, walking the pill away from where the
+    // user put it a little more on every grow/shrink cycle.
+    if (sizeKey === "BASE" && this._baseBoundsBeforeResize) {
+      // The work area can shrink while the window is grown (dock/taskbar
+      // reappearing, resolution change) — clamp the restore so the pill
+      // cannot come back off-screen.
+      const restored = {
+        ...this._baseBoundsBeforeResize,
+        ...WindowPositionUtil.clampToWorkArea(this._baseBoundsBeforeResize, display),
+      };
+      const restoreAnchor =
+        this._panelStartPosition === "center"
+          ? "center"
+          : `bottom-${this._activeHorizontalDirection || this.getMainWindowHorizontalDirection()}`;
+      this._baseBoundsBeforeResize = null;
+      if (
+        restored.x === currentBounds.x &&
+        restored.y === currentBounds.y &&
+        restored.width === currentBounds.width &&
+        restored.height === currentBounds.height
+      ) {
+        // Nothing moved (BASE and the grown size share bounds) — skip the mask
+        // handshake and setBounds so the restore cannot perturb the renderer.
+        this._lastResizeBounds = restored;
+        this._activeHorizontalDirection = null;
+        this._notifyMainWindowHorizontalDirection();
+        return { success: true, bounds: restored, changed: false };
+      }
+      await this._prepareRendererForMainWindowResize(restored, restoreAnchor);
+      if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+        return { success: false, message: "Window not available" };
+      }
+      this._lastResizeBounds = restored;
+      this._setResizedMainWindowBounds(restored);
+      this._activeHorizontalDirection = null;
+      this._notifyMainWindowHorizontalDirection();
+      return { success: true, bounds: restored, changed: true };
+    }
+
+    if (
+      sizeKey !== "BASE" &&
+      !this._baseBoundsBeforeResize &&
+      currentBounds.width === WINDOW_SIZES.BASE.width &&
+      currentBounds.height === WINDOW_SIZES.BASE.height
+    ) {
+      this._baseBoundsBeforeResize = { ...currentBounds };
+      this._activeHorizontalDirection = resolveHorizontalWindowDirection(
+        currentBounds,
+        display,
+        this._panelStartPosition
+      );
+    }
+
+    if (sizeKey !== "BASE" && !this._activeHorizontalDirection) {
+      this._activeHorizontalDirection = resolveHorizontalWindowDirection(
+        currentBounds,
+        display,
+        this._panelStartPosition
+      );
+    }
+    const position =
+      this._panelStartPosition === "center"
+        ? "center"
+        : `bottom-${this._activeHorizontalDirection || this.getMainWindowHorizontalDirection()}`;
+
+    let newX, newY;
+
+    if (position === "bottom-left") {
+      // Anchor bottom-left corner: keep x, expand rightward and upward
+      newX = currentBounds.x;
+      newY = currentBounds.y + currentBounds.height - newSize.height;
+    } else if (position === "center") {
+      // Anchor bottom-center: expand symmetrically and upward
+      const centerX = currentBounds.x + currentBounds.width / 2;
+      newX = centerX - newSize.width / 2;
+      newY = currentBounds.y + currentBounds.height - newSize.height;
+    } else {
+      // bottom-right (default): anchor bottom-right corner, expand leftward and upward
+      const bottomRightX = currentBounds.x + currentBounds.width;
+      newX = bottomRightX - newSize.width;
+      newY = currentBounds.y + currentBounds.height - newSize.height;
+    }
+
+    const clamped = WindowPositionUtil.clampToWorkArea({ x: newX, y: newY, ...newSize }, display);
+    const newBounds = { ...clamped, ...newSize };
+
+    // Opening a voice mode and the size-priority effect can request the same
+    // footprint in adjacent ticks. Avoid asking the OS compositor to rebuild
+    // an unchanged transparent window surface.
+    if (
+      currentBounds.x === newBounds.x &&
+      currentBounds.y === newBounds.y &&
+      currentBounds.width === newBounds.width &&
+      currentBounds.height === newBounds.height
+    ) {
+      this._lastResizeBounds = { ...currentBounds };
+      if (sizeKey === "BASE") {
+        this._activeHorizontalDirection = null;
+        this._notifyMainWindowHorizontalDirection();
+      }
+      return { success: true, bounds: currentBounds, changed: false };
+    }
+
+    await this._prepareRendererForMainWindowResize(newBounds, position);
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return { success: false, message: "Window not available" };
+    }
+    this._setResizedMainWindowBounds(newBounds);
+    this._lastResizeBounds = newBounds;
+    if (sizeKey === "BASE") {
+      this._activeHorizontalDirection = null;
+      this._notifyMainWindowHorizontalDirection();
+    }
+
+    return { success: true, bounds: newBounds, changed: true };
+  }
+
+  async loadWindowContent(window, isControlPanel = false, query = {}) {
+    if (process.env.NODE_ENV === "development") {
+      const appUrl = DevServerManager.getAppUrl(isControlPanel, query);
+      await DevServerManager.waitForDevServer();
+      await window.loadURL(appUrl);
+    } else {
+      const fileInfo = DevServerManager.getAppFilePath(isControlPanel, query);
+      if (!fileInfo) {
+        throw new Error("Failed to get app file path");
+      }
+
+      const fs = require("fs");
+      if (!fs.existsSync(fileInfo.path)) {
+        throw new Error(`HTML file not found: ${fileInfo.path}`);
+      }
+
+      await window.loadFile(fileInfo.path, { query: fileInfo.query });
+    }
+  }
+
+  async loadMainWindow() {
+    await this.loadWindowContent(this.mainWindow, false);
+  }
+
+  createHotkeyCallback() {
+    const isPress = createHotkeyRepeatGate();
+
+    // globalShortcut registrations pass the hotkey that fired; native shortcuts
+    // use down/up phases and resolve their primary hotkey from the active slot.
+    return async (triggeredHotkey, phase) => {
+      if (this.hotkeyManager.isInListeningMode()) {
+        return;
+      }
+      if (this.isDictationProcessing()) {
+        return;
+      }
+
+      const activationMode = this.getActivationMode();
+      const currentHotkey = triggeredHotkey || this.hotkeyManager.getCurrentHotkey?.();
+
+      if (process.platform === "linux" && activationMode === "push") {
+        if (phase === "down") {
+          this.startWindowsPushToTalk(currentHotkey);
+        } else if (phase === "up") {
+          this.handleWindowsPushKeyUp(currentHotkey);
+        }
+        return;
+      }
+      if (phase === "up") return;
+
+      if (
+        process.platform === "darwin" &&
+        activationMode === "push" &&
+        currentHotkey &&
+        !isGlobeLikeHotkey(currentHotkey) &&
+        currentHotkey.includes("+")
+      ) {
+        this.startMacCompoundPushToTalk(currentHotkey);
+        return;
+      }
+
+      // Push mode: defer to native listener (globalShortcut can't detect key-up)
+      if (
+        (process.platform === "win32" || process.platform === "linux") &&
+        activationMode === "push"
+      ) {
+        return;
+      }
+
+      if (!isPress()) return;
+      this.sendToggleDictation();
+    };
+  }
+
+  startMacCompoundPushToTalk(hotkey) {
+    if (!this._isOnboardingInputAllowed("dictation")) return;
+    if (this.macCompoundPushState?.active || this.isDictationProcessing()) {
+      return;
+    }
+
+    const requiredModifiers = this.getMacRequiredModifiers(hotkey);
+    if (requiredModifiers.size === 0) {
+      return;
+    }
+
+    const MIN_HOLD_DURATION_MS = 150;
+    const MAX_PUSH_DURATION_MS = 300000; // 5 minutes max recording
+    const downTime = Date.now();
+
+    const targetPidPromise = this.textEditMonitor?.captureTargetPid?.();
+    this.showDictationPanel({ reposition: true, targetPidPromise });
+    this.sendPrepareDictation();
+
+    const safetyTimeoutId = setTimeout(() => {
+      if (this.macCompoundPushState?.active) {
+        debugLogger.warn("Compound PTT safety timeout", undefined, "ptt");
+        this.forceStopMacCompoundPush("timeout");
+      }
+    }, MAX_PUSH_DURATION_MS);
+
+    this.macCompoundPushState = {
+      active: true,
+      hotkey,
+      downTime,
+      isRecording: false,
+      requiredModifiers,
+      safetyTimeoutId,
+    };
+
+    setTimeout(() => {
+      if (!this.macCompoundPushState || this.macCompoundPushState.downTime !== downTime) {
+        return;
+      }
+
+      if (!this.macCompoundPushState.isRecording) {
+        this.macCompoundPushState.isRecording = true;
+        this.sendStartDictation();
+      }
+    }, MIN_HOLD_DURATION_MS);
+  }
+
+  handleMacPushModifierUp(modifier) {
+    if (!this.macCompoundPushState?.active) {
+      return;
+    }
+
+    if (!this.macCompoundPushState.requiredModifiers.has(modifier)) {
+      return;
+    }
+
+    // The press came through globalShortcut, which can't see the release.
+    this.hotkeyManager.logHotkeyEvent("macos-native", "up", this.macCompoundPushState.hotkey);
+
+    if (this.macCompoundPushState.safetyTimeoutId) {
+      clearTimeout(this.macCompoundPushState.safetyTimeoutId);
+    }
+
+    const wasRecording = this.macCompoundPushState.isRecording;
+    this.macCompoundPushState = null;
+
+    if (wasRecording) {
+      this.sendStopDictation();
+    } else {
+      this.sendCancelDictationPreparation();
+      this.hideDictationPanel();
+    }
+  }
+
+  // A push that ends without a physical release leaves the trigger keys down, so
+  // an injected paste shortcut lands in a modifier state the target app cannot
+  // interpret and the transcript is lost. Tell the renderer to hold the text
+  // back instead of pasting it.
+  _notifyPushForceStopped(reason) {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("dictation-force-stopped", { reason });
+    }
+  }
+
+  forceStopMacCompoundPush(reason = "manual") {
+    if (!this.macCompoundPushState) {
+      return;
+    }
+
+    if (this.macCompoundPushState.safetyTimeoutId) {
+      clearTimeout(this.macCompoundPushState.safetyTimeoutId);
+    }
+
+    const wasRecording = this.macCompoundPushState.isRecording;
+    this.macCompoundPushState = null;
+
+    this._notifyPushForceStopped(reason);
+
+    if (wasRecording) {
+      this.sendStopDictation();
+    } else {
+      this.sendCancelDictationPreparation();
+      this.hideDictationPanel();
+    }
+  }
+
+  getMacRequiredModifiers(hotkey) {
+    const required = new Set();
+    const parts = hotkey.split("+").map((part) => part.trim());
+
+    for (const part of parts) {
+      switch (part) {
+        case "Command":
+        case "Cmd":
+        case "RightCommand":
+        case "RightCmd":
+        case "CommandOrControl":
+        case "Super":
+        case "Meta":
+          required.add("command");
+          break;
+        case "Control":
+        case "Ctrl":
+        case "RightControl":
+        case "RightCtrl":
+          required.add("control");
+          break;
+        case "Alt":
+        case "Option":
+        case "RightAlt":
+        case "RightOption":
+          required.add("option");
+          break;
+        case "Shift":
+        case "RightShift":
+          required.add("shift");
+          break;
+        case "Fn":
+          required.add("fn");
+          break;
+        default:
+          break;
+      }
+    }
+
+    return required;
+  }
+
+  startWindowsPushToTalk(key) {
+    if (!this._isOnboardingInputAllowed("dictation")) return;
+    if (this.winPushState?.active || this.isDictationProcessing()) {
+      return;
+    }
+
+    const MIN_HOLD_DURATION_MS = 150;
+    const MAX_PUSH_DURATION_MS = 300000;
+    const downTime = Date.now();
+
+    this.showDictationPanel({ reposition: true });
+    this.sendPrepareDictation();
+
+    const safetyTimeoutId = setTimeout(() => {
+      if (!this.winPushState || this.winPushState.downTime !== downTime) return;
+      debugLogger.warn("Native PTT safety timeout", undefined, "ptt");
+      this.handleWindowsPushKeyUp(undefined, { reason: "timeout" });
+    }, MAX_PUSH_DURATION_MS);
+
+    this.winPushState = {
+      active: true,
+      key,
+      downTime,
+      isRecording: false,
+      safetyTimeoutId,
+    };
+
+    setTimeout(() => {
+      if (!this.winPushState || this.winPushState.downTime !== downTime) {
+        return;
+      }
+
+      if (!this.winPushState.isRecording) {
+        this.winPushState.isRecording = true;
+        this.sendStartDictation();
+      }
+    }, MIN_HOLD_DURATION_MS);
+  }
+
+  // With several dictation hotkeys bound, only the key that started the push may
+  // stop it; called without a key to force-stop. "release" is the user letting
+  // go; every other reason ends a push whose trigger keys are still physically
+  // down, which the renderer must know before it pastes.
+  handleWindowsPushKeyUp(key, { reason = "release" } = {}) {
+    if (!this.winPushState?.active) {
+      return;
+    }
+    if (key && this.winPushState.key && key !== this.winPushState.key) {
+      return;
+    }
+
+    if (this.winPushState.safetyTimeoutId) {
+      clearTimeout(this.winPushState.safetyTimeoutId);
+    }
+
+    const wasRecording = this.winPushState.isRecording;
+    this.winPushState = null;
+
+    if (reason !== "release") this._notifyPushForceStopped(reason);
+
+    if (wasRecording) {
+      this.sendStopDictation();
+    } else {
+      this.sendCancelDictationPreparation();
+      this.hideDictationPanel();
+    }
+  }
+
+  resetWindowsPushState() {
+    if (!this.winPushState?.active) {
+      return;
+    }
+
+    this.handleWindowsPushKeyUp(undefined, { reason: "reset" });
+  }
+
+  _isOnboardingInputAllowed(inputKind) {
+    return isOnboardingInputAllowed(this._onboardingActive, this._onboardingDemoKind, inputKind);
+  }
+
+  // "meeting" is never a demo kind, so this is simply "not during onboarding".
+  isMeetingInputAllowed() {
+    return this._isOnboardingInputAllowed("meeting");
+  }
+
+  // The one entry for starting a meeting by hand: the meeting hotkey, the pill's
+  // command menu, and the tray. Fails closed during onboarding and while a
+  // hotkey is being captured, like every hotkey slot.
+  async startManualMeeting(options) {
+    if (this.hotkeyManager.isInListeningMode() || !this.isMeetingInputAllowed()) return;
+    try {
+      await this.meetingDetectionEngine?.startManualMeeting(options);
+    } catch (error) {
+      debugLogger.error("Failed to start manual meeting", { error: error.message }, "meeting");
+    }
+  }
+
+  // The assistant is listening: the microphone is its until the take ends.
+  _shouldBlockDictationInput() {
+    return Boolean(this.agentWindow?.isRecording());
+  }
+
+  _sendDictationToggle(channel, inputKind) {
+    if (!this._isOnboardingInputAllowed(inputKind)) return;
+    if (this._shouldBlockDictationInput()) {
+      return;
+    }
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (shouldIgnoreDictationHotkey(this._dictationLifecycleState)) {
+      debugLogger.debug("Ignoring dictation toggle while transcription is processing", {
+        channel,
+      });
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      const isStarting = !this._isDictatingToggle;
+      // Capture the paste target and any selection on every toggle press,
+      // before the overlay steals focus — the paste can't refocus the target
+      // otherwise (#668). The renderer owns the real recording state and may
+      // decline a toggle (mic error, silence gate, Esc cancel), so gating this
+      // on _isDictatingToggle desyncs and leaves a stale target from a
+      // previous app. Press-time capture matches the dictation hotkey call
+      // sites in main.js; a stop-press capture resolves the same frontmost
+      // app, since NSWorkspace ignores the overlay panel.
+      const targetPidPromise = this.textEditMonitor?.captureTargetPid?.();
+      void this.selectionManager?.captureTarget?.({ force: !isStarting });
+      if (!isStarting) {
+        this._mainWindowPlacementCoordinator.cancelPending();
+      }
+      this.showDictationPanel({
+        reposition: isStarting,
+        targetPidPromise,
+      });
+      // About-to-start guess: open the mic one IPC message ahead of the toggle.
+      // A wrong guess (renderer declines) is bounded by the prepared capture's
+      // max-age expiry, and the renderer dedups its own prepare call. Pass the
+      // toggle's own kind so the pre-warm survives the assistant demo, whose
+      // gate rejects "dictation".
+      if (isStarting) {
+        this.sendPrepareDictation({ inputKind });
+      }
+      this.mainWindow.webContents.send(channel);
+    }
+  }
+
+  setDictationLifecycleState(state, attempt, voiceAgentRequested = false) {
+    const nextState = normalizeDictationLifecycle(state);
+    if (attempt !== undefined) {
+      if (nextState === DICTATION_LIFECYCLE.PREPARING && !this._dictationAttempt) {
+        if (this.agentWindow?.isRecording()) return false;
+        this._dictationAttempt = attempt;
+      }
+      if (this._dictationAttempt !== attempt) return false;
+    }
+    if (nextState === DICTATION_LIFECYCLE.IDLE) this._dictationAttempt = null;
+    if (nextState === this._dictationLifecycleState) return true;
+
+    this._dictationLifecycleState = nextState;
+    this._isDictatingToggle = isDictationRecording(nextState);
+    this.syncUserRecording();
+    this.onDictationStateChanged?.(nextState, voiceAgentRequested);
+    return true;
+  }
+
+  // The tray's listen item is a toggle over this state, like the pill's.
+  isDictating() {
+    return this._isDictatingToggle;
+  }
+
+  // Preparing, recording or processing: the agent window stays off the mic.
+  isDictationActive() {
+    return this._dictationLifecycleState !== DICTATION_LIFECYCLE.IDLE;
+  }
+
+  // Talking to the assistant is the user recording too: it must not read as a
+  // meeting starting.
+  syncUserRecording() {
+    this.meetingDetectionEngine?.setUserRecording(
+      this._isDictatingToggle || Boolean(this.agentWindow?.isRecording())
+    );
+  }
+
+  isDictationProcessing() {
+    return shouldIgnoreDictationHotkey(this._dictationLifecycleState);
+  }
+
+  sendToggleDictation() {
+    this._sendDictationToggle("toggle-dictation", "dictation");
+  }
+
+  // The assistant lives in its own window. Onboarding's assistant demo is the
+  // exception: it still records in the dictation window, whose gate admits it.
+  sendToggleVoiceAgent() {
+    if (this._onboardingActive) {
+      this._sendDictationToggle("toggle-voice-agent", "assistant");
+      return;
+    }
+    this.agentWindow?.handleHotkey();
+  }
+
+  sendToggleTranslation() {
+    this._sendDictationToggle("toggle-translation", "translation");
+  }
+
+  // The pill explains a refused meeting start the way it explains a refused
+  // tray action: the start may have come from a hotkey with nothing else shown.
+  sendMeetingStartRefused(code) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.webContents.send("meeting-start-refused", code);
+  }
+
+  // The tray's and the pill menu's Ask assistant: the agent window opens to the
+  // composer, and its renderer explains a policy refusal itself.
+  openAgentWindow() {
+    this.agentWindow?.open({ layout: "typing" });
+  }
+
+  sendStartDictation() {
+    if (!this._isOnboardingInputAllowed("dictation")) return;
+    if (this._shouldBlockDictationInput()) {
+      return;
+    }
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (shouldIgnoreDictationHotkey(this._dictationLifecycleState)) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      const targetPidPromise = this.textEditMonitor?.captureTargetPid?.();
+      void this.selectionManager?.captureTarget?.();
+      this.showDictationPanel({ reposition: true, targetPidPromise });
+      this.mainWindow.webContents.send("start-dictation");
+    }
+  }
+
+  sendStopDictation() {
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("stop-dictation");
+    }
+  }
+
+  sendPrepareDictation({ inputKind = "dictation" } = {}) {
+    if (!this._isOnboardingInputAllowed(inputKind)) return;
+    if (this._shouldBlockDictationInput()) {
+      return;
+    }
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (shouldIgnoreDictationHotkey(this._dictationLifecycleState)) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("prepare-dictation");
+    }
+  }
+
+  sendCancelDictationPreparation() {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("cancel-dictation-preparation");
+    }
+  }
+
+  sendCancelDictation() {
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("cancel-dictation-preparation");
+      this.mainWindow.webContents.send("cancel-hotkey-pressed");
+    }
+  }
+
+  getActivationMode() {
+    return this._cachedActivationMode;
+  }
+
+  async setActivationModeCache(mode) {
+    const nextMode = mode === "push" ? "push" : "tap";
+    const success = await this.hotkeyManager.setActivationMode(nextMode);
+    if (!success) return false;
+    this._cachedActivationMode = nextMode;
+    return true;
+  }
+
+  // Called once dispatch handlers and optional slots are installed. Registration
+  // may still be reading the saved dictation key or falling back to another backend.
+  async initializeNativeKeyListeners() {
+    await this.hotkeyManager.registrationReady;
+    this._nativeKeyListenersReady = true;
+    this.reconcileNativeKeyListeners();
+  }
+
+  /**
+   * Sync the native low-level key listeners (Windows/Linux) so every hotkey slot
+   * that needs one is watched. Call after any change to a slot hotkey or the
+   * activation mode. No-op during hotkey capture (listeners are stopped then).
+   */
+  reconcileNativeKeyListeners() {
+    if (this.isQuitting || !this._nativeKeyListenersReady) return;
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    if (this.hotkeyManager.isInListeningMode()) return;
+    const activationMode = this.getActivationMode();
+    const nativeListenerKeys = this.hotkeyManager.getNativeListenerKeys(activationMode);
+    // Native desktop shortcuts replace the low-level listener in tap mode. In
+    // push mode, keep the dictation listener as a release-event fallback; the
+    // push state machine makes duplicate backend and low-level phases harmless.
+    const keys = this.hotkeyManager.isUsingNativeShortcut()
+      ? activationMode === "push"
+        ? nativeListenerKeys.filter((key) => this.hotkeyManager.slotHasHotkey("dictation", key))
+        : []
+      : nativeListenerKeys;
+    if (process.platform === "win32" && this.windowsKeyManager) {
+      this.windowsKeyManager.setKeys(keys);
+    } else if (process.platform === "linux" && this.linuxKeyManager) {
+      this.linuxKeyManager.setKeys(keys);
+    }
+  }
+
+  setFloatingIconAutoHide(enabled) {
+    this._floatingIconAutoHide = Boolean(enabled);
+  }
+
+  getMainWindowHorizontalDirection() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return this._panelStartPosition === "bottom-left" ? "left" : "right";
+    }
+    const bounds = this.mainWindow.getBounds();
+    const display = this._getMainWindowDisplayFor(bounds);
+    return resolveHorizontalWindowDirection(bounds, display, this._panelStartPosition);
+  }
+
+  _notifyMainWindowHorizontalDirection() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.webContents.send(
+      "main-window-horizontal-direction-changed",
+      this.getMainWindowHorizontalDirection()
+    );
+  }
+
+  setPanelStartPosition(position) {
+    this._panelStartPosition = position || "bottom-right";
+    this._mainWindowPlacementCoordinator.resetManualPosition();
+    this._activeHorizontalDirection = null;
+    // Reposition the window immediately
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      const currentBounds = this.mainWindow.getBounds();
+      const display = this._getMainWindowDisplayFor(currentBounds);
+      const newPos = WindowPositionUtil.getMainWindowPosition(
+        display,
+        { width: currentBounds.width, height: currentBounds.height },
+        this._panelStartPosition
+      );
+      this._clearRendererResizeMask();
+      this.mainWindow.setBounds(newPos);
+      this._notifyMainWindowHorizontalDirection();
+    }
+  }
+
+  setHotkeyListeningMode(enabled) {
+    this.hotkeyManager.setListeningMode(enabled);
+  }
+
+  async initializeHotkey() {
+    await this.hotkeyManager.initializeHotkey(this.mainWindow, this.createHotkeyCallback());
+  }
+
+  async updateHotkey(hotkey) {
+    return await this.hotkeyManager.updateHotkey(hotkey, this.createHotkeyCallback());
+  }
+
+  isUsingGnomeHotkeys() {
+    return this.hotkeyManager.isUsingGnome();
+  }
+
+  isUsingHyprlandHotkeys() {
+    return this.hotkeyManager.isUsingHyprland();
+  }
+
+  getHyprlandConfigStatus() {
+    return this.hotkeyManager.getHyprlandConfigStatus();
+  }
+
+  isUsingKDEHotkeys() {
+    return this.hotkeyManager.isUsingKDE();
+  }
+
+  isUsingNativeShortcutHotkeys() {
+    return this.hotkeyManager.isUsingNativeShortcut();
+  }
+
+  // The control panel is transparent on macOS, where Electron ignores
+  // `-webkit-app-region: drag` entirely — the renderer recreates its titlebar
+  // drag through the shared DragManager instead (useControlPanelWindowDrag).
+  // No pill bookkeeping: position ownership below is main-window-only.
+  async startControlPanelDrag() {
+    if (!this.controlPanelWindow || this.controlPanelWindow.isDestroyed()) {
+      return { success: false, message: "Window not available" };
+    }
+    return await this.dragManager.startWindowDrag(this.controlPanelWindow);
+  }
+
+  async stopControlPanelDrag() {
+    return await this.dragManager.stopWindowDrag();
+  }
+
+  async startWindowDrag() {
+    // A lookup started by a prior hotkey must never land while the user is
+    // taking ownership of the panel position.
+    this._mainWindowPlacementCoordinator.cancelPending();
+    this._dragStartBounds =
+      this.mainWindow && !this.mainWindow.isDestroyed() ? this.mainWindow.getBounds() : null;
+    return await this.dragManager.startWindowDrag();
+  }
+
+  async stopWindowDrag() {
+    const result = await this.dragManager.stopWindowDrag();
+    if (result.success && this.mainWindow && !this.mainWindow.isDestroyed()) {
+      const draggedBounds = this.mainWindow.getBounds();
+      const start = this._dragStartBounds;
+      // Every pill click goes through start/stopWindowDrag; only an actual
+      // move hands position ownership to the user.
+      const moved =
+        !start ||
+        Math.abs(draggedBounds.x - start.x) > DRAG_MOVE_TOLERANCE_PX ||
+        Math.abs(draggedBounds.y - start.y) > DRAG_MOVE_TOLERANCE_PX;
+      if (moved) {
+        this._mainWindowPlacementCoordinator.markManuallyPositioned();
+        this._baseBoundsBeforeResize = null;
+        this._lastResizeBounds = { ...draggedBounds };
+      }
+    }
+    this._dragStartBounds = null;
+    this._activeHorizontalDirection = null;
+    this._notifyMainWindowHorizontalDirection();
+    return result;
+  }
+
+  openExternalUrl(url, showError = true) {
+    openUrlInExternalBrowser(url).catch((error) => {
+      if (showError) {
+        dialog.showErrorBox(
+          i18nMain.t("dialog.openLink.title"),
+          i18nMain.t("dialog.openLink.message", { url, error: error.message })
+        );
+      }
+    });
+  }
+
+  // Links in either window open in the default browser, never in an in-app
+  // window or by navigating the app away from itself.
+  registerExternalLinkHandlers(window, isControlPanel) {
+    window.webContents.on("will-navigate", (event, url) => {
+      // getAppUrl() is null in packaged builds; exactly one of the two is set.
+      const appUrl =
+        DevServerManager.getAppUrl(isControlPanel) ??
+        pathToFileURL(DevServerManager.getAppFilePath(isControlPanel).path).href;
+
+      if (isAllowedAppNavigation(url, appUrl)) {
+        return;
+      }
+
+      event.preventDefault();
+      if (isExternalBrowserUrl(url)) {
+        this.openExternalUrl(url);
+      } else {
+        debugLogger.debug("Blocked untrusted navigation", { url }, "window");
+      }
+    });
+
+    window.webContents.setWindowOpenHandler(({ url }) => {
+      if (isExternalOpenUrl(url)) {
+        this.openExternalUrl(url);
+      } else {
+        debugLogger.debug("Blocked untrusted window open", { url }, "window");
+      }
+      return { action: "deny" };
+    });
+
+    window.webContents.on("did-create-window", (childWindow, details) => {
+      childWindow.close();
+      if (details.url && isExternalOpenUrl(details.url)) {
+        this.openExternalUrl(details.url, false);
+      }
+    });
+  }
+
+  async createControlPanelWindow(options) {
+    if (this.controlPanelWindow && !this.controlPanelWindow.isDestroyed()) {
+      this.showControlPanel(options);
+      return;
+    }
+
+    this.controlPanelWindow = new BrowserWindow(CONTROL_PANEL_CONFIG);
+    this._onboardingRestoreBounds = null;
+    this._onboardingWindowMode = null;
+    this._onboardingWindowState = null;
+
+    this.registerExternalLinkHandlers(this.controlPanelWindow, true);
+
+    // Nothing else shows this window: ready-to-show deliberately doesn't, so the
+    // renderer can pick the onboarding size first and avoid a visible
+    // expanded → compact flash on fresh installs. That makes this the only
+    // backstop if the renderer never gets that far — it loads but throws, a lazy
+    // chunk fails, or auth/policy resolution never settles — so it must outlive
+    // did-finish-load. Only a real show cancels it.
+    this._controlPanelVisibilityTimer = setTimeout(() => {
+      this._showControlPanel();
+    }, 10000);
+
+    this.controlPanelWindow.on("close", (event) => {
+      if (!this.isQuitting) {
+        event.preventDefault();
+        this.hideControlPanelToTray();
+      }
+    });
+
+    this.controlPanelWindow.on("closed", () => {
+      this.meetingDetectionEngine?.closeCurrentMeetingNote?.();
+      this._clearControlPanelVisibilityTimer();
+      this.endOnboardingDemo();
+      this.controlPanelWindow = null;
+      this._onboardingActive = true;
+      this._hideNormalAppSurfaces();
+      this._onboardingRestoreBounds = null;
+      this._onboardingWindowMode = null;
+      this._onboardingWindowState = null;
+      dockManager.setControlPanelVisible(false);
+    });
+
+    MenuManager.setupControlPanelMenu(this.controlPanelWindow, () => this.openSettings());
+
+    // The initial load may already own a queued note; only release a replaced document's session.
+    // On commit, not on start: a navigation will-navigate blocks leaves the document in place.
+    let controlPanelDocumentLoaded = false;
+    this.controlPanelWindow.webContents.on("did-navigate", () => {
+      if (!controlPanelDocumentLoaded) return;
+      controlPanelDocumentLoaded = false;
+      this.meetingDetectionEngine?.closeCurrentMeetingNote?.();
+    });
+    this.controlPanelWindow.webContents.on("did-finish-load", () => {
+      controlPanelDocumentLoaded = true;
+      // Every fresh document starts unresolved. AppRouter releases the gate
+      // only after it commits the normal app, so OAuth/onboarding reloads cannot
+      // expose the dictation pill, hotkeys, or popup surfaces in between.
+      this.setOnboardingActive(true);
+      this.endOnboardingDemo();
+      this.controlPanelWindow.setTitle(i18nMain.t("window.controlPanelTitle"));
+    });
+
+    this.controlPanelWindow.webContents.on(
+      "did-fail-load",
+      (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) {
+          return;
+        }
+        // An aborted navigation leaves the document in place; any other failure replaced it.
+        if (errorCode !== ERR_ABORTED) this.meetingDetectionEngine?.closeCurrentMeetingNote?.();
+        if (process.env.NODE_ENV !== "development") {
+          this.showLoadFailureDialog("Control panel", errorCode, errorDescription, validatedURL);
+        }
+        // Show it regardless: a failed load can't reach the renderer path that
+        // normally does, and a hidden window leaves the failure invisible.
+        this._showControlPanel();
+      }
+    );
+
+    this.controlPanelWindow.webContents.on("render-process-gone", (_event, details) => {
+      this.meetingDetectionEngine?.closeCurrentMeetingNote?.();
+      if (details.reason === "crashed" || details.reason === "killed" || details.reason === "oom") {
+        debugLogger.error(
+          "Control panel renderer process gone",
+          { reason: details.reason, exitCode: details.exitCode },
+          "window"
+        );
+        // The renderer owned any running demo; without this, its stale session
+        // keeps swallowing dictations after the reload.
+        this.endOnboardingDemo();
+        setTimeout(() => this.loadControlPanel(), 1000);
+      }
+    });
+
+    this.controlPanelWindow.on("show", () => {
+      if (this.controlPanelWindow.webContents.isCrashed()) {
+        debugLogger.error("Control panel crashed, reloading on show", undefined, "window");
+        this.loadControlPanel();
+      }
+    });
+
+    await this.loadControlPanel();
+  }
+
+  async loadControlPanel() {
+    await this.loadWindowContent(this.controlPanelWindow, true);
+  }
+
+  async showTranscriptionPreview(text) {
+    if (this._onboardingActive) return;
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.webContents.send("preview-text", text);
+    // Partials arrive several times a second; re-showing a visible window
+    // restacks it (and re-fires "show") on every chunk (#1262).
+    if (!this.mainWindow.isVisible()) {
+      this.mainWindow.showInactive();
+      this.enforceMainWindowOnTop();
+    }
+  }
+
+  appendTranscriptionPreview(text) {
+    if (this._onboardingActive) return;
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.webContents.send("preview-append", text);
+  }
+
+  holdTranscriptionPreview(options = {}) {
+    if (this._onboardingActive) return;
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    const payload = {
+      showCleanup: !!options.showCleanup,
+    };
+    this.mainWindow.webContents.send("preview-hold", payload);
+  }
+
+  completeTranscriptionPreview(text) {
+    if (this._onboardingActive) return;
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    const payload = { text };
+    this.mainWindow.webContents.send("preview-result", payload);
+    this.enforceMainWindowOnTop();
+  }
+
+  hideTranscriptionPreview() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    this.mainWindow.webContents.send("preview-hide");
+  }
+
+  // The display the user is working on is the one showing the app being dictated
+  // into, which on a multi-monitor desk is often not the one the mouse rests on.
+  // Falls back to the cursor when the target has no readable window (non-macOS,
+  // no target captured yet, or an app with no ordinary window).
+  async _resolveActiveDisplay(targetPidPromise) {
+    let pid = this.textEditMonitor?.lastTargetPid;
+    if (targetPidPromise) {
+      try {
+        pid = await targetPidPromise;
+      } catch {
+        pid = null;
+      }
+    }
+    const bounds = pid ? await this.textEditMonitor.getTargetWindowBounds(pid) : null;
+    return plasmaWorkAreas.resolve(
+      bounds
+        ? screen.getDisplayMatching(bounds)
+        : screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+    );
+  }
+
+  _repositionToActiveDisplay(targetPidPromise) {
+    // A panel edit that leaves the root work area unchanged raises no display
+    // event, so look again on every show; a change re-anchors the pill.
+    void plasmaWorkAreas.refresh();
+    return this._mainWindowPlacementCoordinator.request(
+      () => this._resolveActiveDisplay(targetPidPromise),
+      (activeDisplay, isCurrent) =>
+        this._enqueueMainWindowMutation(() =>
+          this._performActiveDisplayReposition(activeDisplay, isCurrent)
+        )
+    );
+  }
+
+  _performActiveDisplayReposition(activeDisplay, isCurrent) {
+    if (
+      !isCurrent() ||
+      this.dragManager.isDragActive() ||
+      !this.mainWindow ||
+      this.mainWindow.isDestroyed()
+    ) {
+      return { applied: false, reason: "superseded" };
+    }
+
+    const currentBounds = this.mainWindow.getBounds();
+    const currentDisplay = this._getMainWindowDisplayFor(currentBounds);
+
+    if (currentDisplay.id === activeDisplay.id) {
+      // Nearest-display math can't tell "on this display" from "just past its
+      // edge", so a rearranged monitor or a drag that ended over another
+      // display can leave the panel stranded in dead space, looking like the
+      // overlay vanished. Pull it back before showing it.
+      const clamped = WindowPositionUtil.clampToWorkArea(currentBounds, currentDisplay);
+      if (clamped.x !== currentBounds.x || clamped.y !== currentBounds.y) {
+        const clampedBounds = { ...currentBounds, ...clamped };
+        this._clearRendererResizeMask();
+        this.mainWindow.setBounds(clampedBounds);
+        this._lastResizeBounds = { ...clampedBounds };
+        this._baseBoundsBeforeResize = null;
+        return { applied: true, bounds: clampedBounds };
+      }
+      return { applied: false, reason: "same-display" };
+    }
+
+    const newPos = WindowPositionUtil.getMainWindowPosition(
+      activeDisplay,
+      { width: currentBounds.width, height: currentBounds.height },
+      this._panelStartPosition
+    );
+    debugLogger.debug(
+      "[WindowManager] Moving dictation panel to the active display",
+      { from: currentBounds, to: newPos, displayId: activeDisplay.id },
+      "window"
+    );
+    return this._moveMainWindowTo(newPos);
+  }
+
+  _moveMainWindowTo(newPos) {
+    this._clearRendererResizeMask();
+    this.mainWindow.setBounds(newPos);
+    // This is an intentional native move, not a drag. Keep resize restoration
+    // from treating the old display's bounds as the user's desired base state.
+    this._lastResizeBounds = { ...newPos };
+    this._baseBoundsBeforeResize = null;
+    this._activeHorizontalDirection = null;
+    this._notifyMainWindowHorizontalDirection();
+    return { applied: true, bounds: newPos };
+  }
+
+  // Corrected work areas can arrive after the pill was placed: plasmashell
+  // answers after startup, or a panel changed. An auto-placed pill moves to its
+  // display's anchor; one the user dragged stays where they put it.
+  _reanchorMainWindow() {
+    return this._enqueueMainWindowMutation(() => {
+      if (
+        !this.mainWindow ||
+        this.mainWindow.isDestroyed() ||
+        this.dragManager.isDragActive() ||
+        this._mainWindowPlacementCoordinator.hasManualPosition()
+      ) {
+        return;
+      }
+      const currentBounds = this.mainWindow.getBounds();
+      const newPos = WindowPositionUtil.getMainWindowPosition(
+        this._getMainWindowDisplayFor(currentBounds),
+        { width: currentBounds.width, height: currentBounds.height },
+        this._panelStartPosition
+      );
+      if (newPos.x === currentBounds.x && newPos.y === currentBounds.y) return;
+      debugLogger.debug(
+        "[WindowManager] Re-anchoring dictation panel to the corrected work area",
+        { from: currentBounds, to: newPos },
+        "window"
+      );
+      this._moveMainWindowTo(newPos);
+    });
+  }
+
+  // hide() also hides Chromium's child input window (Chrome_RenderWidgetHostHWND),
+  // and showing the pill again does not bring it back. Clicks then land on the
+  // non-focusable top-level window, which answers WM_MOUSEACTIVATE with
+  // MA_NOACTIVATEANDEAT, so Windows drops every button press while moves and
+  // releases still arrive: the pill can't be clicked or dragged until something
+  // resizes the window (a menu or toast). A resize shows the child again, so
+  // nudge the width and put it back.
+  _restoreWin32MainWindowClicks() {
+    const win = this.mainWindow;
+    if (!win || win.isDestroyed()) return;
+    const bounds = win.getBounds();
+    // Electron stores the non-resizable pill's requested size in its constraints.
+    // Reading the size from getBounds() instead rounds screen edges outward at
+    // fractional DPI, so restoring that size would grow the window on each show.
+    const [width, height] = win.getMinimumSize();
+    // Nudge past the rounded bounds so the renderer's DIP size also changes.
+    win.setBounds({ ...bounds, width: bounds.width + 1 });
+    win.setBounds({ ...bounds, width, height });
+  }
+
+  showDictationPanel(options = {}) {
+    if (this._onboardingActive) return;
+    const { focus = false, reposition = false, targetPidPromise } = options;
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    if (reposition) {
+      void this._repositionToActiveDisplay(targetPidPromise);
+    }
+    if (this.mainWindow.isMinimized()) {
+      this.mainWindow.restore();
+    }
+    if (!this.mainWindow.isVisible()) {
+      if (typeof this.mainWindow.showInactive === "function") {
+        this.mainWindow.showInactive();
+      } else {
+        this.mainWindow.show();
+      }
+    }
+    if (focus) {
+      this.mainWindow.focus();
+    }
+  }
+
+  setOnboardingActive(active) {
+    const nextActive = active === true;
+    if (!nextActive) this.permissionGuide?.close();
+    if (nextActive === this._onboardingActive) {
+      if (nextActive) this._hideNormalAppSurfaces();
+      return true;
+    }
+
+    if (nextActive) {
+      this._onboardingActive = true;
+      this.sendCancelDictation();
+      this._hideNormalAppSurfaces();
+      return true;
+    }
+
+    this.endOnboardingDemo();
+    this.sendCancelDictation();
+    this.hideDictationPanel();
+    this._onboardingActive = false;
+    if (!this._floatingIconAutoHide) this.showDictationPanel();
+    this.agentWindow?.prewarm();
+    return true;
+  }
+
+  _hideNormalAppSurfaces() {
+    this.hideDictationPanel();
+    this.hideTranscriptionPreview();
+    this.agentWindow?.dismiss();
+    this.dismissMeetingNotification({ flushQueued: false });
+  }
+
+  beginOnboardingDemo(kind) {
+    if (!ONBOARDING_DEMO_KINDS.has(kind)) return false;
+    this._onboardingActive = true;
+    this._onboardingDemoKind = kind;
+    // A prior recording must not leak into a new correlated demo session.
+    this.sendCancelDictation();
+    this.hideDictationPanel();
+    return true;
+  }
+
+  isOnboardingDemoActive() {
+    return this._onboardingDemoKind !== null;
+  }
+
+  isOnboardingActive() {
+    return this._onboardingActive;
+  }
+
+  stopOnboardingDemoRecording() {
+    if (!this._onboardingDemoKind) return false;
+    this.sendStopDictation();
+    this.hideDictationPanel();
+    return true;
+  }
+
+  endOnboardingDemo() {
+    // Before the early return on purpose: IPCHandlers' demo session must die
+    // on every teardown path even if the demo kind is already gone — a stale
+    // session broadcasts every later dictation on onboarding-demo-event.
+    this.onOnboardingDemoTeardown?.();
+    if (!this._onboardingDemoKind) return false;
+    // Leaving/retrying is cancellation, not a transcription request. The
+    // overlay owns AudioManager, so route cleanup must be delivered there.
+    this.sendCancelDictation();
+    this.hideDictationPanel();
+    this._onboardingDemoKind = null;
+    return true;
+  }
+
+  _clearControlPanelVisibilityTimer() {
+    clearTimeout(this._controlPanelVisibilityTimer);
+    this._controlPanelVisibilityTimer = null;
+  }
+
+  _showControlPanel({ onlyBeforeFirstShow = false } = {}) {
+    const win = this.controlPanelWindow;
+    if (!win || win.isDestroyed()) return;
+    // onlyBeforeFirstShow reveals a new panel only while its visibility timer is pending;
+    // after that, a hidden or minimized panel stays as the user left it.
+    if (onlyBeforeFirstShow && this._controlPanelVisibilityTimer === null) return;
+    // Cancel the backstop either way: once the window has been shown on purpose,
+    // a later timer firing could pull it back out of the tray.
+    this._clearControlPanelVisibilityTimer();
+    if (win.isVisible()) return;
+    this.showControlPanel();
+  }
+
+  // Every path that opens the control panel comes through here. The Dock is
+  // reported first: on an active app dock.show() activates the Dock and then
+  // re-activates the app, which macOS does not honour, so a window surfaced
+  // before it is left behind the previously frontmost app. show() runs even
+  // for a visible window, since on macOS it activates the app while another
+  // app is active and focus() does not. `activate: false` skips that for an
+  // open panel, for openers that send the user to another app (joining a
+  // meeting, the meeting hotkey mid-call): the panel updates behind it.
+  showControlPanel({ activate = true } = {}) {
+    const win = this.controlPanelWindow;
+    if (!win || win.isDestroyed()) return;
+    this._clearControlPanelVisibilityTimer();
+    dockManager.setControlPanelVisible(true);
+    if (win.isMinimized()) win.restore();
+    if (activate || !win.isVisible()) win.show();
+    win.focus();
+  }
+
+  // Compact onboarding starts at smaller bounds, but every mode exposes the
+  // complete window-control contract so a frameless window never traps the
+  // user in setup.
+  _applyOnboardingWindowChrome(win, mode) {
+    win.setResizable(true);
+    win.setMinimizable(true);
+    win.setMaximizable(true);
+    win.setClosable(true);
+    win.setFullScreenable(false);
+    // Floor at the mode's canonical size so no step renders below the bounds
+    // it was designed for — clamped to the work area, or a 1366x768-class
+    // display could never fit (and setContentBounds would fight the minimum).
+    const floor = ONBOARDING_WINDOW_SIZES[ONBOARDING_WINDOW_SIZE_KEYS[mode]];
+    const { workArea } = screen.getDisplayMatching(win.getBounds());
+    win.setMinimumSize(
+      Math.min(floor.width, workArea.width),
+      Math.min(floor.height, workArea.height)
+    );
+    if (process.platform === "darwin" && typeof win.setWindowButtonVisibility === "function") {
+      win.setWindowButtonVisibility(true);
+    }
+  }
+
+  setOnboardingWindowMode(mode) {
+    const win = this.controlPanelWindow;
+    if (!win || win.isDestroyed()) return false;
+    if (mode !== "restore" && !Object.hasOwn(ONBOARDING_WINDOW_SIZE_KEYS, mode)) return false;
+    if (mode !== "restore" && (win.isFullScreen() || win.isMaximized())) {
+      // Entering onboarding from a maximized/fullscreen control panel must not
+      // refuse: each mode is applied at its canonical centered bounds, which
+      // only take effect from a normal window state. Both modes stay
+      // maximizable, so the user can simply maximize again afterwards.
+      if (win.isFullScreen()) win.setFullScreen(false);
+      if (win.isMaximized()) win.unmaximize();
+    }
+
+    const current = win.getContentBounds();
+    const { workArea } = screen.getDisplayMatching(win.getBounds());
+
+    if (mode === "restore") {
+      // A maximized/fullscreen window the user made keeps its bounds, but the
+      // chrome state below must still be restored and the tracking cleared —
+      // refusing outright left setFullScreenable(false) and onboarding's
+      // minimum-size floor on the control panel for the rest of its life.
+      if (!win.isFullScreen() && !win.isMaximized() && this._onboardingRestoreBounds) {
+        win.setContentBounds(clampedBounds(this._onboardingRestoreBounds, workArea), true);
+      }
+      const state = this._onboardingWindowState;
+      if (state) {
+        win.setResizable(state.resizable);
+        win.setMinimizable(state.minimizable);
+        win.setMaximizable(state.maximizable);
+        win.setClosable(state.closable);
+        win.setFullScreenable(state.fullscreenable);
+        if (state.minimumSize) win.setMinimumSize(...state.minimumSize);
+      }
+      if (process.platform === "darwin" && typeof win.setWindowButtonVisibility === "function") {
+        win.setWindowButtonVisibility(true);
+      }
+      this._onboardingRestoreBounds = null;
+      this._onboardingWindowMode = null;
+      this._onboardingWindowState = null;
+      this._showControlPanel({ onlyBeforeFirstShow: true });
+      return true;
+    }
+
+    if (!this._onboardingRestoreBounds) {
+      this._onboardingRestoreBounds = current;
+      this._onboardingWindowState = {
+        resizable: win.isResizable(),
+        minimizable: win.isMinimizable(),
+        maximizable: win.isMaximizable(),
+        closable: win.isClosable(),
+        fullscreenable: win.isFullScreenable(),
+        minimumSize: win.getMinimumSize(),
+      };
+    }
+
+    this._applyOnboardingWindowChrome(win, mode);
+
+    if (this._onboardingWindowMode === mode) {
+      this._showControlPanel({ onlyBeforeFirstShow: true });
+      return true;
+    }
+
+    const target = ONBOARDING_WINDOW_SIZES[ONBOARDING_WINDOW_SIZE_KEYS[mode]];
+    const next = centeredBounds(current, target, workArea);
+    if (
+      current.x === next.x &&
+      current.y === next.y &&
+      current.width === next.width &&
+      current.height === next.height
+    ) {
+      this._onboardingWindowMode = mode;
+      this._showControlPanel({ onlyBeforeFirstShow: true });
+      return true;
+    }
+
+    win.setContentBounds(next, true);
+    this._onboardingWindowMode = mode;
+    this._showControlPanel({ onlyBeforeFirstShow: true });
+    return true;
+  }
+
+  hideControlPanelToTray() {
+    if (!this.controlPanelWindow || this.controlPanelWindow.isDestroyed()) {
+      return;
+    }
+
+    // An explicit hide is authoritative: the visibility backstop exists to
+    // rescue a window that never got shown, and letting it fire now would
+    // pull the panel (and the Dock icon) back out of the tray.
+    this._clearControlPanelVisibilityTimer();
+    // A demo left running when the panel hides would keep swallowing normal
+    // dictations (paste suppressed, transcripts rerouted to the demo session).
+    this.endOnboardingDemo();
+    // The guide cannot watch the panel's hide event (occlusion fires it too),
+    // so the one real hide path tells it.
+    this.permissionGuide?.close(false, true);
+    this.controlPanelWindow.hide();
+    dockManager.setControlPanelVisible(false);
+  }
+
+  hideDictationPanel() {
+    this._mainWindowPlacementCoordinator.cancelPending();
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) this.mainWindow.hide();
+  }
+
+  isDictationPanelVisible() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return false;
+    }
+
+    if (this.mainWindow.isMinimized && this.mainWindow.isMinimized()) {
+      return false;
+    }
+
+    return this.mainWindow.isVisible();
+  }
+
+  registerMainWindowEvents() {
+    const win = this.mainWindow;
+    if (!win) {
+      return;
+    }
+
+    if (process.platform === "linux" || process.platform === "win32") {
+      // backgroundThrottling:false keeps document.visibilityState visible even
+      // after hide(). Native visibility owns the Linux input-region and the
+      // Windows window-shape updates, which pause while the pill is hidden.
+      for (const event of ["show", "hide", "minimize", "restore"]) {
+        win.on(event, () => {
+          win.webContents.send(
+            "main-window-visibility-changed",
+            win.isVisible() && !win.isMinimized()
+          );
+        });
+      }
+    }
+
+    if (process.platform === "win32") {
+      const shape = this._win32MainWindowShape();
+      win.on("hide", () => shape.set(null));
+      for (const event of ["resize", "move"]) {
+        win.on(event, shape.revalidate);
+      }
+    }
+
+    // Safety timeout: force show the window if ready-to-show doesn't fire within 10 seconds
+    const showTimeout = setTimeout(() => {
+      if (
+        this.mainWindow &&
+        !this.mainWindow.isDestroyed() &&
+        !this.mainWindow.isVisible() &&
+        !this._floatingIconAutoHide
+      ) {
+        this.showDictationPanel();
+      }
+    }, 10000);
+
+    win.once("ready-to-show", () => {
+      clearTimeout(showTimeout);
+      this.enforceMainWindowOnTop();
+      if (!this.mainWindow.isVisible() && !this._floatingIconAutoHide) {
+        this.showDictationPanel();
+      }
+    });
+
+    win.on("show", () => {
+      this.enforceMainWindowOnTop();
+      if (process.platform === "win32") this._restoreWin32MainWindowClicks();
+    });
+
+    win.on("focus", () => this.enforceMainWindowOnTop());
+
+    win.on("closed", () => {
+      clearTimeout(showTimeout);
+      if (this.mainWindow !== win) return;
+      this.setDictationLifecycleState(DICTATION_LIFECYCLE.IDLE);
+      this.dragManager.cleanup();
+      this.mainWindow = null;
+    });
+  }
+
+  enforceMainWindowOnTop() {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      WindowPositionUtil.setupAlwaysOnTop(this.mainWindow);
+    }
+  }
+
+  async showMeetingNotification(promptData, { autoDismiss = true } = {}) {
+    if (this._onboardingActive) {
+      // No card will settle this detection, and while it stays active the
+      // engine skips every repeat of it.
+      if (promptData?.detectionId) {
+        this.meetingDetectionEngine?.handleDetectionNotificationClosed?.(promptData.detectionId, {
+          flushQueued: false,
+        });
+      }
+      return false;
+    }
+    this._cancelMeetingNavigation("STALE_NOTIFICATION");
+    const previousOwner = this._meetingNotificationOwner;
+    if (
+      previousOwner?.detection &&
+      previousOwner.prompt.detectionId !== promptData.detectionId &&
+      this.meetingDetectionEngine?.activeDetections?.get(previousOwner.prompt.detectionId) ===
+        previousOwner.detection
+    ) {
+      this.meetingDetectionEngine.activeDetections.delete(previousOwner.prompt.detectionId);
+    }
+    this._meetingNotificationOwner = null;
+    if (this.notificationWindow && !this.notificationWindow.isDestroyed()) {
+      const previousWindow = this.notificationWindow;
+      this.notificationWindow = null;
+      this._pendingNotificationData = null;
+      previousWindow.close();
+    }
+    this._notificationDismissTimer.cancel();
+    if (this._notificationReadyFallback) {
+      clearTimeout(this._notificationReadyFallback);
+      this._notificationReadyFallback = null;
+    }
+
+    const display = screen.getPrimaryDisplay();
+    const position = WindowPositionUtil.getNotificationPosition(display);
+
+    const win = new BrowserWindow({
+      ...NOTIFICATION_WINDOW_CONFIG,
+      // Linux has no setFocusable, so the picker's typing needs this from creation.
+      ...(process.platform === "linux" && { focusable: true, type: "normal" }),
+      ...position,
+    });
+    this.notificationWindow = win;
+
+    // "closed" fires asynchronously, so a replaced prompt's window emits it
+    // after the replacement already took over the reference and the countdown.
+    win.on("closed", () => {
+      if (this.notificationWindow !== win) return;
+      const closedDetectionId = this._pendingNotificationData?.detectionId ?? null;
+      this.notificationWindow = null;
+      this._meetingNotificationOwner = null;
+      this._pendingNotificationData = null;
+      this._notificationDismissTimer.cancel();
+      if (this._notificationReadyFallback) {
+        clearTimeout(this._notificationReadyFallback);
+        this._notificationReadyFallback = null;
+      }
+      if (closedDetectionId) {
+        this.meetingDetectionEngine?.handleDetectionNotificationClosed?.(closedDetectionId);
+      }
+    });
+
+    win.setContentProtection(true);
+
+    if (process.platform === "darwin") {
+      win.setIgnoreMouseEvents(true, { forward: true });
+    }
+
+    // Notifications must clear every other window, including our own floating
+    // dictation panel and the agent window.
+    WindowPositionUtil.setupAlwaysOnTop(win, { level: "screen-saver" });
+
+    this._pendingNotificationData = promptData;
+    const owner = {
+      prompt: promptData,
+      window: win,
+      detection: this.meetingDetectionEngine?.activeDetections?.get(promptData.detectionId),
+      selectedDestination: null,
+      createRequests: new Map(),
+      layoutRevision: 0,
+      mode: "closed",
+      pointerInside: false,
+    };
+    this._meetingNotificationOwner = owner;
+    const retireRenderer = () => {
+      if (this._meetingNotificationOwner !== owner) return;
+      this.dismissMeetingNotification();
+    };
+    const notificationContents = win.webContents;
+    notificationContents.once("render-process-gone", retireRenderer);
+    win.on("closed", () => {
+      notificationContents.removeListener("render-process-gone", retireRenderer);
+    });
+    if (process.platform === "linux") win.setShape([MEETING_NOTIFICATION_CARD_REGION]);
+    win.on("blur", () => {
+      if (!this.isMeetingNotificationOwner(owner) || owner.mode === "closed") return;
+      this.setMeetingNotificationSurface(owner, {
+        revision: owner.layoutRevision + 1,
+        mode: "closed",
+        contentHeight: NOTIFICATION_WINDOW_CONFIG.height,
+        regions: [MEETING_NOTIFICATION_CARD_REGION],
+        focus: "release",
+      });
+      win.webContents.send("meeting-notification-surface-closed", {
+        revision: owner.layoutRevision,
+      });
+    });
+    const refit = () => {
+      if (!this.isMeetingNotificationOwner(owner) || !owner.surface) return;
+      this.setMeetingNotificationSurface(owner, {
+        ...owner.surface,
+        revision: owner.layoutRevision + 1,
+        focus: "keep",
+      });
+      win.webContents.send("meeting-notification-surface-resized", {
+        revision: owner.layoutRevision,
+      });
+    };
+    for (const event of ["display-metrics-changed", "display-removed", "display-added"])
+      screen.on(event, refit);
+    win.on("closed", () => {
+      for (const event of ["display-metrics-changed", "display-removed", "display-added"])
+        screen.removeListener(event, refit);
+    });
+
+    // Everything past the load addresses `win` directly: a replacement taking
+    // over mid-load must not have this prompt's data, countdown or force-show
+    // applied to its window.
+    try {
+      if (process.env.NODE_ENV === "development") {
+        await DevServerManager.waitForDevServer();
+        if (this.notificationWindow !== win) return false;
+        await win.loadURL(`${DevServerManager.DEV_SERVER_URL}?meeting-notification=true`);
+      } else {
+        const fileInfo = DevServerManager.getAppFilePath(false);
+        await win.loadFile(fileInfo.path, {
+          query: { ...fileInfo.query, "meeting-notification": "true" },
+        });
+      }
+    } catch (error) {
+      // A load aborted by our own replacement or dismissal is not a failure —
+      // but the caller must still learn the notification never appeared.
+      if (this.notificationWindow !== win) return false;
+      this.dismissMeetingNotification();
+      throw error;
+    }
+    if (this.notificationWindow !== win) return false;
+    if (this._onboardingActive) {
+      // Queued prompts would only reach the same closed gate.
+      this.dismissMeetingNotification({ flushQueued: false });
+      return false;
+    }
+
+    const readyFallback = setTimeout(() => {
+      if (this._notificationReadyFallback !== readyFallback) return;
+      this._notificationReadyFallback = null;
+      if (this._onboardingActive || this.notificationWindow !== win || win.isDestroyed()) return;
+      debugLogger.warn("Notification renderer did not signal ready, force-showing", {}, "meeting");
+      win.webContents.send("meeting-notification-data", promptData);
+      win.showInactive();
+    }, 3000);
+    this._notificationReadyFallback = readyFallback;
+
+    if (autoDismiss) {
+      this._notificationDismissTimer.start(getNotificationTimeoutMs(promptData.source));
+    }
+    return true;
+  }
+
+  // Only the window that loaded the prompt may reveal it: a stale window's late
+  // "ready" must not clear the fallback that would force-show its replacement.
+  showNotificationWindow(ownerWebContents) {
+    if (this._onboardingActive) {
+      this.dismissMeetingNotification({ flushQueued: false });
+      return;
+    }
+    const win = this.notificationWindow;
+    if (!win || win.isDestroyed() || (ownerWebContents && win.webContents !== ownerWebContents)) {
+      return;
+    }
+
+    if (this._notificationReadyFallback) {
+      clearTimeout(this._notificationReadyFallback);
+      this._notificationReadyFallback = null;
+    }
+    win.showInactive();
+  }
+
+  dismissMeetingNotification({ notifyEngine = true, flushQueued = true } = {}) {
+    const notification = this._pendingNotificationData;
+    this._meetingNotificationOwner = null;
+    this._pendingNotificationData = null;
+    if (this._notificationReadyFallback) {
+      clearTimeout(this._notificationReadyFallback);
+      this._notificationReadyFallback = null;
+    }
+    this._notificationDismissTimer.cancel();
+    const win = this.notificationWindow;
+    this.notificationWindow = null;
+    if (win && !win.isDestroyed()) win.close();
+    if (notifyEngine && notification?.detectionId) {
+      this.meetingDetectionEngine?.handleDetectionNotificationClosed?.(notification.detectionId, {
+        flushQueued,
+      });
+    }
+  }
+
+  sendToControlPanel(channel, data) {
+    const win = this.controlPanelWindow;
+    if (!win || win.isDestroyed()) return;
+    if (win.webContents.isLoading()) {
+      win.webContents.once("did-finish-load", () => {
+        if (!win.isDestroyed()) win.webContents.send(channel, data);
+      });
+    } else {
+      win.webContents.send(channel, data);
+    }
+  }
+
+  async queueMeetingNoteNavigation(payload, options) {
+    if (!payload.navigationId) {
+      this._pendingMeetingNoteNavigation = payload;
+      try {
+        await this.createControlPanelWindow(options);
+        if (this._pendingMeetingNoteNavigation === payload)
+          this.sendToControlPanel("meeting-note-navigation-pending");
+      } catch (error) {
+        if (this._pendingMeetingNoteNavigation === payload)
+          this._pendingMeetingNoteNavigation = null;
+        this.meetingDetectionEngine?.abandonMeetingNote?.(payload.noteSessionId);
+        throw error;
+      }
+      return;
+    }
+    if (!this.isMeetingNotificationOwner(options.owner))
+      return { success: false, code: "STALE_NOTIFICATION" };
+    this._cancelMeetingNavigation("STALE_NOTIFICATION");
+    let resolve;
+    const result = new Promise((done) => {
+      resolve = done;
+    });
+    const operation = {
+      payload,
+      owner: options.owner,
+      resolve,
+      consumed: false,
+      panel: null,
+    };
+    this._meetingNavigationOperation = operation;
+    // Bound panel creation as well as the renderer handshake; reset at delivery.
+    operation.timer = setTimeout(
+      () => this._settleMeetingNavigation(operation, { success: false, code: "START_FAILED" }),
+      15000
+    );
+    void (async () => {
+      try {
+        await this.createControlPanelWindow({ activate: options.activate });
+        if (this._meetingNavigationOperation !== operation) return;
+        const panel = this.controlPanelWindow;
+        if (!panel || panel.isDestroyed()) throw new Error("Panel unavailable");
+        operation.panel = panel;
+        operation.contents = panel.webContents;
+        operation.onClose = () =>
+          this._settleMeetingNavigation(operation, { success: false, code: "START_FAILED" });
+        panel.once("closed", operation.onClose);
+        panel.webContents.once("render-process-gone", operation.onClose);
+        const deliver = () => {
+          if (this._meetingNavigationOperation !== operation) return;
+          if (this.controlPanelWindow !== panel || panel.isDestroyed()) {
+            this._settleMeetingNavigation(operation, {
+              success: false,
+              code: "STALE_NOTIFICATION",
+            });
+            return;
+          }
+          clearTimeout(operation.timer);
+          operation.timer = setTimeout(
+            () =>
+              this._settleMeetingNavigation(operation, { success: false, code: "START_FAILED" }),
+            15000
+          );
+          this._pendingMeetingNoteNavigation = payload;
+          panel.webContents.send("meeting-note-navigation-pending");
+        };
+        operation.deliver = deliver;
+        // Not did-finish-load: creating a panel resolves inside it, with isLoading() still true.
+        // Waiting keeps a reloading panel's outgoing document from taking the navigation.
+        if (panel.webContents.isLoading()) panel.webContents.once("did-stop-loading", deliver);
+        else deliver();
+      } catch {
+        this._settleMeetingNavigation(operation, { success: false, code: "START_FAILED" });
+      }
+    })();
+    return result;
+  }
+
+  isMeetingNoteNavigationPending(noteSessionId) {
+    if (noteSessionId == null) return false;
+    return (
+      this._pendingMeetingNoteNavigation?.noteSessionId === noteSessionId ||
+      // A navigation still waiting for a reloading panel isn't pending yet.
+      this._meetingNavigationOperation?.payload.noteSessionId === noteSessionId
+    );
+  }
+
+  _settleMeetingNavigation(operation, result) {
+    if (this._meetingNavigationOperation !== operation) return;
+    if (!result.success)
+      this.meetingDetectionEngine?.abandonMeetingNote?.(operation.payload.noteSessionId);
+    this._meetingNavigationOperation = null;
+    clearTimeout(operation.timer);
+    operation.panel?.removeListener("closed", operation.onClose);
+    operation.contents?.removeListener("render-process-gone", operation.onClose);
+    if (operation.deliver) operation.contents.removeListener("did-stop-loading", operation.deliver);
+    if (this._pendingMeetingNoteNavigation === operation.payload)
+      this._pendingMeetingNoteNavigation = null;
+    operation.resolve(result);
+  }
+
+  _cancelMeetingNavigation(code) {
+    const operation = this._meetingNavigationOperation;
+    if (operation) this._settleMeetingNavigation(operation, { success: false, code });
+  }
+
+  consumePendingMeetingNoteNavigation(sender) {
+    const payload = this._pendingMeetingNoteNavigation;
+    if (payload?.navigationId) {
+      const operation = this._meetingNavigationOperation;
+      if (
+        !operation ||
+        operation.payload !== payload ||
+        operation.panel !== this.controlPanelWindow ||
+        operation.contents !== sender
+      )
+        return null;
+      operation.consumed = true;
+    }
+    this._pendingMeetingNoteNavigation = null;
+    return payload;
+  }
+
+  confirmMeetingNoteNavigation(sender, navigationId, status = "ready") {
+    const operation = this._meetingNavigationOperation;
+    if (
+      !operation ||
+      operation.payload.navigationId !== navigationId ||
+      !operation.consumed ||
+      operation.panel !== this.controlPanelWindow ||
+      operation.contents !== sender
+    ) {
+      return { success: false, code: "STALE_NOTIFICATION" };
+    }
+    let result;
+    if (status === "cancel") result = { success: false, code: "START_FAILED" };
+    else if (status !== "ready") return { success: false, code: "INVALID_REQUEST" };
+    else {
+      try {
+        const db = this.meetingDetectionEngine.databaseManager;
+        const note = db.getNote(operation.payload.noteId);
+        if (!describeMeetingNote(db, note)) result = { success: false, code: "NOTE_UNAVAILABLE" };
+        else if (
+          note.space_id !== operation.payload.spaceId ||
+          note.folder_id !== operation.payload.folderId
+        ) {
+          result = {
+            success: false,
+            code: "LINKED_NOTE_CHANGED",
+            context: meetingDestinationContext(db, operation.owner, this.meetingRecentDestinations),
+          };
+        } else result = { success: true, value: note };
+      } catch {
+        result = { success: false, code: "NOTE_UNAVAILABLE" };
+      }
+    }
+    this._settleMeetingNavigation(operation, result);
+    return result;
+  }
+
+  async queueNoteNavigation(payload, options) {
+    this._pendingNoteNavigation = payload;
+    await this.createControlPanelWindow(options);
+    this.sendToControlPanel("note-navigation-pending");
+  }
+
+  consumePendingNoteNavigation() {
+    const payload = this._pendingNoteNavigation;
+    this._pendingNoteNavigation = null;
+    return payload;
+  }
+
+  snapControlPanelToMeetingMode() {
+    const win = this.controlPanelWindow;
+    if (!win || win.isDestroyed()) return;
+    this._preMeetingBounds = win.getBounds();
+    const display = screen.getPrimaryDisplay();
+    const workArea = display.workArea;
+    const width = Math.round(workArea.width / 3);
+    win.setBounds({
+      x: workArea.x + workArea.width - width,
+      y: workArea.y,
+      width,
+      height: workArea.height,
+    });
+    win.focus();
+  }
+
+  restoreControlPanelFromMeetingMode() {
+    const win = this.controlPanelWindow;
+    if (!win || win.isDestroyed()) return;
+    if (this._preMeetingBounds) {
+      win.setBounds(this._preMeetingBounds);
+      this._preMeetingBounds = null;
+    } else {
+      const { width, height } = CONTROL_PANEL_CONFIG;
+      win.setSize(width, height);
+      win.center();
+    }
+  }
+
+  refreshLocalizedUi() {
+    MenuManager.setupMainMenu(() => this.openSettings());
+
+    if (this.controlPanelWindow && !this.controlPanelWindow.isDestroyed()) {
+      MenuManager.setupControlPanelMenu(this.controlPanelWindow, () => this.openSettings());
+      this.controlPanelWindow.setTitle(i18nMain.t("window.controlPanelTitle"));
+    }
+
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.setTitle(i18nMain.t("window.voiceRecorderTitle"));
+    }
+  }
+
+  // A named section waits here like a note navigation: a control panel created
+  // by this call registers its show-settings listener only after the event.
+  async openSettings(section) {
+    if (section) this._pendingSettingsSection = section;
+    await this.createControlPanelWindow();
+    if (this.controlPanelWindow && !this.controlPanelWindow.isDestroyed()) {
+      this.controlPanelWindow.webContents.send("show-settings");
+    }
+  }
+
+  consumePendingSettingsSection() {
+    const section = this._pendingSettingsSection;
+    this._pendingSettingsSection = null;
+    return section;
+  }
+
+  showLoadFailureDialog(windowName, errorCode, errorDescription, validatedURL) {
+    if (this.loadErrorShown) {
+      return;
+    }
+    this.loadErrorShown = true;
+    const detailLines = [
+      i18nMain.t("dialog.loadFailure.detail.window", { windowName }),
+      i18nMain.t("dialog.loadFailure.detail.error", { errorCode, errorDescription }),
+      validatedURL ? i18nMain.t("dialog.loadFailure.detail.url", { url: validatedURL }) : null,
+      i18nMain.t("dialog.loadFailure.detail.hint"),
+    ].filter(Boolean);
+    dialog.showMessageBox({
+      type: "error",
+      title: i18nMain.t("dialog.loadFailure.title"),
+      message: i18nMain.t("dialog.loadFailure.message"),
+      detail: detailLines.join("\n"),
+    });
+  }
+}
+
+module.exports = WindowManager;

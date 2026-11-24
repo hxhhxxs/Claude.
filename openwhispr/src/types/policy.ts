@@ -1,0 +1,105 @@
+import type { InferenceMode } from "./electron";
+
+/**
+ * Organization policy delivered by the OpenWhispr API and enforced by the app.
+ *
+ * Mirrors the canonical schema in `openwhispr-api/lib/policy-schema.ts` and
+ * `openwhispr-admin/lib/policy-schema.ts` — keep the three in sync. Mode ids are
+ * validated strictly; BYOK provider ids are validated shape-only (see
+ * `allowedByokProviders`) so the server enum can grow ahead of this build.
+ */
+
+export type UpdateMode = "user_choice" | "always_on" | "it_managed";
+export type LocalHistoryMode = "user_choice" | "always_on" | "always_off";
+export type ExternalSharingMode = "allowed" | "domain_only" | "disabled";
+
+export interface OrgPolicy {
+  version: number;
+  transcription: {
+    /** Absent/null is unrestricted; an empty intersection permits no local model. */
+    allowedLocalModels?: string[] | null;
+    allowedModes: InferenceMode[];
+    /**
+     * Registry provider ids plus "custom". Validated shape-only so a provider
+     * added server-side can't invalidate the policy on older builds; ids this
+     * build does not know are filtered out at enforcement time and grant nothing.
+     */
+    allowedByokProviders: string[];
+    /** Absent on servers that predate the field; absent means none. */
+    allowedEnterpriseProviders?: string[];
+  };
+  llm: {
+    allowedLocalModels?: string[] | null;
+    allowedModes: InferenceMode[];
+    /** Registry provider ids plus "custom" and "openrouter"; same forward-compat rule as transcription. */
+    allowedByokProviders: string[];
+    allowedEnterpriseProviders: string[];
+  };
+  features: {
+    agentEnabled: boolean;
+    webSearchEnabled: boolean;
+    meetingRecordingEnabled?: boolean;
+    audioUploadEnabled?: boolean;
+    /** Absent on servers that predate the field; absent means allowed. */
+    screenContextEnabled?: boolean;
+    /**
+     * Agent connectors (email drafts, Slack, Linear, GitHub). Absent on
+     * servers that predate the field; absent means allowed.
+     */
+    connectorsEnabled?: boolean;
+    /** Personal API keys and MCP access. Absent on older servers means allowed. */
+    apiAccessEnabled?: boolean;
+    /**
+     * Retired agent-memory gate: the API stopped using it when it removed
+     * assistant memory (openwhispr-api#243), but older API versions may still
+     * send it. The app ignores it.
+     */
+    memoryEnabled?: boolean;
+  };
+  meetings?: {
+    /** Absent means automatic. Unknown values require a manual start. */
+    transcriptionStart?: string;
+    /** Absent means allowed. Unknown values require an internal invite. */
+    externalAttendees?: string;
+    internalDomains?: string[];
+  };
+  sharing: {
+    externalLinkSharing: ExternalSharingMode;
+  };
+  dataRetention: {
+    audioRetentionMaxDays: number | null;
+    localHistoryMode: LocalHistoryMode;
+    cloudBackupAllowed: boolean;
+  };
+  /**
+   * Model ids (whisper/parakeet registry keys) members must download.
+   * Absent on servers that predate the field; absent/empty means none.
+   * Validated shape-only so future server-side ids can't invalidate the
+   * policy — unknown ids are filtered at enforcement time.
+   */
+  requiredLocalModels?: string[];
+  /** Optional for older servers; unknown future strings behave as user_choice. */
+  updates?: { mode?: string };
+  minAppVersion: string | null;
+}
+
+/** Which allowlist a mode/provider check applies to. */
+export type PolicyScope = "transcription" | "llm";
+
+export interface EffectivePolicySnapshot {
+  success: boolean;
+  status: "loading" | "managed" | "unmanaged" | "error";
+  revision: number;
+  accountId: string | null;
+  authGeneration: number;
+  managed: boolean;
+  policy: OrgPolicy | null;
+  deviceReady: boolean;
+  deviceManaged: boolean;
+  workspaceManaged: boolean;
+  workspaceRequired: boolean;
+  localOnly: boolean;
+  requireSignIn: boolean;
+  code?: string;
+  policyUpdatedAt?: string | null;
+}

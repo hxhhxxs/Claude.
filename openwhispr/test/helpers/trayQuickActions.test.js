@@ -1,0 +1,68 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const Module = require("node:module");
+
+const originalLoad = Module._load;
+Module._load = function loadTrayWithStubs(request, parent, isMain) {
+  if (request === "electron") return { Tray: class {}, Menu: {}, nativeImage: {}, app: {} };
+  if (request === "./debugLogger") return { info: () => undefined, debug: () => undefined };
+  if (request === "./dockManager") return {};
+  if (request === "./i18nMain") return { i18nMain: { t: (key) => key } };
+  return originalLoad.call(this, request, parent, isMain);
+};
+const TrayManager = require("../../src/helpers/tray");
+Module._load = originalLoad;
+
+function createTrayManager(calls, { dictating = false, meetingRefusal = null } = {}) {
+  const trayManager = new TrayManager();
+  trayManager.windowManager = {
+    isDictationPanelVisible: () => false,
+    isDictating: () => dictating,
+    sendStartDictation: () => calls.push("start-dictation"),
+    sendStopDictation: () => calls.push("stop-dictation"),
+    openAgentWindow: () => calls.push("assistant"),
+    startManualMeeting: (options) => calls.push(`meeting from ${options?.startSource}`),
+    getMeetingRecordingRefusal: () => meetingRefusal,
+  };
+  return trayManager;
+}
+
+test("the tray menu leads with the dictation pill's quick actions", () => {
+  const calls = [];
+  const [listen, assistant, meeting, separator] =
+    createTrayManager(calls).buildContextMenuTemplate();
+
+  assert.deepEqual(
+    [listen.label, assistant.label, meeting.label, separator.type],
+    [
+      "app.commandMenu.startListening",
+      "app.commandMenu.askAssistant",
+      "app.commandMenu.startMeetingRecording",
+      "separator",
+    ]
+  );
+
+  listen.click();
+  assistant.click();
+  meeting.click();
+  // Each starts in the main process; the assistant opens its own window.
+  assert.deepEqual(calls, ["start-dictation", "assistant", "meeting from tray"]);
+});
+
+test("the tray's listen item stops the recording it reflects", () => {
+  const calls = [];
+  const [listen] = createTrayManager(calls, { dictating: true }).buildContextMenuTemplate();
+
+  assert.equal(listen.label, "app.commandMenu.stopListening");
+  listen.click();
+  assert.deepEqual(calls, ["stop-dictation"]);
+});
+
+test("the tray's meeting item is disabled while the org refuses meeting recording", () => {
+  const meetingItem = (meetingRefusal) =>
+    createTrayManager([], { meetingRefusal }).buildContextMenuTemplate()[2];
+
+  assert.equal(meetingItem(null).enabled, true);
+  assert.equal(meetingItem({ code: "POLICY_MEETING_RECORDING_DISABLED" }).enabled, false);
+  assert.equal(meetingItem({ code: "POLICY_UNRESOLVABLE" }).enabled, false);
+});
